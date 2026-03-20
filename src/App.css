@@ -1,0 +1,163 @@
+.app-shell {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  min-height: 100dvh;
+  max-height: 100dvh;
+  gap: 12px;
+  padding: 12px;
+}
+
+.topbar {
+  display: flex;
+  justify-content: flex-start;
+  gap: 10px;
+  align-items: flex-start;
+  background: color-mix(in oklab, var(--panel), white 28%);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 12px 14px;
+  box-shadow: 0 8px 18px rgba(16, 38, 29, 0.08);
+}
+
+.topbar h1 {
+  margin: 0;
+  font-size: clamp(1.1rem, 2.2vw, 1.7rem);
+  letter-spacing: 0.02em;
+}
+
+.topbar p {
+  margin: 6px 0 0;
+  color: var(--ink-soft);
+  max-width: 90ch;
+  font-size: 0.9rem;
+}
+
+.status-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(130px, 1fr));
+  gap: 8px;
+  width: 100%;
+}
+
+.stat {
+  display: grid;
+  gap: 4px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  padding: 8px 10px;
+  min-height: 62px;
+}
+
+.stat span {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ink-soft);
+}
+
+.stat strong {
+  font-size: 0.88rem;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
+.controls {
+  display: grid;
+  gap: 10px;
+  align-items: center;
+  align-content: start;
+  grid-template-columns: 1fr;
+  background: color-mix(in oklab, var(--panel-strong), white 35%);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 10px;
+}
+
+.button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.button-row button {
+  border: 1px solid var(--line);
+  background: #ffffff;
+  color: var(--ink);
+  border-radius: 999px;
+  padding: 6px 12px;
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+.button-row button:hover {
+  border-color: var(--accent);
+}
+
+.button-row button.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.button-row button.plan-x {
+  border-color: #8b5cf6;
+}
+
+.button-row button.plan-x.active {
+  background: #ede9fe;
+  color: #6d28d9;
+}
+
+.button-row button.plan-o {
+  border-color: #f97316;
+}
+
+.button-row button.plan-o.active {
+  background: #ffedd5;
+  color: #c2410c;
+}
+
+.zoom-readout,
+.drag-readout {
+  margin-left: 4px;
+  color: var(--ink-soft);
+  font-size: 0.86rem;
+  padding: 0 4px;
+}
+
+.board-wrapper {
+  min-height: 0;
+  border-radius: 14px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  background: #f5f9f7;
+}
+
+.board {
+  width: 100%;
+  height: 100%;
+  display: block;
+  touch-action: none;
+  cursor: grab;
+}
+
+.board:active {
+  cursor: grabbing;
+}
+
+@media (max-width: 860px) {
+  .status-grid {
+    grid-template-columns: repeat(2, minmax(110px, 1fr));
+    width: 100%;
+  }
+
+  .zoom-readout,
+  .drag-readout {
+    width: 100%;
+    margin-left: 0;
+    padding-left: 0;
+  }
+}
