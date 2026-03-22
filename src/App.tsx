@@ -3,6 +3,7 @@ import './App.css'
 
 type Player = 'X' | 'O'
 type Mode = 'live' | 'plan'
+type PlayAs = 'any' | Player
 
 type Camera = {
   x: number
@@ -15,8 +16,15 @@ type HoverHex = {
   r: number
 }
 
+type MoveRecord = {
+  q: number
+  r: number
+  mark: Player
+}
+
 type LiveGameState = {
   moves: Map<string, Player>
+  moveHistory: MoveRecord[]
   turn: Player
   placementsLeft: number
   winner: Player | null
@@ -29,8 +37,18 @@ type LiveAction =
       r: number
     }
   | {
+      type: 'sync'
+      moves: Map<string, Player>
+      moveHistory?: MoveRecord[]
+    }
+  | {
+      type: 'undo'
+    }
+  | {
       type: 'clear'
     }
+
+type WsStatus = 'disconnected' | 'connecting' | 'connected'
 
 const SQRT3 = Math.sqrt(3)
 const BASE_HEX_SIZE = 28
@@ -50,10 +68,6 @@ function toKey(q: number, r: number): string {
 function fromKey(key: string): { q: number; r: number } {
   const [q, r] = key.split(',').map(Number)
   return { q, r }
-}
-
-function nextPlayer(player: Player): Player {
-  return player === 'X' ? 'O' : 'X'
 }
 
 function countDirectional(
@@ -89,9 +103,56 @@ function isWinningPlacement(board: Map<string, Player>, q: number, r: number, pl
   return false
 }
 
+function findWinner(board: Map<string, Player>): Player | null {
+  for (const [key, player] of board.entries()) {
+    const { q, r } = fromKey(key)
+    if (isWinningPlacement(board, q, r, player)) {
+      return player
+    }
+  }
+
+  return null
+}
+
+function turnStateFromMoveCount(totalMoves: number): { turn: Player; placementsLeft: number } {
+  if (totalMoves === 0) {
+    return { turn: 'X', placementsLeft: 1 }
+  }
+
+  if (totalMoves === 1) {
+    return { turn: 'O', placementsLeft: 2 }
+  }
+
+  const k = totalMoves - 1
+  const turnIndex = Math.floor(k / 2)
+  return {
+    turn: turnIndex % 2 === 0 ? 'O' : 'X',
+    placementsLeft: k % 2 === 0 ? 2 : 1,
+  }
+}
+
+function deriveLiveState(moveHistory: MoveRecord[]): LiveGameState {
+  const moves = new Map<string, Player>()
+  for (const move of moveHistory) {
+    moves.set(toKey(move.q, move.r), move.mark)
+  }
+
+  const winner = findWinner(moves)
+  const turnState = turnStateFromMoveCount(moves.size)
+
+  return {
+    moves,
+    moveHistory,
+    turn: turnState.turn,
+    placementsLeft: winner ? 0 : turnState.placementsLeft,
+    winner,
+  }
+}
+
 function createInitialLiveState(): LiveGameState {
   return {
     moves: new Map(),
+    moveHistory: [],
     turn: 'X',
     placementsLeft: 1,
     winner: null,
@@ -103,37 +164,31 @@ function liveReducer(state: LiveGameState, action: LiveAction): LiveGameState {
     return createInitialLiveState()
   }
 
+  if (action.type === 'sync') {
+    if (action.moveHistory) {
+      return deriveLiveState(action.moveHistory)
+    }
+
+    const fallbackHistory: MoveRecord[] = []
+    for (const [key, mark] of action.moves.entries()) {
+      const { q, r } = fromKey(key)
+      fallbackHistory.push({ q, r, mark })
+    }
+    return deriveLiveState(fallbackHistory)
+  }
+
+  if (action.type === 'undo') {
+    if (state.moveHistory.length === 0) return state
+    return deriveLiveState(state.moveHistory.slice(0, -1))
+  }
+
   if (state.winner) return state
 
   const key = toKey(action.q, action.r)
   if (state.moves.has(key)) return state
 
-  const nextMoves = new Map(state.moves)
-  nextMoves.set(key, state.turn)
-
-  if (isWinningPlacement(nextMoves, action.q, action.r, state.turn)) {
-    return {
-      ...state,
-      moves: nextMoves,
-      winner: state.turn,
-      placementsLeft: 0,
-    }
-  }
-
-  if (state.placementsLeft > 1) {
-    return {
-      ...state,
-      moves: nextMoves,
-      placementsLeft: state.placementsLeft - 1,
-    }
-  }
-
-  return {
-    ...state,
-    moves: nextMoves,
-    turn: nextPlayer(state.turn),
-    placementsLeft: 2,
-  }
+  const nextHistory = [...state.moveHistory, { q: action.q, r: action.r, mark: state.turn }]
+  return deriveLiveState(nextHistory)
 }
 
 function axialToWorld(q: number, r: number, size: number): { x: number; y: number } {
@@ -151,9 +206,9 @@ function worldToAxial(x: number, y: number, size: number): { q: number; r: numbe
 }
 
 function roundAxial(q: number, r: number): { q: number; r: number } {
-  let x = q
-  let z = r
-  let y = -x - z
+  const x = q
+  const z = r
+  const y = -x - z
 
   let rx = Math.round(x)
   let ry = Math.round(y)
@@ -174,20 +229,69 @@ function roundAxial(q: number, r: number): { q: number; r: number } {
   return { q: rx, r: rz }
 }
 
+function boardObjectToMap(value: unknown): Map<string, Player> {
+  if (!value || typeof value !== 'object') {
+    return new Map()
+  }
+
+  const entries = Object.entries(value as Record<string, unknown>)
+  const next = new Map<string, Player>()
+
+  for (const [key, marker] of entries) {
+    if (marker === 'X' || marker === 'O') {
+      next.set(key, marker)
+    }
+  }
+
+  return next
+}
+
+function moveHistoryObjectToArray(value: unknown): MoveRecord[] {
+  if (!Array.isArray(value)) {
+    return []
+  }
+
+  const next: MoveRecord[] = []
+  for (const move of value) {
+    if (!move || typeof move !== 'object') continue
+    const raw = move as Record<string, unknown>
+    const mark = raw.mark
+    const q = Number(raw.q)
+    const r = Number(raw.r)
+
+    if ((mark === 'X' || mark === 'O') && Number.isInteger(q) && Number.isInteger(r)) {
+      next.push({ q, r, mark })
+    }
+  }
+
+  return next
+}
+
 function App() {
   const wrapperRef = useRef<HTMLDivElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const initializedRef = useRef(false)
+  const wsRef = useRef<WebSocket | null>(null)
 
   const [size, setSize] = useState({ width: 0, height: 0 })
   const [camera, setCamera] = useState<Camera>({ x: 0, y: 0, zoom: 1 })
   const [hoverHex, setHoverHex] = useState<HoverHex | null>(null)
   const [isDragging, setIsDragging] = useState(false)
   const [mode, setMode] = useState<Mode>('live')
+  const [playAs, setPlayAs] = useState<PlayAs>('any')
 
   const [liveState, dispatchLive] = useReducer(liveReducer, undefined, createInitialLiveState)
   const [planBrush, setPlanBrush] = useState<Player>('X')
   const [planMoves, setPlanMoves] = useState<Map<string, Player>>(new Map())
+
+  const [gameCodeInput, setGameCodeInput] = useState('')
+  const [joinedRoom, setJoinedRoom] = useState<string | null>(null)
+  const [wsStatus, setWsStatus] = useState<WsStatus>('disconnected')
+  const [networkError, setNetworkError] = useState<string | null>(null)
+  const [showHud, setShowHud] = useState(() => {
+    if (typeof window === 'undefined') return true
+    return window.matchMedia('(min-width: 900px)').matches
+  })
 
   const dragRef = useRef<{
     pointerId: number
@@ -195,6 +299,14 @@ function App() {
     lastY: number
     started: boolean
   } | null>(null)
+
+  const wsUrl = import.meta.env.VITE_WS_URL as string | undefined
+
+  useEffect(() => {
+    return () => {
+      wsRef.current?.close()
+    }
+  }, [])
 
   useEffect(() => {
     const wrapper = wrapperRef.current
@@ -204,18 +316,16 @@ function App() {
       const entry = entries[0]
       const { width, height } = entry.contentRect
       setSize({ width, height })
+
+      if (!initializedRef.current && width > 0 && height > 0) {
+        setCamera({ x: width / 2, y: height / 2, zoom: 1 })
+        initializedRef.current = true
+      }
     })
 
     observer.observe(wrapper)
     return () => observer.disconnect()
   }, [])
-
-  useEffect(() => {
-    if (!initializedRef.current && size.width > 0 && size.height > 0) {
-      setCamera({ x: size.width / 2, y: size.height / 2, zoom: 1 })
-      initializedRef.current = true
-    }
-  }, [size.height, size.width])
 
   const screenToWorld = useCallback(
     (screenX: number, screenY: number) => {
@@ -248,6 +358,24 @@ function App() {
 
   const totalLiveMoves = liveState.moves.size
   const totalPlanMoves = planMoves.size
+  const canUndo = liveState.moveHistory.length > 0 && !liveState.winner
+  const highlightedKeys = useMemo(() => {
+    if (liveState.moveHistory.length === 0) {
+      return new Set<string>()
+    }
+
+    const next = new Set<string>()
+    const lastMark = liveState.moveHistory[liveState.moveHistory.length - 1].mark
+
+    for (let i = liveState.moveHistory.length - 1; i >= 0; i -= 1) {
+      const move = liveState.moveHistory[i]
+      if (move.mark !== lastMark) break
+      next.add(toKey(move.q, move.r))
+      if (next.size >= 2) break
+    }
+
+    return next
+  }, [liveState.moveHistory])
 
   const modeLabel = useMemo(() => {
     return mode === 'live' ? 'Live game' : 'Plan mode'
@@ -261,9 +389,143 @@ function App() {
     return `${liveState.turn} to move (${liveState.placementsLeft} placement${liveState.placementsLeft === 1 ? '' : 's'} left)`
   }, [liveState.placementsLeft, liveState.turn, liveState.winner])
 
+  const syncFromWireBoard = useCallback((wireBoard: unknown, wireHistory?: unknown) => {
+    const moves = boardObjectToMap(wireBoard)
+    const moveHistory = moveHistoryObjectToArray(wireHistory)
+    dispatchLive({ type: 'sync', moves, moveHistory: moveHistory.length > 0 ? moveHistory : undefined })
+  }, [])
+
+  const leaveRoom = useCallback(() => {
+    wsRef.current?.close()
+    wsRef.current = null
+    setJoinedRoom(null)
+    setWsStatus('disconnected')
+  }, [])
+
+  const openSocket = useCallback(
+    (firstMessage: Record<string, unknown>, fallbackJoinedRoom: string | null = null) => {
+      if (!wsUrl) {
+        setNetworkError('Missing VITE_WS_URL. Set it from stack output before joining.')
+        return
+      }
+
+      setNetworkError(null)
+
+      wsRef.current?.close()
+      const ws = new WebSocket(wsUrl)
+      wsRef.current = ws
+      setWsStatus('connecting')
+
+      ws.onopen = () => {
+        ws.send(JSON.stringify(firstMessage))
+      }
+
+      ws.onmessage = (event) => {
+        try {
+          const message = JSON.parse(event.data as string) as {
+            type?: string
+            roomId?: string
+            boardState?: unknown
+            moveHistory?: unknown
+            message?: string
+          }
+
+          if (message.type === 'state_snapshot') {
+            if (message.boardState) {
+              syncFromWireBoard(message.boardState, message.moveHistory)
+            }
+
+            const resolvedRoom = message.roomId ?? fallbackJoinedRoom
+            setJoinedRoom(resolvedRoom)
+            if (resolvedRoom) {
+              setGameCodeInput(resolvedRoom)
+            }
+            setWsStatus('connected')
+            return
+          }
+
+          if (message.type === 'move_applied') {
+            if (message.boardState) {
+              syncFromWireBoard(message.boardState, message.moveHistory)
+            }
+            return
+          }
+
+          if (message.type === 'move_undone') {
+            if (message.boardState) {
+              syncFromWireBoard(message.boardState, message.moveHistory)
+            }
+            return
+          }
+
+          if (message.type === 'error') {
+            setNetworkError(message.message ?? 'WebSocket error')
+            return
+          }
+        } catch {
+          setNetworkError('Received malformed message from server.')
+        }
+      }
+
+      ws.onerror = () => {
+        setNetworkError('WebSocket connection failed.')
+      }
+
+      ws.onclose = () => {
+        setWsStatus('disconnected')
+        setJoinedRoom(null)
+      }
+    },
+    [syncFromWireBoard, wsUrl],
+  )
+
+  const hostGame = useCallback(() => {
+    if (!wsUrl) {
+      setNetworkError('Missing VITE_WS_URL. Set it from stack output before joining.')
+      return
+    }
+
+    openSocket({ action: 'create' })
+  }, [openSocket, wsUrl])
+
+  const joinGame = useCallback(() => {
+    const roomId = gameCodeInput.trim().toUpperCase()
+    if (!roomId || roomId.length > 5 || !/^[A-Z0-9]+$/.test(roomId)) {
+      setNetworkError('Game code must be 1-5 letters/numbers.')
+      return
+    }
+
+    openSocket(
+      {
+        action: 'join',
+        roomId,
+      },
+      roomId,
+    )
+  }, [gameCodeInput, openSocket])
+
   const placeMove = useCallback(
     (q: number, r: number) => {
       if (mode === 'live') {
+        if (playAs !== 'any' && liveState.turn !== playAs) {
+          setNetworkError(`You are set to play as ${playAs}. It is ${liveState.turn}'s turn.`)
+          return
+        }
+
+        setNetworkError(null)
+
+        if (joinedRoom && wsRef.current?.readyState === WebSocket.OPEN) {
+          wsRef.current.send(
+            JSON.stringify({
+              action: 'place',
+              q,
+              r,
+              mark: liveState.turn,
+            }),
+          )
+          return
+        }
+
         dispatchLive({ type: 'place', q, r })
         return
       }
@@ -283,8 +545,23 @@ function App() {
         return next
       })
     },
-    [mode, planBrush],
+    [joinedRoom, liveState.turn, mode, planBrush, playAs],
   )
+
+  const undoMove = useCallback(() => {
+    if (mode !== 'live') return
+
+    if (joinedRoom && wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          action: 'undo',
+        }),
+      )
+      return
+    }
+
+    dispatchLive({ type: 'undo' })
+  }, [joinedRoom, mode])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -375,8 +652,28 @@ function App() {
       const world = axialToWorld(q, r, BASE_HEX_SIZE)
       const screen = worldToScreen(world.x, world.y)
       const radius = BASE_HEX_SIZE * camera.zoom * 0.55
+      const highlight = highlightedKeys.has(key)
 
       ctx.save()
+
+      if (highlight) {
+        const ringSize = BASE_HEX_SIZE * camera.zoom * 1.05
+        ctx.beginPath()
+        for (let i = 0; i < 6; i += 1) {
+          const angle = (Math.PI / 180) * (60 * i - 30)
+          const px = screen.x + ringSize * Math.cos(angle)
+          const py = screen.y + ringSize * Math.sin(angle)
+          if (i === 0) ctx.moveTo(px, py)
+          else ctx.lineTo(px, py)
+        }
+        ctx.closePath()
+        ctx.fillStyle = 'rgba(251, 191, 36, 0.22)'
+        ctx.fill()
+        ctx.strokeStyle = '#b45309'
+        ctx.lineWidth = Math.max(1.6, camera.zoom * 1.4)
+        ctx.stroke()
+      }
+
       ctx.lineWidth = Math.max(2, camera.zoom * 2.4)
       ctx.strokeStyle = player === 'X' ? '#1e2f97' : '#8a1930'
 
@@ -428,11 +725,13 @@ function App() {
     camera.zoom,
     hoverHex,
     liveState.moves,
+    liveState.moveHistory,
     liveState.winner,
     mode,
     planMoves,
     size.height,
     size.width,
+    highlightedKeys,
     worldToScreen,
   ])
 
@@ -540,22 +839,37 @@ function App() {
   }
 
   const clearAll = () => {
-    dispatchLive({ type: 'clear' })
     setPlanMoves(new Map())
     setPlanBrush('X')
+
+    if (joinedRoom && wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          action: 'sync',
+        }),
+      )
+      return
+    }
+
+    dispatchLive({ type: 'clear' })
   }
 
   return (
     <div className="app-shell">
       <header className="topbar">
-        <div>
-          <h1>Hexagonal Tic-Tac-Toe Prototype</h1>
-          <p>
-            Drag to pan, scroll to zoom, click to place. Rule set: X places 1 on opening turn, then both players place 2 per
-            turn. First 6 in a row wins.
-          </p>
+        <div className="title-block">
+          <h1>Hexagonal Tic-Tac-Toe</h1>
+        </div>
+        <div className="topbar-actions">
+          <div className={`ws-pill ${wsStatus}`}>{wsStatus}</div>
+          <div className="room-pill">{joinedRoom ? `Game: ${joinedRoom}` : 'Local only'}</div>
+          <button className="toggle-hud" onClick={() => setShowHud((prev) => !prev)} type="button">
+            {showHud ? 'Hide menus' : 'Show menus'}
+          </button>
         </div>
       </header>
+
+      {networkError ? <div className="network-error">{networkError}</div> : null}
 
       <main className="board-wrapper" ref={wrapperRef}>
         <canvas
@@ -569,71 +883,114 @@ function App() {
           onWheel={onWheel}
           aria-label="Hexagonal tic-tac-toe board"
         />
-      </main>
+        {showHud ? (
+          <section className="board-dock">
+            <details className="dock-panel" open>
+              <summary>Game and connection</summary>
+              <div className="network-panel">
+                <button onClick={hostGame} type="button">
+                  Host game
+                </button>
+                <input
+                  value={gameCodeInput}
+                  onChange={(e) => setGameCodeInput(e.target.value.toUpperCase())}
+                  placeholder="Game code"
+                  maxLength={5}
+                />
+                <button onClick={joinGame} type="button">
+                  Join by code
+                </button>
+                <button onClick={leaveRoom} type="button" disabled={!joinedRoom}>
+                  Leave
+                </button>
+              </div>
+            </details>
 
-      <section className="controls">
-        <div className="status-grid">
-          <div className="stat">
-            <span>Mode</span>
-            <strong>{modeLabel}</strong>
-          </div>
-          <div className="stat">
-            <span>Live status</span>
-            <strong>{liveStatus}</strong>
-          </div>
-          <div className="stat">
-            <span>Plan brush</span>
-            <strong>{planBrush}</strong>
-          </div>
-          <div className="stat">
-            <span>Moves</span>
-            <strong>
-              {totalLiveMoves} live / {totalPlanMoves} plan
-            </strong>
-          </div>
-        </div>
-        <div className="button-row">
-          <button
-            className={mode === 'live' ? 'active' : ''}
-            onClick={() => setMode('live')}
-            type="button"
-          >
-            Live mode
-          </button>
-          <button
-            className={mode === 'plan' ? 'active' : ''}
-            onClick={() => setMode('plan')}
-            type="button"
-          >
-            Plan mode
-          </button>
-          <button
-            className={planBrush === 'X' ? 'active plan-x' : 'plan-x'}
-            onClick={() => setPlanBrush('X')}
-            type="button"
-          >
-            Plan X
-          </button>
-          <button
-            className={planBrush === 'O' ? 'active plan-o' : 'plan-o'}
-            onClick={() => setPlanBrush('O')}
-            type="button"
-          >
-            Plan O
-          </button>
-          <button onClick={clearPlan} type="button">
-            Clear plan
-          </button>
-          <button onClick={clearAll} type="button">
-            Clear all
-          </button>
-          <button onClick={resetView} type="button">
-            Recenter view
-          </button>
-          <div className="zoom-readout">Zoom: {(camera.zoom * 100).toFixed(0)}%</div>
-          <div className="drag-readout">{isDragging ? 'Panning…' : 'Ready'}</div>
-        </div>
-      </section>
+            <details className="dock-panel" open>
+              <summary>Play controls</summary>
+              <section className="controls">
+                <div className="status-grid">
+                  <div className="stat">
+                    <span>Mode</span>
+                    <strong>{modeLabel}</strong>
+                  </div>
+                  <div className="stat">
+                    <span>Live status</span>
+                    <strong>{liveStatus}</strong>
+                  </div>
+                  <div className="stat">
+                    <span>Plan brush</span>
+                    <strong>{planBrush}</strong>
+                  </div>
+                  <div className="stat">
+                    <span>Moves</span>
+                    <strong>
+                      {totalLiveMoves} live / {totalPlanMoves} plan
+                    </strong>
+                  </div>
+                </div>
+                <div className="button-row">
+                  <label className="play-as">
+                    Play as
+                    <select value={playAs} onChange={(event) => setPlayAs(event.target.value as PlayAs)}>
+                      <option value="any">Any</option>
+                      <option value="X">X</option>
+                      <option value="O">O</option>
+                    </select>
+                  </label>
+                  <button className={mode === 'live' ? 'active' : ''} onClick={() => setMode('live')} type="button">
+                    Live mode
+                  </button>
+                  <button className={mode === 'plan' ? 'active' : ''} onClick={() => setMode('plan')} type="button">
+                    Plan mode
+                  </button>
+                  <button className={planBrush === 'X' ? 'active plan-x' : 'plan-x'} onClick={() => setPlanBrush('X')} type="button">
+                    Plan X
+                  </button>
+                  <button className={planBrush === 'O' ? 'active plan-o' : 'plan-o'} onClick={() => setPlanBrush('O')} type="button">
+                    Plan O
+                  </button>
+                  <button onClick={clearPlan} type="button">
+                    Clear plan
+                  </button>
+                  <button onClick={undoMove} type="button" disabled={!canUndo}>
+                    Undo last
+                  </button>
+                  <button onClick={clearAll} type="button">
+                    {joinedRoom ? 'Sync room' : 'Clear local'}
+                  </button>
+                  <button onClick={resetView} type="button">
+                    Recenter view
+                  </button>
+                  <div className="zoom-readout">Zoom: {(camera.zoom * 100).toFixed(0)}%</div>
+                  <div className="drag-readout">{isDragging ? 'Panning...' : 'Ready'}</div>
+                </div>
+              </section>
+            </details>
+
+            <details className="help-panel dock-panel">
+              <summary>Rules and UI limits</summary>
+              <div className="help-content">
+                <p>
+                  <strong>Rules:</strong> X places one mark on the first turn. After that, each turn is two placements by the
+                  active player. First player to make six in a row wins.
+                </p>
+                <p>
+                  <strong>Highlights:</strong> the most recent live placements (up to two cells) are highlighted on the board.
+                </p>
+                <p>
+                  <strong>Multiplayer limitations:</strong> there is no player identity yet, so either person in a room can place
+                  the current turn's mark. Game codes are shared and not private.
+                </p>
+                <p>
+                  <strong>Backtracking:</strong> use <code>Undo last</code> in Live mode to remove the most recent move (works in
+                  local and synced room play).
+                </p>
+              </div>
+            </details>
+          </section>
+        ) : null}
+      </main>
     </div>
   )
 }

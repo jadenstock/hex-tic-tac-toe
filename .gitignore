@@ -11,6 +11,12 @@ node_modules
 dist
 dist-ssr
 *.local
+.env
+.env.*
+!.env.example
+infra/node_modules
+infra/dist
+infra/cdk.out
 
 # Editor directories and files
 .vscode/*

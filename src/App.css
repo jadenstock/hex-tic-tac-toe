@@ -1,40 +1,210 @@
 .app-shell {
   display: grid;
-  grid-template-rows: auto 1fr auto;
+  grid-template-rows: auto 1fr;
   min-height: 100dvh;
   max-height: 100dvh;
-  gap: 12px;
-  padding: 12px;
+  gap: 10px;
+  padding: 10px;
 }
 
 .topbar {
   display: flex;
-  justify-content: flex-start;
-  gap: 10px;
-  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
   background: color-mix(in oklab, var(--panel), white 28%);
   border: 1px solid var(--line);
-  border-radius: 14px;
-  padding: 12px 14px;
-  box-shadow: 0 8px 18px rgba(16, 38, 29, 0.08);
+  border-radius: 12px;
+  padding: 8px 10px;
+  box-shadow: 0 6px 14px rgba(16, 38, 29, 0.07);
+}
+
+.title-block {
+  min-width: 0;
 }
 
 .topbar h1 {
   margin: 0;
-  font-size: clamp(1.1rem, 2.2vw, 1.7rem);
+  font-size: clamp(1rem, 2vw, 1.45rem);
   letter-spacing: 0.02em;
 }
 
-.topbar p {
-  margin: 6px 0 0;
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.toggle-hud {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #ffffff;
+  color: var(--ink);
+  font-size: 0.84rem;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+
+.network-panel {
+  display: grid;
+  grid-template-columns: auto minmax(110px, 140px) auto auto;
+  gap: 8px;
+  align-items: center;
+  min-width: min(600px, 100%);
+}
+
+.dock-panel .network-panel {
+  padding: 10px;
+}
+
+.network-panel input {
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 8px 9px;
+  font-size: 0.88rem;
+  background: #ffffff;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 600;
+}
+
+.network-panel button {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #ffffff;
+  color: var(--ink);
+  font-size: 0.88rem;
+  padding: 7px 10px;
+  cursor: pointer;
+}
+
+.network-panel button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.ws-pill,
+.room-pill {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 5px 9px;
+  font-size: 0.8rem;
+  width: fit-content;
+  white-space: nowrap;
+}
+
+.ws-pill.disconnected {
+  background: #f4f4f5;
+  color: #3f3f46;
+}
+
+.ws-pill.connecting {
+  background: #fef9c3;
+  color: #854d0e;
+}
+
+.ws-pill.connected {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.room-pill {
+  background: #eef2ff;
+  color: #3730a3;
+}
+
+.network-error {
+  border: 1px solid #fecaca;
+  background: #fef2f2;
+  color: #991b1b;
+  border-radius: 10px;
+  padding: 8px 10px;
+  font-size: 0.86rem;
+}
+
+.board-wrapper {
+  min-height: 0;
+  border-radius: 12px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  background: #f5f9f7;
+  position: relative;
+}
+
+.board {
+  width: 100%;
+  height: 100%;
+  display: block;
+  touch-action: none;
+  cursor: grab;
+}
+
+.board:active {
+  cursor: grabbing;
+}
+
+.board-dock {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  bottom: 10px;
+  display: grid;
+  gap: 8px;
+  pointer-events: none;
+  max-height: calc(100% - 20px);
+  overflow-y: auto;
+}
+
+.dock-panel {
+  border: 1px solid var(--line);
+  background: color-mix(in oklab, var(--panel), white 28%);
+  border-radius: 12px;
+  box-shadow: 0 8px 18px rgba(12, 34, 24, 0.12);
+  pointer-events: auto;
+}
+
+.dock-panel summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--ink);
+  padding: 8px 10px;
+}
+
+.dock-panel[open] > summary {
+  border-bottom: 1px solid color-mix(in oklab, var(--line), transparent 35%);
+}
+
+.help-panel .help-content {
+  padding: 8px 10px 10px;
+}
+
+.help-content {
   color: var(--ink-soft);
-  max-width: 90ch;
-  font-size: 0.9rem;
+  font-size: 0.88rem;
+  display: grid;
+  gap: 6px;
+}
+
+.help-content p {
+  margin: 0;
+}
+
+.controls {
+  display: grid;
+  gap: 10px;
+  align-items: center;
+  grid-template-columns: 1fr;
+  background: color-mix(in oklab, var(--panel-strong), white 35%);
+  border: 0;
+  border-radius: 0 0 12px 12px;
+  padding: 10px;
 }
 
 .status-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(130px, 1fr));
+  grid-template-columns: repeat(4, minmax(140px, 1fr));
   gap: 8px;
   width: 100%;
 }
@@ -62,23 +232,32 @@
   overflow-wrap: anywhere;
 }
 
-.controls {
-  display: grid;
-  gap: 10px;
-  align-items: center;
-  align-content: start;
-  grid-template-columns: 1fr;
-  background: color-mix(in oklab, var(--panel-strong), white 35%);
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  padding: 10px;
-}
-
 .button-row {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
   align-items: center;
+}
+
+.play-as {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--line);
+  background: #ffffff;
+  border-radius: 999px;
+  padding: 5px 10px;
+  font-size: 0.86rem;
+  color: var(--ink-soft);
+}
+
+.play-as select {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 2px 8px;
+  background: #ffffff;
+  color: var(--ink);
+  font-size: 0.85rem;
 }
 
 .button-row button {
@@ -89,6 +268,11 @@
   padding: 6px 12px;
   font-size: 0.9rem;
   cursor: pointer;
+}
+
+.button-row button:disabled {
+  opacity: 0.45;
+  cursor: default;
 }
 
 .button-row button:hover {
@@ -128,27 +312,36 @@
   padding: 0 4px;
 }
 
-.board-wrapper {
-  min-height: 0;
-  border-radius: 14px;
-  overflow: hidden;
-  border: 1px solid var(--line);
-  background: #f5f9f7;
-}
+@media (max-width: 1080px) {
+  .topbar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
 
-.board {
-  width: 100%;
-  height: 100%;
-  display: block;
-  touch-action: none;
-  cursor: grab;
-}
-
-.board:active {
-  cursor: grabbing;
+  .network-panel {
+    width: 100%;
+    min-width: 0;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 @media (max-width: 860px) {
+  .app-shell {
+    padding: 8px;
+    gap: 8px;
+  }
+
+  .topbar-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .board-dock {
+    left: 8px;
+    right: 8px;
+    bottom: 8px;
+  }
+
   .status-grid {
     grid-template-columns: repeat(2, minmax(110px, 1fr));
     width: 100%;
@@ -159,5 +352,10 @@
     width: 100%;
     margin-left: 0;
     padding-left: 0;
+  }
+
+  .button-row button,
+  .toggle-hud {
+    font-size: 0.82rem;
   }
 }

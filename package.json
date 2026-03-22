@@ -7,7 +7,11 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "infra:install": "npm --prefix infra install",
+    "infra:build": "npm --prefix infra run build",
+    "infra:synth": "npm --prefix infra run synth",
+    "infra:deploy": "npm --prefix infra run deploy"
   },
   "dependencies": {
     "react": "^19.2.4",

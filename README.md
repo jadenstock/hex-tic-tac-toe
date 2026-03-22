@@ -1,34 +1,88 @@
-# Hexagonal Tic-Tac-Toe (Prototype)
+# Hexagonal Tic-Tac-Toe
 
-Local prototype for a hex-grid tic-tac-toe variant.
+Prototype web app for hex-grid tic-tac-toe, including a minimal AWS multiplayer backend.
 
-## Rules currently implemented
+## Features
 
-- Board is effectively unbounded (you can pan forever).
-- `X` places **1** mark on the opening turn.
-- After that, each turn is **2 placements** for the active player.
-- First player to make **6 in a row** wins.
-- Plan mode is available for hypothetical moves (separate from live game state).
+- Infinite-feel hex board with pan + zoom
+- Live mode rules:
+  - Opening turn: `X` places 1
+  - Then alternating turns of 2 placements each (`O:2`, `X:2`, ...)
+  - Win at 6 in a row
+- Plan mode with separate colors and free placement
+- Multiplayer room sync over WebSocket:
+  - Share one link
+  - Host creates a short game code (up to 5 letters/numbers)
+  - Friend joins using that code
+  - Moves sync live through AWS
 
-## Controls
-
-- Drag board: pan horizontally/vertically
-- Mouse wheel / trackpad scroll: zoom in/out
-- Click a hex: place on current layer
-- `Live mode`: real game moves
-- `Plan mode`: analysis moves (does not change live moves)
-
-## Run locally (WSL)
+## Local frontend run
 
 ```bash
 npm install
 npm run dev
 ```
 
-Then open the local URL shown by Vite (usually `http://localhost:5173`).
+If using multiplayer locally, create `.env` from `.env.example` and set `VITE_WS_URL`.
 
-## Build
+## AWS stack (minimal prototype)
+
+Infra lives in `infra/`.
+
+Resources created:
+
+- `S3 + CloudFront` for frontend hosting
+- `API Gateway WebSocket API` (`create`, `join`, `place`, `sync` routes)
+- `Lambda` handlers (`connect`, `disconnect`, `message`)
+- `DynamoDB` tables for rooms and connections
+
+### Deploy
+
+1. Build frontend assets:
 
 ```bash
 npm run build
 ```
+
+2. Bootstrap account once per region (if not already done):
+
+```bash
+cd infra
+npm install
+npx cdk bootstrap
+```
+
+3. Deploy stack:
+
+```bash
+npm run deploy
+```
+
+4. Copy outputs:
+
+- `SiteUrl` -> share this with friends
+- `WebSocketUrl` -> put into frontend `.env` as `VITE_WS_URL`
+
+5. Rebuild and redeploy frontend after setting websocket URL:
+
+```bash
+cd ..
+cp .env.example .env
+# edit .env with real WebSocketUrl
+npm run build
+cd infra
+npm run deploy
+```
+
+## Useful root scripts
+
+- `npm run infra:install`
+- `npm run infra:build`
+- `npm run infra:synth`
+- `npm run infra:deploy`
+
+## Notes
+
+- For this prototype, game codes are 5-char uppercase alphanumeric values generated server-side.
+- No user identity/auth ownership yet; any joined client can place `X` or `O`.
+- This is intentionally minimal and optimized for quick iteration.
