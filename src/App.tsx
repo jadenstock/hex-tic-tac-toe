@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react'
 import './App.css'
+import { DEFAULT_BOT_TUNING, chooseGreedyTurn, evaluateBoardState, type BotTuning } from './bot/engine'
 
 type Player = 'X' | 'O'
 type Mode = 'live' | 'plan'
@@ -267,6 +268,14 @@ function moveHistoryObjectToArray(value: unknown): MoveRecord[] {
   return next
 }
 
+function HintPill({ text }: { text: string }) {
+  return (
+    <span className="hint-pill" data-tip={text} tabIndex={0} aria-label={text}>
+      ?
+    </span>
+  )
+}
+
 function App() {
   const wrapperRef = useRef<HTMLDivElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
@@ -292,6 +301,12 @@ function App() {
     if (typeof window === 'undefined') return true
     return window.matchMedia('(min-width: 900px)').matches
   })
+  const [dockTab, setDockTab] = useState<'play' | 'bot'>('play')
+  const [autoBotEnabled, setAutoBotEnabled] = useState(false)
+  const [autoBotSide, setAutoBotSide] = useState<'X' | 'O' | 'both'>('O')
+  const [botTuning, setBotTuning] = useState<BotTuning>(DEFAULT_BOT_TUNING)
+  const [showDangerFlags, setShowDangerFlags] = useState(false)
+  const [showRulesModal, setShowRulesModal] = useState(false)
 
   const dragRef = useRef<{
     pointerId: number
@@ -299,6 +314,7 @@ function App() {
     lastY: number
     started: boolean
   } | null>(null)
+  const lastAutoBotSignatureRef = useRef('')
 
   const wsUrl = import.meta.env.VITE_WS_URL as string | undefined
 
@@ -358,7 +374,7 @@ function App() {
 
   const totalLiveMoves = liveState.moves.size
   const totalPlanMoves = planMoves.size
-  const canUndo = liveState.moveHistory.length > 0 && !liveState.winner
+  const canUndo = liveState.moveHistory.length > 0
   const highlightedKeys = useMemo(() => {
     if (liveState.moveHistory.length === 0) {
       return new Set<string>()
@@ -380,10 +396,11 @@ function App() {
   const modeLabel = useMemo(() => {
     return mode === 'live' ? 'Live game' : 'Plan mode'
   }, [mode])
+  const liveEvaluation = useMemo(() => evaluateBoardState(liveState.moves, botTuning), [botTuning, liveState.moves])
 
   const liveStatus = useMemo(() => {
     if (liveState.winner) {
-      return `${liveState.winner} wins with 6 in a row`
+      return `${liveState.winner} wins with 6 in a row. Board locked.`
     }
 
     return `${liveState.turn} to move (${liveState.placementsLeft} placement${liveState.placementsLeft === 1 ? '' : 's'} left)`
@@ -507,6 +524,11 @@ function App() {
   const placeMove = useCallback(
     (q: number, r: number) => {
       if (mode === 'live') {
+        if (liveState.winner) {
+          setNetworkError(`Game over: ${liveState.winner} already won.`)
+          return
+        }
+
         if (playAs !== 'any' && liveState.turn !== playAs) {
           setNetworkError(`You are set to play as ${playAs}. It is ${liveState.turn}'s turn.`)
           return
@@ -545,7 +567,7 @@ function App() {
         return next
       })
     },
-    [joinedRoom, liveState.turn, mode, planBrush, playAs],
+    [joinedRoom, liveState.turn, liveState.winner, mode, planBrush, playAs],
   )
 
   const undoMove = useCallback(() => {
@@ -562,6 +584,110 @@ function App() {
 
     dispatchLive({ type: 'undo' })
   }, [joinedRoom, mode])
+
+  const runGreedyBotTurn = useCallback(() => {
+    if (mode !== 'live') {
+      setNetworkError('Bot play is only available in Live mode.')
+      return
+    }
+
+    if (liveState.winner) {
+      setNetworkError('Game already has a winner.')
+      return
+    }
+
+    const plannedMoves = chooseGreedyTurn(
+      {
+        moves: liveState.moves,
+        moveHistory: liveState.moveHistory,
+        turn: liveState.turn,
+        placementsLeft: liveState.placementsLeft,
+      },
+      botTuning,
+    )
+
+    if (plannedMoves.length === 0) {
+      return
+    }
+
+    setNetworkError(null)
+
+    if (joinedRoom && wsRef.current?.readyState !== WebSocket.OPEN) {
+      setNetworkError('Room socket is not connected. Rejoin or reconnect before bot play.')
+      return
+    }
+
+    if (joinedRoom && wsRef.current?.readyState === WebSocket.OPEN) {
+      for (const move of plannedMoves) {
+        wsRef.current.send(
+          JSON.stringify({
+            action: 'place',
+            q: move.q,
+            r: move.r,
+            mark: liveState.turn,
+          }),
+        )
+      }
+      return
+    }
+
+    for (const move of plannedMoves) {
+      dispatchLive({ type: 'place', q: move.q, r: move.r })
+    }
+  }, [botTuning, joinedRoom, liveState.moveHistory, liveState.moves, liveState.placementsLeft, liveState.turn, liveState.winner, mode])
+
+  const setThreatWeight = (idx: number, value: number) => {
+    setBotTuning((prev) => {
+      const next = [...prev.threatWeights]
+      next[idx] = value
+      return { ...prev, threatWeights: next }
+    })
+  }
+
+  const setBreadthWeight = (idx: number, value: number) => {
+    setBotTuning((prev) => {
+      const next = [...prev.threatBreadthWeights]
+      next[idx] = value
+      return { ...prev, threatBreadthWeights: next }
+    })
+  }
+
+  useEffect(() => {
+    if (!autoBotEnabled || mode !== 'live' || liveState.winner) {
+      return
+    }
+
+    const sideMatches = autoBotSide === 'both' || autoBotSide === liveState.turn
+    if (!sideMatches) {
+      return
+    }
+
+    const lastMove = liveState.moveHistory[liveState.moveHistory.length - 1]
+    const lastMoveSig = lastMove ? `${lastMove.mark}@${lastMove.q},${lastMove.r}` : 'none'
+    const signature = `${joinedRoom ?? 'local'}|${liveState.turn}|${liveState.placementsLeft}|${liveState.moveHistory.length}|${lastMoveSig}`
+    if (lastAutoBotSignatureRef.current === signature) {
+      return
+    }
+    lastAutoBotSignatureRef.current = signature
+
+    const timer = window.setTimeout(() => {
+      runGreedyBotTurn()
+    }, 180)
+
+    return () => {
+      window.clearTimeout(timer)
+    }
+  }, [
+    autoBotEnabled,
+    autoBotSide,
+    joinedRoom,
+    liveState.moveHistory,
+    liveState.placementsLeft,
+    liveState.turn,
+    liveState.winner,
+    mode,
+    runGreedyBotTurn,
+  ])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -719,6 +845,25 @@ function App() {
 
       ctx.restore()
     }
+
+    if (liveState.winner) {
+      ctx.save()
+      ctx.fillStyle = 'rgba(10, 18, 14, 0.22)'
+      ctx.fillRect(0, 0, size.width, size.height)
+      ctx.fillStyle = '#f8fafc'
+      ctx.strokeStyle = 'rgba(15, 23, 42, 0.55)'
+      ctx.lineWidth = 4
+      ctx.font = '700 34px ui-sans-serif, system-ui, sans-serif'
+      ctx.textAlign = 'center'
+      ctx.textBaseline = 'middle'
+      const label = `${liveState.winner} wins`
+      ctx.strokeText(label, size.width / 2, size.height / 2 - 12)
+      ctx.fillText(label, size.width / 2, size.height / 2 - 12)
+      ctx.font = '600 15px ui-sans-serif, system-ui, sans-serif'
+      ctx.fillStyle = '#e2e8f0'
+      ctx.fillText('Board is locked. Use Undo or Sync/Clear to continue.', size.width / 2, size.height / 2 + 18)
+      ctx.restore()
+    }
   }, [
     camera.x,
     camera.y,
@@ -863,18 +1008,44 @@ function App() {
         <div className="topbar-actions">
           <div className={`ws-pill ${wsStatus}`}>{wsStatus}</div>
           <div className="room-pill">{joinedRoom ? `Game: ${joinedRoom}` : 'Local only'}</div>
+          <button className="toggle-hud" onClick={() => setShowRulesModal(true)} type="button">
+            Rules
+          </button>
           <button className="toggle-hud" onClick={() => setShowHud((prev) => !prev)} type="button">
             {showHud ? 'Hide menus' : 'Show menus'}
           </button>
         </div>
       </header>
 
+      {liveState.winner ? <div className="winner-banner">{liveState.winner} wins. Game locked until undo or sync/reset.</div> : null}
+
       {networkError ? <div className="network-error">{networkError}</div> : null}
+      {showRulesModal ? (
+        <div className="rules-modal-backdrop" onClick={() => setShowRulesModal(false)} role="presentation">
+          <section
+            className="rules-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Game rules"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <h2>Rules</h2>
+            <p>X places one mark on the very first turn.</p>
+            <p>After that, each turn is two placements by the active player.</p>
+            <p>First player to make six in a row wins.</p>
+            <div className="button-row">
+              <button onClick={() => setShowRulesModal(false)} type="button">
+                Close
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
 
       <main className="board-wrapper" ref={wrapperRef}>
         <canvas
           ref={canvasRef}
-          className="board"
+          className={`board ${liveState.winner ? 'board-locked' : ''}`}
           onPointerDown={onPointerDown}
           onPointerMove={onPointerMove}
           onPointerUp={onPointerUp}
@@ -909,6 +1080,26 @@ function App() {
             <details className="dock-panel" open>
               <summary>Play controls</summary>
               <section className="controls">
+                <div className="dock-tabs" role="tablist" aria-label="Board controls">
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={dockTab === 'play'}
+                    className={dockTab === 'play' ? 'active' : ''}
+                    onClick={() => setDockTab('play')}
+                  >
+                    Play
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={dockTab === 'bot'}
+                    className={dockTab === 'bot' ? 'active' : ''}
+                    onClick={() => setDockTab('bot')}
+                  >
+                    Bot
+                  </button>
+                </div>
                 <div className="status-grid">
                   <div className="stat">
                     <span>Mode</span>
@@ -929,65 +1120,335 @@ function App() {
                     </strong>
                   </div>
                 </div>
-                <div className="button-row">
-                  <label className="play-as">
-                    Play as
-                    <select value={playAs} onChange={(event) => setPlayAs(event.target.value as PlayAs)}>
-                      <option value="any">Any</option>
-                      <option value="X">X</option>
-                      <option value="O">O</option>
-                    </select>
-                  </label>
-                  <button className={mode === 'live' ? 'active' : ''} onClick={() => setMode('live')} type="button">
-                    Live mode
-                  </button>
-                  <button className={mode === 'plan' ? 'active' : ''} onClick={() => setMode('plan')} type="button">
-                    Plan mode
-                  </button>
-                  <button className={planBrush === 'X' ? 'active plan-x' : 'plan-x'} onClick={() => setPlanBrush('X')} type="button">
-                    Plan X
-                  </button>
-                  <button className={planBrush === 'O' ? 'active plan-o' : 'plan-o'} onClick={() => setPlanBrush('O')} type="button">
-                    Plan O
-                  </button>
-                  <button onClick={clearPlan} type="button">
-                    Clear plan
-                  </button>
-                  <button onClick={undoMove} type="button" disabled={!canUndo}>
-                    Undo last
-                  </button>
-                  <button onClick={clearAll} type="button">
-                    {joinedRoom ? 'Sync room' : 'Clear local'}
-                  </button>
-                  <button onClick={resetView} type="button">
-                    Recenter view
-                  </button>
-                  <div className="zoom-readout">Zoom: {(camera.zoom * 100).toFixed(0)}%</div>
-                  <div className="drag-readout">{isDragging ? 'Panning...' : 'Ready'}</div>
-                </div>
+                {dockTab === 'play' ? (
+                  <div className="button-row">
+                    <label className="play-as">
+                      Play as
+                      <select value={playAs} onChange={(event) => setPlayAs(event.target.value as PlayAs)}>
+                        <option value="any">Any</option>
+                        <option value="X">X</option>
+                        <option value="O">O</option>
+                      </select>
+                    </label>
+                    <button className={mode === 'live' ? 'active' : ''} onClick={() => setMode('live')} type="button">
+                      Live mode
+                    </button>
+                    <button className={mode === 'plan' ? 'active' : ''} onClick={() => setMode('plan')} type="button">
+                      Plan mode
+                    </button>
+                    <button className={planBrush === 'X' ? 'active plan-x' : 'plan-x'} onClick={() => setPlanBrush('X')} type="button">
+                      Plan X
+                    </button>
+                    <button className={planBrush === 'O' ? 'active plan-o' : 'plan-o'} onClick={() => setPlanBrush('O')} type="button">
+                      Plan O
+                    </button>
+                    <button onClick={clearPlan} type="button">
+                      Clear plan
+                    </button>
+                    <button onClick={undoMove} type="button" disabled={!canUndo}>
+                      Undo last
+                    </button>
+                    <button onClick={clearAll} type="button">
+                      {joinedRoom ? 'Sync room' : 'Clear local'}
+                    </button>
+                    <button onClick={resetView} type="button">
+                      Recenter view
+                    </button>
+                    <div className="zoom-readout">Zoom: {(camera.zoom * 100).toFixed(0)}%</div>
+                    <div className="drag-readout">{isDragging ? 'Panning...' : 'Ready'}</div>
+                  </div>
+                ) : (
+                  <section className="bot-panel">
+                    <div className="score-bar" aria-label="Board evaluation score bar">
+                      <div className="score-x" style={{ width: `${(liveEvaluation.xShare * 100).toFixed(1)}%` }}>
+                        X {(liveEvaluation.xShare * 100).toFixed(0)}%
+                      </div>
+                      <div className="score-o">O {(100 - liveEvaluation.xShare * 100).toFixed(0)}%</div>
+                    </div>
+                    <div className="bot-metrics">
+                      <div className="stat">
+                        <span>X Score</span>
+                        <strong>{liveEvaluation.xScore}</strong>
+                      </div>
+                      <div className="stat">
+                        <span>O Score</span>
+                        <strong>{liveEvaluation.oScore}</strong>
+                      </div>
+                      <div className="stat">
+                        <span>X Threats</span>
+                        <strong>
+                          1:{liveEvaluation.xThreats[1]} 2:{liveEvaluation.xThreats[2]} 3:{liveEvaluation.xThreats[3]} 4:
+                          {liveEvaluation.xThreats[4]} 5:{liveEvaluation.xThreats[5]}
+                        </strong>
+                      </div>
+                      <div className="stat">
+                        <span>O Threats</span>
+                        <strong>
+                          1:{liveEvaluation.oThreats[1]} 2:{liveEvaluation.oThreats[2]} 3:{liveEvaluation.oThreats[3]} 4:
+                          {liveEvaluation.oThreats[4]} 5:{liveEvaluation.oThreats[5]}
+                        </strong>
+                      </div>
+                      <div className="stat">
+                        <span>X One-turn wins</span>
+                        <strong>{liveEvaluation.xOneTurnWins}</strong>
+                      </div>
+                      <div className="stat">
+                        <span>O One-turn wins</span>
+                        <strong>{liveEvaluation.oOneTurnWins}</strong>
+                      </div>
+                      {showDangerFlags ? (
+                        <div className="stat">
+                          <span>X Will win next turn</span>
+                          <strong>{liveEvaluation.xWillWinNextTurn ? 'Yes' : 'No'}</strong>
+                        </div>
+                      ) : null}
+                      {showDangerFlags ? (
+                        <div className="stat">
+                          <span>O Will win next turn</span>
+                          <strong>{liveEvaluation.oWillWinNextTurn ? 'Yes' : 'No'}</strong>
+                        </div>
+                      ) : null}
+                    </div>
+                    <div className="button-row">
+                      <button onClick={runGreedyBotTurn} type="button" disabled={mode !== 'live' || !!liveState.winner}>
+                        Play greedy turn for {liveState.turn}
+                      </button>
+                      <label className="play-as">
+                        Show danger flags
+                        <input
+                          type="checkbox"
+                          checked={showDangerFlags}
+                          onChange={(event) => setShowDangerFlags(event.target.checked)}
+                        />
+                      </label>
+                      <label className="play-as">
+                        Auto-play bot
+                        <input
+                          type="checkbox"
+                          checked={autoBotEnabled}
+                          onChange={(event) => {
+                            setAutoBotEnabled(event.target.checked)
+                            lastAutoBotSignatureRef.current = ''
+                          }}
+                        />
+                      </label>
+                      <label className="play-as">
+                        Bot side
+                        <select
+                          value={autoBotSide}
+                          onChange={(event) => {
+                            setAutoBotSide(event.target.value as 'X' | 'O' | 'both')
+                            lastAutoBotSignatureRef.current = ''
+                          }}
+                          disabled={!autoBotEnabled}
+                        >
+                          <option value="X">X</option>
+                          <option value="O">O</option>
+                          <option value="both">Both</option>
+                        </select>
+                      </label>
+                      <div className="drag-readout">
+                        {mode === 'live'
+                          ? `Bot will place ${liveState.placementsLeft} mark${liveState.placementsLeft === 1 ? '' : 's'}`
+                          : 'Switch to Live mode for bot play'}
+                      </div>
+                    </div>
+                    <details className="tuning-panel">
+                      <summary>Advanced tuning (opinionated defaults)</summary>
+                      <div className="tuning-grid">
+                        <label>
+                          <span className="tuning-label-text">
+                            Threat-3 base <HintPill text="Base value of each uncontested 3-in-a-row threat window." />
+                          </span>
+                          <input
+                            type="number"
+                            value={botTuning.threatWeights[3]}
+                            onChange={(e) => setThreatWeight(3, Number(e.target.value))}
+                          />
+                        </label>
+                        <label>
+                          <span className="tuning-label-text">
+                            Threat-4 base <HintPill text="Base value of each uncontested 4-in-a-row threat window." />
+                          </span>
+                          <input
+                            type="number"
+                            value={botTuning.threatWeights[4]}
+                            onChange={(e) => setThreatWeight(4, Number(e.target.value))}
+                          />
+                        </label>
+                        <label>
+                          <span className="tuning-label-text">
+                            Threat-5 base <HintPill text="Base value of each uncontested 5-in-a-row threat window." />
+                          </span>
+                          <input
+                            type="number"
+                            value={botTuning.threatWeights[5]}
+                            onChange={(e) => setThreatWeight(5, Number(e.target.value))}
+                          />
+                        </label>
+                        <label>
+                          <span className="tuning-label-text">
+                            Threat-3 breadth{' '}
+                            <HintPill text="Extra bonus for having many 3-threats at once (scales with count squared)." />
+                          </span>
+                          <input
+                            type="number"
+                            value={botTuning.threatBreadthWeights[3]}
+                            onChange={(e) => setBreadthWeight(3, Number(e.target.value))}
+                          />
+                        </label>
+                        <label>
+                          <span className="tuning-label-text">
+                            Threat-4 breadth{' '}
+                            <HintPill text="Extra bonus for multiple 4-threats at once; encourages fork creation." />
+                          </span>
+                          <input
+                            type="number"
+                            value={botTuning.threatBreadthWeights[4]}
+                            onChange={(e) => setBreadthWeight(4, Number(e.target.value))}
+                          />
+                        </label>
+                        <label>
+                          <span className="tuning-label-text">
+                            Threat-5 breadth <HintPill text="Extra bonus for multiple 5-threats; usually near forced wins." />
+                          </span>
+                          <input
+                            type="number"
+                            value={botTuning.threatBreadthWeights[5]}
+                            onChange={(e) => setBreadthWeight(5, Number(e.target.value))}
+                          />
+                        </label>
+                        <label>
+                          <span className="tuning-label-text">
+                            Defense weight{' '}
+                            <HintPill text="Blend between offense and defense. 0.5 means balanced; higher values prioritize reducing opponent score." />
+                          </span>
+                          <input
+                            type="number"
+                            min={0}
+                            max={1}
+                            step={0.05}
+                            value={botTuning.defenseWeight}
+                            onChange={(e) =>
+                              setBotTuning((prev) => ({
+                                ...prev,
+                                defenseWeight: Math.max(0, Math.min(1, Number(e.target.value) || 0)),
+                              }))
+                            }
+                          />
+                        </label>
+                        <label>
+                          <span className="tuning-label-text">
+                            Immediate danger penalty{' '}
+                            <HintPill text="Large penalty applied whenever opponent still has any one-turn win threat group after your move." />
+                          </span>
+                          <input
+                            type="number"
+                            value={botTuning.immediateDangerPenalty}
+                            onChange={(e) =>
+                              setBotTuning((prev) => ({
+                                ...prev,
+                                immediateDangerPenalty: Math.max(0, Number(e.target.value) || 0),
+                              }))
+                            }
+                          />
+                        </label>
+                        <label>
+                          <span className="tuning-label-text">
+                            One-turn win bonus{' '}
+                            <HintPill text="Bonus per unique empty cell that completes a win in one turn (up to two placements)." />
+                          </span>
+                          <input
+                            type="number"
+                            value={botTuning.oneTurnWinBonus}
+                            onChange={(e) => setBotTuning((prev) => ({ ...prev, oneTurnWinBonus: Number(e.target.value) }))}
+                          />
+                        </label>
+                        <label>
+                          <span className="tuning-label-text">
+                            Threat-3 cluster bonus <HintPill text="Extra emphasis on building dense groups of 3-threats." />
+                          </span>
+                          <input
+                            type="number"
+                            value={botTuning.threat3ClusterBonus}
+                            onChange={(e) =>
+                              setBotTuning((prev) => ({
+                                ...prev,
+                                threat3ClusterBonus: Number(e.target.value),
+                              }))
+                            }
+                          />
+                        </label>
+                        <label>
+                          <span className="tuning-label-text">
+                            Threat-4 fork bonus{' '}
+                            <HintPill text="Additional bonus when there is more than one 4-threat; models dual-threat pressure." />
+                          </span>
+                          <input
+                            type="number"
+                            value={botTuning.threat4ForkBonus}
+                            onChange={(e) => setBotTuning((prev) => ({ ...prev, threat4ForkBonus: Number(e.target.value) }))}
+                          />
+                        </label>
+                        <label>
+                          <span className="tuning-label-text">
+                            Threat-5 fork bonus{' '}
+                            <HintPill text="Additional bonus when there is more than one 5-threat; often decisive." />
+                          </span>
+                          <input
+                            type="number"
+                            value={botTuning.threat5ForkBonus}
+                            onChange={(e) => setBotTuning((prev) => ({ ...prev, threat5ForkBonus: Number(e.target.value) }))}
+                          />
+                        </label>
+                        <label>
+                          <span className="tuning-label-text">
+                            Candidate radius{' '}
+                            <HintPill text="How far from existing stones the bot considers candidate cells. Higher is wider but slower." />
+                          </span>
+                          <input
+                            type="number"
+                            min={1}
+                            max={7}
+                            value={botTuning.candidateRadius}
+                            onChange={(e) =>
+                              setBotTuning((prev) => ({
+                                ...prev,
+                                candidateRadius: Math.max(1, Math.min(7, Number(e.target.value) || 1)),
+                              }))
+                            }
+                          />
+                        </label>
+                        <label>
+                          <span className="tuning-label-text">
+                            Top-K first moves{' '}
+                            <HintPill text="For 2-placement turns, evaluate this many best first moves before choosing the line with best follow-up second move." />
+                          </span>
+                          <input
+                            type="number"
+                            min={1}
+                            max={20}
+                            value={botTuning.topKFirstMoves}
+                            onChange={(e) =>
+                              setBotTuning((prev) => ({
+                                ...prev,
+                                topKFirstMoves: Math.max(1, Math.min(20, Math.floor(Number(e.target.value) || 1))),
+                              }))
+                            }
+                          />
+                        </label>
+                      </div>
+                      <div className="button-row">
+                        <button onClick={() => setBotTuning(DEFAULT_BOT_TUNING)} type="button">
+                          Reset to defaults
+                        </button>
+                      </div>
+                    </details>
+                  </section>
+                )}
               </section>
             </details>
 
-            <details className="help-panel dock-panel">
-              <summary>Rules and UI limits</summary>
-              <div className="help-content">
-                <p>
-                  <strong>Rules:</strong> X places one mark on the first turn. After that, each turn is two placements by the
-                  active player. First player to make six in a row wins.
-                </p>
-                <p>
-                  <strong>Highlights:</strong> the most recent live placements (up to two cells) are highlighted on the board.
-                </p>
-                <p>
-                  <strong>Multiplayer limitations:</strong> there is no player identity yet, so either person in a room can place
-                  the current turn's mark. Game codes are shared and not private.
-                </p>
-                <p>
-                  <strong>Backtracking:</strong> use <code>Undo last</code> in Live mode to remove the most recent move (works in
-                  local and synced room play).
-                </p>
-              </div>
-            </details>
           </section>
         ) : null}
       </main>

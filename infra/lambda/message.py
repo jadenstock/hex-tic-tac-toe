@@ -16,6 +16,12 @@ CONNECTION_TTL_SECONDS = int(os.environ.get('CONNECTION_TTL_SECONDS', '86400'))
 ROOM_TTL_SECONDS = int(os.environ.get('ROOM_TTL_SECONDS', '604800'))
 GAME_CODE_CHARS = string.ascii_uppercase + string.digits
 GAME_CODE_LEN = 5
+WIN_LENGTH = 6
+WIN_DIRECTIONS = (
+    (1, 0),
+    (0, 1),
+    (1, -1),
+)
 
 
 def _response(status_code: int, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -89,6 +95,32 @@ def _build_board_from_history(move_history: list[Dict[str, Any]]) -> Dict[str, s
     for move in move_history:
         board[f"{move['q']},{move['r']}"] = move['mark']
     return board
+
+
+def _count_direction(board: Dict[str, str], q: int, r: int, dq: int, dr: int, player: str) -> int:
+    count = 0
+    cq = q + dq
+    cr = r + dr
+    while board.get(f'{cq},{cr}') == player:
+        count += 1
+        cq += dq
+        cr += dr
+    return count
+
+
+def _find_winner(board: Dict[str, str]) -> str | None:
+    for key, player in board.items():
+        if player not in ('X', 'O'):
+            continue
+        q_str, r_str = key.split(',')
+        q = int(q_str)
+        r = int(r_str)
+        for dq, dr in WIN_DIRECTIONS:
+            forward = _count_direction(board, q, r, dq, dr, player)
+            backward = _count_direction(board, q, r, -dq, -dr, player)
+            if 1 + forward + backward >= WIN_LENGTH:
+                return player
+    return None
 
 
 def _touch_room_expiry(
@@ -282,6 +314,11 @@ def _handle_place(event: Dict[str, Any]) -> Dict[str, Any]:
 
     move_history = _normalize_move_history(room.get('moveHistory', []))
     board_state = dict(room.get('boardState', {}))
+    winner = _find_winner(board_state)
+    if winner:
+        _send_error(client, connection_id, f'game already complete ({winner} won)')
+        return _response(409, {'ok': False})
+
     if f'{q},{r}' in board_state:
         _send_error(client, connection_id, 'cell already occupied')
         return _response(409, {'ok': False})
