@@ -14,6 +14,7 @@ dist-ssr
 .env
 .env.*
 !.env.example
+.bot-opt/
 infra/node_modules
 infra/dist
 infra/cdk.out
