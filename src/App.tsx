@@ -1240,11 +1240,10 @@ function App() {
                             setAutoBotSide(event.target.value as 'X' | 'O' | 'both')
                             lastAutoBotSignatureRef.current = ''
                           }}
-                          disabled={!autoBotEnabled}
                         >
+                          <option value="both">Both</option>
                           <option value="X">X</option>
                           <option value="O">O</option>
-                          <option value="both">Both</option>
                         </select>
                       </label>
                       <div className="drag-readout">
