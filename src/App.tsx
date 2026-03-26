@@ -1,6 +1,14 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react'
 import './App.css'
-import { DEFAULT_BOT_TUNING, chooseGreedyTurn, evaluateBoardState, type BotTuning } from './bot/engine'
+import {
+  DEFAULT_BOT_SEARCH_OPTIONS,
+  DEFAULT_BOT_TUNING,
+  chooseBotTurnDetailed,
+  evaluateBoardState,
+  type BotSearchStats,
+  type BotSearchOptions,
+  type BotTuning,
+} from './bot/engine'
 
 type Player = 'X' | 'O'
 type Mode = 'live' | 'plan'
@@ -304,7 +312,9 @@ function App() {
   const [dockTab, setDockTab] = useState<'play' | 'bot'>('play')
   const [autoBotEnabled, setAutoBotEnabled] = useState(false)
   const [autoBotSide, setAutoBotSide] = useState<'X' | 'O' | 'both'>('O')
+  const [botThinkSeconds, setBotThinkSeconds] = useState(0)
   const [botTuning, setBotTuning] = useState<BotTuning>(DEFAULT_BOT_TUNING)
+  const [lastBotStats, setLastBotStats] = useState<BotSearchStats | null>(null)
   const [showDangerFlags, setShowDangerFlags] = useState(false)
   const [showRulesModal, setShowRulesModal] = useState(false)
 
@@ -397,6 +407,29 @@ function App() {
     return mode === 'live' ? 'Live game' : 'Plan mode'
   }, [mode])
   const liveEvaluation = useMemo(() => evaluateBoardState(liveState.moves, botTuning), [botTuning, liveState.moves])
+  const botSearchOptions = useMemo<BotSearchOptions>(() => {
+    if (botThinkSeconds <= 0) {
+      return {
+        ...DEFAULT_BOT_SEARCH_OPTIONS,
+        budget: { maxTimeMs: 0, maxNodes: 0 },
+      }
+    }
+
+    const seconds = Math.max(0.1, Math.min(12, botThinkSeconds))
+    const normalized = seconds / 12
+
+    return {
+      ...DEFAULT_BOT_SEARCH_OPTIONS,
+      budget: {
+        maxTimeMs: Math.round(seconds * 1000),
+        maxNodes: Math.round(50000 + normalized * 750000),
+      },
+      turnCandidateCount: Math.max(5, Math.min(12, 5 + Math.floor(normalized * 7))),
+      maxSimulationTurns: Math.max(2, Math.min(6, 2 + Math.floor(normalized * 4))),
+      simulationRadius: Math.max(2, Math.min(6, Math.min(botTuning.candidateRadius, 2 + Math.floor(normalized * 5)))),
+      simulationTopKFirstMoves: Math.max(1, Math.min(4, 1 + Math.floor(normalized * 3))),
+    }
+  }, [botThinkSeconds, botTuning.candidateRadius])
 
   const liveStatus = useMemo(() => {
     if (liveState.winner) {
@@ -585,7 +618,7 @@ function App() {
     dispatchLive({ type: 'undo' })
   }, [joinedRoom, mode])
 
-  const runGreedyBotTurn = useCallback(() => {
+  const runBotTurn = useCallback(() => {
     if (mode !== 'live') {
       setNetworkError('Bot play is only available in Live mode.')
       return
@@ -596,7 +629,7 @@ function App() {
       return
     }
 
-    const plannedMoves = chooseGreedyTurn(
+    const decision = chooseBotTurnDetailed(
       {
         moves: liveState.moves,
         moveHistory: liveState.moveHistory,
@@ -604,7 +637,10 @@ function App() {
         placementsLeft: liveState.placementsLeft,
       },
       botTuning,
+      botSearchOptions,
     )
+    setLastBotStats(decision.stats)
+    const plannedMoves = decision.moves
 
     if (plannedMoves.length === 0) {
       return
@@ -634,7 +670,17 @@ function App() {
     for (const move of plannedMoves) {
       dispatchLive({ type: 'place', q: move.q, r: move.r })
     }
-  }, [botTuning, joinedRoom, liveState.moveHistory, liveState.moves, liveState.placementsLeft, liveState.turn, liveState.winner, mode])
+  }, [
+    botSearchOptions,
+    botTuning,
+    joinedRoom,
+    liveState.moveHistory,
+    liveState.moves,
+    liveState.placementsLeft,
+    liveState.turn,
+    liveState.winner,
+    mode,
+  ])
 
   const setThreatWeight = (idx: number, value: number) => {
     setBotTuning((prev) => {
@@ -671,7 +717,7 @@ function App() {
     lastAutoBotSignatureRef.current = signature
 
     const timer = window.setTimeout(() => {
-      runGreedyBotTurn()
+      runBotTurn()
     }, 180)
 
     return () => {
@@ -686,7 +732,7 @@ function App() {
     liveState.turn,
     liveState.winner,
     mode,
-    runGreedyBotTurn,
+    runBotTurn,
   ])
 
   useEffect(() => {
@@ -1210,8 +1256,8 @@ function App() {
                       ) : null}
                     </div>
                     <div className="button-row">
-                      <button onClick={runGreedyBotTurn} type="button" disabled={mode !== 'live' || !!liveState.winner}>
-                        Play greedy turn for {liveState.turn}
+                      <button onClick={runBotTurn} type="button" disabled={mode !== 'live' || !!liveState.winner}>
+                        {botThinkSeconds <= 0 ? `Play greedy turn for ${liveState.turn}` : `Play search turn for ${liveState.turn}`}
                       </button>
                       <label className="play-as">
                         Show danger flags
@@ -1251,6 +1297,33 @@ function App() {
                           ? `Bot will place ${liveState.placementsLeft} mark${liveState.placementsLeft === 1 ? '' : 's'}`
                           : 'Switch to Live mode for bot play'}
                       </div>
+                    </div>
+                    <div className="compute-panel">
+                      <label className="compute-label" htmlFor="bot-compute-slider">
+                        Search time limit: {botThinkSeconds.toFixed(1)}s
+                        <HintPill text="0.0s uses greedy only. Higher values run budgeted MCTS with guided (non-random) simulation and larger node caps." />
+                      </label>
+                      <input
+                        id="bot-compute-slider"
+                        type="range"
+                        min={0}
+                        max={12}
+                        step={0.1}
+                        value={botThinkSeconds}
+                        onChange={(event) => setBotThinkSeconds(Math.max(0, Math.min(12, Number(event.target.value) || 0)))}
+                      />
+                      <div className="compute-meta">
+                        {botThinkSeconds <= 0
+                          ? 'Mode: Greedy (no search)'
+                          : `Mode: MCTS | Budget: ${botSearchOptions.budget.maxTimeMs}ms or ${botSearchOptions.budget.maxNodes.toLocaleString()} nodes`}
+                      </div>
+                      {lastBotStats ? (
+                        <div className="compute-meta">
+                          Last run: {lastBotStats.mode.toUpperCase()} | {(lastBotStats.elapsedMs / 1000).toFixed(3)}s | nodes{' '}
+                          {lastBotStats.nodesExpanded.toLocaleString()} | playouts {lastBotStats.playouts.toLocaleString()} | depth{' '}
+                          {lastBotStats.maxDepthTurns} turns | root cands {lastBotStats.rootCandidates} | stop {lastBotStats.stopReason}
+                        </div>
+                      ) : null}
                     </div>
                     <details className="tuning-panel">
                       <summary>Advanced tuning (opinionated defaults)</summary>
