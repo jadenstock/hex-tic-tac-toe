@@ -11,6 +11,7 @@
     "bot:opt": "node --experimental-strip-types bot-optimizer/run.ts",
     "bot:opt:gen": "node --experimental-strip-types bot-optimizer/generate-challengers.ts",
     "bot:opt:promote": "node --experimental-strip-types bot-optimizer/promote-best.ts",
+    "bot:api": "node --experimental-strip-types bot-api/server.ts",
     "infra:install": "npm --prefix infra install",
     "infra:build": "npm --prefix infra run build",
     "infra:synth": "npm --prefix infra run synth",

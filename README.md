@@ -80,6 +80,18 @@ npm run deploy
 - `npm run infra:build`
 - `npm run infra:synth`
 - `npm run infra:deploy`
+- `npm run bot:api`
+
+## Stateless bot API (for external bot platforms)
+
+This repo includes a stateless HTTP bot adapter at `bot-api/server.ts`.
+
+- Endpoint: `POST /v1-alpha/turn`
+- Health: `GET /healthz`
+- Local run: `npm run bot:api`
+- Dockerfile: `bot-api/Dockerfile`
+
+See `bot-api/README.md` for request/response examples.
 
 ## Notes
 
