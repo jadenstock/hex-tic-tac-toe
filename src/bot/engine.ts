@@ -52,18 +52,18 @@ export type BotTuning = {
 }
 
 export const DEFAULT_BOT_TUNING: BotTuning = {
-  threatWeights: [0, 0, 1, 36, 760, 760, 20_000],
-  threatBreadthWeights: [0, 0, 0, 36, 180, 180, 0],
-  defenseWeight: 0.5,
-  immediateDangerPenalty: 250_000,
-  oneTurnWinBonus: 9_000,
-  oneTurnForkBonus: 26_000,
-  oneTurnOverlapPenalty: 4_500,
-  threat3ClusterBonus: 160,
-  threat4ForkBonus: 12_000,
-  threat5ForkBonus: 12_000,
-  candidateRadius: 5,
-  topKFirstMoves: 6,
+  threatWeights: [0, 0, 1, 30.6, 760, 912, 20000],
+  threatBreadthWeights: [0, 0, 0, 28.8, 180, 225, 0],
+  defenseWeight: 0.72,
+  immediateDangerPenalty: 412500,
+  oneTurnWinBonus: 8100,
+  oneTurnForkBonus: 27300,
+  oneTurnOverlapPenalty: 6975,
+  threat3ClusterBonus: 120,
+  threat4ForkBonus: 17400,
+  threat5ForkBonus: 15000,
+  candidateRadius: 4,
+  topKFirstMoves: 5,
 }
 
 function toKey(q: number, r: number): string {
