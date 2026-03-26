@@ -13,7 +13,7 @@ export type LiveLikeState = {
   placementsLeft: number
 }
 
-type Axial = { q: number; r: number }
+export type Axial = { q: number; r: number }
 
 export type EvaluationResult = {
   xScore: number
@@ -51,6 +51,37 @@ export type BotTuning = {
   topKFirstMoves: number
 }
 
+export type BotSearchBudget = {
+  maxTimeMs: number
+  maxNodes: number
+}
+
+export type BotSearchOptions = {
+  budget: BotSearchBudget
+  explorationC: number
+  turnCandidateCount: number
+  maxSimulationTurns: number
+  simulationRadius: number
+  simulationTopKFirstMoves: number
+}
+
+export type BotSearchMode = 'greedy' | 'mcts'
+
+export type BotSearchStats = {
+  mode: BotSearchMode
+  elapsedMs: number
+  nodesExpanded: number
+  playouts: number
+  maxDepthTurns: number
+  rootCandidates: number
+  stopReason: 'budget_zero' | 'time' | 'nodes' | 'terminal' | 'no_candidates' | 'fallback' | 'early_win'
+}
+
+export type BotTurnDecision = {
+  moves: Axial[]
+  stats: BotSearchStats
+}
+
 export const DEFAULT_BOT_TUNING: BotTuning = {
   threatWeights: [0, 0, 1, 30.6, 760, 912, 20000],
   threatBreadthWeights: [0, 0, 0, 28.8, 180, 225, 0],
@@ -64,6 +95,18 @@ export const DEFAULT_BOT_TUNING: BotTuning = {
   threat5ForkBonus: 15000,
   candidateRadius: 4,
   topKFirstMoves: 5,
+}
+
+export const DEFAULT_BOT_SEARCH_OPTIONS: BotSearchOptions = {
+  budget: {
+    maxTimeMs: 600,
+    maxNodes: 120000,
+  },
+  explorationC: 1.15,
+  turnCandidateCount: 7,
+  maxSimulationTurns: 3,
+  simulationRadius: 3,
+  simulationTopKFirstMoves: 2,
 }
 
 function toKey(q: number, r: number): string {
@@ -211,6 +254,21 @@ function appendMove(state: LiveLikeState, q: number, r: number, mark: Player): L
   }
 }
 
+function turnStateFromMoveCount(totalMoves: number): { turn: Player; placementsLeft: number } {
+  if (totalMoves === 0) {
+    return { turn: 'X', placementsLeft: 1 }
+  }
+  if (totalMoves === 1) {
+    return { turn: 'O', placementsLeft: 2 }
+  }
+  const k = totalMoves - 1
+  const turnIndex = Math.floor(k / 2)
+  return {
+    turn: turnIndex % 2 === 0 ? 'O' : 'X',
+    placementsLeft: k % 2 === 0 ? 2 : 1,
+  }
+}
+
 function candidateCells(moves: Map<string, Player>, radius: number): Axial[] {
   if (moves.size === 0) {
     return [{ q: 0, r: 0 }]
@@ -237,6 +295,146 @@ function candidateCells(moves: Map<string, Player>, radius: number): Axial[] {
   return [...candidates].map(fromKey)
 }
 
+type RankedPlacement = {
+  option: Axial
+  simulated: LiveLikeState
+  immediateWin: boolean
+  objective: number
+  ownScore: number
+}
+
+function rankPlacements(
+  working: LiveLikeState,
+  player: Player,
+  tuning: BotTuning,
+  rankOptions?: { ignoreDangerFlag?: boolean },
+): RankedPlacement[] {
+  const moveOptions = candidateCells(working.moves, tuning.candidateRadius)
+  const ranked = moveOptions.map((option) => {
+    const simulated = appendMove(working, option.q, option.r, player)
+    const immediateWin = isWinningPlacement(simulated.moves, option.q, option.r, player)
+    const evalResult = evaluateBoardState(simulated.moves, tuning)
+    const objective = immediateWin
+      ? Number.POSITIVE_INFINITY
+      : objectiveForPlayer(evalResult, player, tuning, rankOptions)
+    const ownScore = player === 'X' ? evalResult.xScore : evalResult.oScore
+    return { option, simulated, immediateWin, objective, ownScore }
+  })
+
+  ranked.sort((a, b) => {
+    if (a.immediateWin !== b.immediateWin) return a.immediateWin ? -1 : 1
+    if (a.objective !== b.objective) return b.objective - a.objective
+    return b.ownScore - a.ownScore
+  })
+
+  return ranked
+}
+
+function enumerateTurnCandidates(state: LiveLikeState, tuning: BotTuning, maxCandidates: number): Axial[][] {
+  const player = state.turn
+  const placements = state.placementsLeft
+  if (placements <= 0) return []
+
+  const immediateWin = findImmediateWinningMove(state, player, tuning.candidateRadius)
+  if (immediateWin) {
+    return [[immediateWin]]
+  }
+
+  const firstRanked = rankPlacements(state, player, tuning, { ignoreDangerFlag: placements >= 2 })
+  if (firstRanked.length === 0) return []
+
+  const baseEval = evaluateBoardState(state.moves, tuning)
+  const baselineOppWins = opponentOneTurnWins(baseEval, player)
+  const capped = Math.max(1, Math.floor(maxCandidates))
+
+  const maybeApplyDefensivePruning = (
+    lines: Array<{ line: Axial[]; objective: number; ownScore: number; immediateWin: boolean; oppOneTurnWins: number }>,
+  ) => {
+    if (baselineOppWins <= 0) return lines
+
+    const fullyBlocked = lines.filter((entry) => entry.oppOneTurnWins === 0)
+    if (fullyBlocked.length > 0) return fullyBlocked
+
+    const minOppWins = lines.reduce((min, entry) => Math.min(min, entry.oppOneTurnWins), Number.POSITIVE_INFINITY)
+    return lines.filter((entry) => entry.oppOneTurnWins === minOppWins)
+  }
+
+  if (placements === 1) {
+    const lines = firstRanked.slice(0, capped).map((entry) => {
+      const evalResult = evaluateBoardState(entry.simulated.moves, tuning)
+      return {
+        line: [entry.option],
+        objective: objectiveForPlayer(evalResult, player, tuning),
+        ownScore: player === 'X' ? evalResult.xScore : evalResult.oScore,
+        immediateWin: entry.immediateWin,
+        oppOneTurnWins: opponentOneTurnWins(evalResult, player),
+      }
+    })
+    const pruned = maybeApplyDefensivePruning(lines)
+    pruned.sort((a, b) => {
+      if (a.immediateWin !== b.immediateWin) return a.immediateWin ? -1 : 1
+      if (a.objective !== b.objective) return b.objective - a.objective
+      return b.ownScore - a.ownScore
+    })
+    return pruned.map((entry) => entry.line)
+  }
+
+  const topK = Math.max(1, Math.floor(tuning.topKFirstMoves))
+  const firstCandidates = firstRanked.slice(0, Math.min(capped, topK))
+  const secondLimit = Math.max(1, Math.floor(capped / Math.max(1, firstCandidates.length)))
+
+  const lines: Array<{ line: Axial[]; objective: number; ownScore: number; immediateWin: boolean; oppOneTurnWins: number }> = []
+
+  for (const first of firstCandidates) {
+    const secondRanked = rankPlacements(first.simulated, player, tuning)
+    if (secondRanked.length === 0) {
+      const evalResult = evaluateBoardState(first.simulated.moves, tuning)
+      lines.push({
+        line: [first.option],
+        objective: objectiveForPlayer(evalResult, player, tuning),
+        ownScore: player === 'X' ? evalResult.xScore : evalResult.oScore,
+        immediateWin: first.immediateWin,
+        oppOneTurnWins: opponentOneTurnWins(evalResult, player),
+      })
+      continue
+    }
+
+    for (const second of secondRanked.slice(0, secondLimit)) {
+      const evalResult = evaluateBoardState(second.simulated.moves, tuning)
+      lines.push({
+        line: [first.option, second.option],
+        objective: objectiveForPlayer(evalResult, player, tuning),
+        ownScore: player === 'X' ? evalResult.xScore : evalResult.oScore,
+        immediateWin: second.immediateWin,
+        oppOneTurnWins: opponentOneTurnWins(evalResult, player),
+      })
+    }
+  }
+
+  if (lines.length === 0) {
+    return [[firstCandidates[0].option]]
+  }
+
+  const pruned = maybeApplyDefensivePruning(lines)
+  pruned.sort((a, b) => {
+    if (a.immediateWin !== b.immediateWin) return a.immediateWin ? -1 : 1
+    if (a.objective !== b.objective) return b.objective - a.objective
+    return b.ownScore - a.ownScore
+  })
+
+  const unique = new Set<string>()
+  const picks: Axial[][] = []
+  for (const candidate of pruned) {
+    const key = candidate.line.map((cell) => toKey(cell.q, cell.r)).join('|')
+    if (unique.has(key)) continue
+    unique.add(key)
+    picks.push(candidate.line)
+    if (picks.length >= capped) break
+  }
+
+  return picks
+}
+
 function objectiveForPlayer(
   result: EvaluationResult,
   player: Player,
@@ -248,6 +446,10 @@ function objectiveForPlayer(
   const oppOneTurnWins = player === 'X' ? result.oOneTurnWins : result.xOneTurnWins
   const dangerPenalty = options?.ignoreDangerFlag ? 0 : oppOneTurnWins > 0 ? tuning.immediateDangerPenalty : 0
   return (1 - tuning.defenseWeight) * own - tuning.defenseWeight * opp - dangerPenalty
+}
+
+function opponentOneTurnWins(result: EvaluationResult, player: Player): number {
+  return player === 'X' ? result.oOneTurnWins : result.xOneTurnWins
 }
 
 function countDirectional(
@@ -302,67 +504,404 @@ export function chooseGreedyTurn(state: LiveLikeState, tuning: BotTuning = DEFAU
     return [immediateWin]
   }
 
-  const rankMoves = (working: LiveLikeState, rankOptions?: { ignoreDangerFlag?: boolean }) => {
-    const moveOptions = candidateCells(working.moves, tuning.candidateRadius)
-    const ranked = moveOptions.map((option) => {
-      const simulated = appendMove(working, option.q, option.r, player)
-      const immediateWin = isWinningPlacement(simulated.moves, option.q, option.r, player)
-      const evalResult = evaluateBoardState(simulated.moves, tuning)
-      const objective = immediateWin
-        ? Number.POSITIVE_INFINITY
-        : objectiveForPlayer(evalResult, player, tuning, rankOptions)
-      const ownScore = player === 'X' ? evalResult.xScore : evalResult.oScore
-      return { option, simulated, immediateWin, objective, ownScore }
-    })
+  const candidateCount = Math.max(8, Math.floor(tuning.topKFirstMoves) * Math.max(2, placements))
+  const candidateLines = enumerateTurnCandidates(state, tuning, candidateCount)
+  if (candidateLines.length === 0) return []
 
-    ranked.sort((a, b) => {
-      if (a.immediateWin !== b.immediateWin) return a.immediateWin ? -1 : 1
-      if (a.objective !== b.objective) return b.objective - a.objective
-      return b.ownScore - a.ownScore
-    })
-
-    return ranked
-  }
-
-  const firstRanked = rankMoves(state, { ignoreDangerFlag: placements >= 2 })
-  if (firstRanked.length === 0) return []
-  if (firstRanked[0].immediateWin || placements === 1) return [firstRanked[0].option]
-
-  const topK = Math.max(1, Math.floor(tuning.topKFirstMoves))
-  const firstCandidates = firstRanked.slice(0, topK)
-  let bestLine: Axial[] = [firstCandidates[0].option]
+  let bestLine: Axial[] = candidateLines[0]
   let bestObjective = Number.NEGATIVE_INFINITY
   let bestOwn = Number.NEGATIVE_INFINITY
 
-  for (const first of firstCandidates) {
-    const secondRanked = rankMoves(first.simulated)
-    if (secondRanked.length === 0) {
-      const evalResult = evaluateBoardState(first.simulated.moves, tuning)
-      const objective = objectiveForPlayer(evalResult, player, tuning)
-      const ownScore = player === 'X' ? evalResult.xScore : evalResult.oScore
-      if (objective > bestObjective || (objective === bestObjective && ownScore > bestOwn)) {
-        bestLine = [first.option]
-        bestObjective = objective
-        bestOwn = ownScore
-      }
-      continue
+  for (const line of candidateLines) {
+    const applied = applyTurnLine(state, line)
+    if (applied.winner === player) {
+      return line
     }
-
-    const second = secondRanked[0]
-    if (second.immediateWin) {
-      return [first.option, second.option]
-    }
-
-    const evalResult = evaluateBoardState(second.simulated.moves, tuning)
+    const evalResult = evaluateBoardState(applied.state.moves, tuning)
     const objective = objectiveForPlayer(evalResult, player, tuning)
     const ownScore = player === 'X' ? evalResult.xScore : evalResult.oScore
 
     if (objective > bestObjective || (objective === bestObjective && ownScore > bestOwn)) {
-      bestLine = [first.option, second.option]
+      bestLine = line
       bestObjective = objective
       bestOwn = ownScore
     }
   }
 
   return bestLine
+}
+
+function findWinner(moves: Map<string, Player>): Player | null {
+  for (const [key, player] of moves.entries()) {
+    const { q, r } = fromKey(key)
+    if (isWinningPlacement(moves, q, r, player)) {
+      return player
+    }
+  }
+  return null
+}
+
+type AppliedTurn = {
+  state: LiveLikeState
+  winner: Player | null
+}
+
+function applyTurnLine(state: LiveLikeState, line: Axial[]): AppliedTurn {
+  const nextMoves = new Map(state.moves)
+  const nextHistory = [...state.moveHistory]
+  let turn = state.turn
+  let placementsLeft = state.placementsLeft
+  let winner: Player | null = null
+
+  for (const move of line) {
+    if (placementsLeft <= 0 || winner) break
+    const key = toKey(move.q, move.r)
+    if (nextMoves.has(key)) continue
+
+    nextMoves.set(key, turn)
+    nextHistory.push({ q: move.q, r: move.r, mark: turn })
+
+    if (isWinningPlacement(nextMoves, move.q, move.r, turn)) {
+      winner = turn
+      placementsLeft = 0
+      break
+    }
+
+    placementsLeft -= 1
+    if (placementsLeft === 0) {
+      const nextTurn = turnStateFromMoveCount(nextMoves.size)
+      turn = nextTurn.turn
+      placementsLeft = nextTurn.placementsLeft
+    }
+  }
+
+  return {
+    state: {
+      moves: nextMoves,
+      moveHistory: nextHistory,
+      turn,
+      placementsLeft,
+    },
+    winner,
+  }
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value))
+}
+
+function nowMs(): number {
+  if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
+    return performance.now()
+  }
+  return Date.now()
+}
+
+function evaluateNodeForRoot(
+  state: LiveLikeState,
+  winner: Player | null,
+  rootPlayer: Player,
+  tuning: BotTuning,
+): number {
+  if (winner) return winner === rootPlayer ? 1 : -1
+  const result = evaluateBoardState(state.moves, tuning)
+  const objective = rootPlayer === 'X' ? result.objectiveForX : result.objectiveForO
+  return Math.tanh(objective / 12000)
+}
+
+type SearchNode = {
+  state: LiveLikeState
+  winner: Player | null
+  parent: SearchNode | null
+  actionFromParent: Axial[] | null
+  children: SearchNode[]
+  untriedActions: Axial[][]
+  visits: number
+  totalValue: number
+}
+
+function selectUctChild(node: SearchNode, explorationC: number): SearchNode {
+  const logParent = Math.log(Math.max(1, node.visits))
+  let best = node.children[0]
+  let bestScore = Number.NEGATIVE_INFINITY
+
+  for (const child of node.children) {
+    if (child.visits === 0) {
+      return child
+    }
+    const exploit = child.totalValue / child.visits
+    const explore = explorationC * Math.sqrt(logParent / child.visits)
+    const score = exploit + explore
+    if (score > bestScore) {
+      bestScore = score
+      best = child
+    }
+  }
+
+  return best
+}
+
+function rootActionFor(node: SearchNode): Axial[] | null {
+  let current: SearchNode | null = node
+  while (current && current.parent && current.parent.parent) {
+    current = current.parent
+  }
+  if (!current || !current.parent) return null
+  return current.actionFromParent
+}
+
+function rolloutValue(node: SearchNode, rootPlayer: Player, tuning: BotTuning, options: BotSearchOptions): number {
+  if (node.winner) {
+    return node.winner === rootPlayer ? 1 : -1
+  }
+
+  let simState: LiveLikeState = {
+    moves: new Map(node.state.moves),
+    moveHistory: [...node.state.moveHistory],
+    turn: node.state.turn,
+    placementsLeft: node.state.placementsLeft,
+  }
+  let simWinner: Player | null = null
+
+  const rolloutTuning: BotTuning = {
+    ...tuning,
+    candidateRadius: clamp(options.simulationRadius, 1, 7),
+    topKFirstMoves: Math.max(1, Math.floor(options.simulationTopKFirstMoves)),
+  }
+
+  for (let depth = 0; depth < options.maxSimulationTurns; depth += 1) {
+    const plan = chooseGreedyTurn(simState, rolloutTuning)
+    if (plan.length === 0) break
+    const applied = applyTurnLine(simState, plan)
+    simState = applied.state
+    simWinner = applied.winner
+    if (simWinner) break
+  }
+
+  return evaluateNodeForRoot(simState, simWinner, rootPlayer, tuning)
+}
+
+export function chooseBotTurnDetailed(
+  state: LiveLikeState,
+  tuning: BotTuning = DEFAULT_BOT_TUNING,
+  partialOptions: Partial<BotSearchOptions> = {},
+): BotTurnDecision {
+  const start = nowMs()
+  const options: BotSearchOptions = {
+    ...DEFAULT_BOT_SEARCH_OPTIONS,
+    ...partialOptions,
+    budget: {
+      ...DEFAULT_BOT_SEARCH_OPTIONS.budget,
+      ...partialOptions.budget,
+    },
+  }
+
+  if (state.placementsLeft <= 0) {
+    return {
+      moves: [],
+      stats: {
+        mode: 'greedy',
+        elapsedMs: nowMs() - start,
+        nodesExpanded: 0,
+        playouts: 0,
+        maxDepthTurns: 0,
+        rootCandidates: 0,
+        stopReason: 'terminal',
+      },
+    }
+  }
+  if (options.budget.maxTimeMs <= 0 || options.budget.maxNodes <= 0) {
+    return {
+      moves: chooseGreedyTurn(state, tuning),
+      stats: {
+        mode: 'greedy',
+        elapsedMs: nowMs() - start,
+        nodesExpanded: 0,
+        playouts: 0,
+        maxDepthTurns: 0,
+        rootCandidates: 0,
+        stopReason: 'budget_zero',
+      },
+    }
+  }
+
+  const existingWinner = findWinner(state.moves)
+  if (existingWinner) {
+    return {
+      moves: [],
+      stats: {
+        mode: 'mcts',
+        elapsedMs: nowMs() - start,
+        nodesExpanded: 0,
+        playouts: 0,
+        maxDepthTurns: 0,
+        rootCandidates: 0,
+        stopReason: 'terminal',
+      },
+    }
+  }
+
+  const rootPlayer = state.turn
+  const rootCandidates = enumerateTurnCandidates(state, tuning, Math.max(1, Math.floor(options.turnCandidateCount)))
+  const root: SearchNode = {
+    state,
+    winner: null,
+    parent: null,
+    actionFromParent: null,
+    children: [],
+    untriedActions: rootCandidates,
+    visits: 0,
+    totalValue: 0,
+  }
+
+  if (root.untriedActions.length === 0) {
+    return {
+      moves: chooseGreedyTurn(state, tuning),
+      stats: {
+        mode: 'mcts',
+        elapsedMs: nowMs() - start,
+        nodesExpanded: 1,
+        playouts: 0,
+        maxDepthTurns: 0,
+        rootCandidates: rootCandidates.length,
+        stopReason: 'no_candidates',
+      },
+    }
+  }
+
+  let nodesExpanded = 1
+  let playouts = 0
+  let maxDepthTurns = 0
+  let stopReason: BotSearchStats['stopReason'] = 'time'
+
+  // Early stop before MCTS loop if any root action is an immediate winning turn-line.
+  for (const line of rootCandidates) {
+    const applied = applyTurnLine(state, line)
+    if (applied.winner === rootPlayer) {
+      return {
+        moves: line,
+        stats: {
+          mode: 'mcts',
+          elapsedMs: nowMs() - start,
+          nodesExpanded,
+          playouts,
+          maxDepthTurns,
+          rootCandidates: rootCandidates.length,
+          stopReason: 'early_win',
+        },
+      }
+    }
+  }
+
+  while (nodesExpanded < options.budget.maxNodes && nowMs() - start < options.budget.maxTimeMs) {
+    let depthTurns = 0
+    let node = root
+
+    while (node.untriedActions.length === 0 && node.children.length > 0 && !node.winner) {
+      node = selectUctChild(node, options.explorationC)
+      depthTurns += 1
+    }
+
+    if (node.untriedActions.length > 0 && !node.winner) {
+      const action = node.untriedActions.pop() as Axial[]
+      const applied = applyTurnLine(node.state, action)
+      const child: SearchNode = {
+        state: applied.state,
+        winner: applied.winner,
+        parent: node,
+        actionFromParent: action,
+        children: [],
+        untriedActions: applied.winner
+          ? []
+          : enumerateTurnCandidates(applied.state, tuning, Math.max(1, Math.floor(options.turnCandidateCount))),
+        visits: 0,
+        totalValue: 0,
+      }
+      node.children.push(child)
+      node = child
+      nodesExpanded += 1
+      depthTurns += 1
+    }
+
+    if (depthTurns > maxDepthTurns) {
+      maxDepthTurns = depthTurns
+    }
+
+    const value = rolloutValue(node, rootPlayer, tuning, options)
+    playouts += 1
+    let current: SearchNode | null = node
+    while (current) {
+      current.visits += 1
+      current.totalValue += value
+      current = current.parent
+    }
+
+    // Early stop as soon as we discover a concrete winning continuation for the root player.
+    if (node.winner === rootPlayer) {
+      const rootAction = rootActionFor(node)
+      if (rootAction) {
+        return {
+          moves: rootAction,
+          stats: {
+            mode: 'mcts',
+            elapsedMs: nowMs() - start,
+            nodesExpanded,
+            playouts,
+            maxDepthTurns,
+            rootCandidates: rootCandidates.length,
+            stopReason: 'early_win',
+          },
+        }
+      }
+    }
+  }
+
+  if (nodesExpanded >= options.budget.maxNodes) {
+    stopReason = 'nodes'
+  } else if (nowMs() - start >= options.budget.maxTimeMs) {
+    stopReason = 'time'
+  }
+
+  if (root.children.length === 0) {
+    return {
+      moves: chooseGreedyTurn(state, tuning),
+      stats: {
+        mode: 'mcts',
+        elapsedMs: nowMs() - start,
+        nodesExpanded,
+        playouts,
+        maxDepthTurns,
+        rootCandidates: rootCandidates.length,
+        stopReason: 'fallback',
+      },
+    }
+  }
+
+  root.children.sort((a, b) => {
+    if (a.visits !== b.visits) return b.visits - a.visits
+    const aMean = a.visits > 0 ? a.totalValue / a.visits : Number.NEGATIVE_INFINITY
+    const bMean = b.visits > 0 ? b.totalValue / b.visits : Number.NEGATIVE_INFINITY
+    return bMean - aMean
+  })
+
+  return {
+    moves: root.children[0].actionFromParent ?? chooseGreedyTurn(state, tuning),
+    stats: {
+      mode: 'mcts',
+      elapsedMs: nowMs() - start,
+      nodesExpanded,
+      playouts,
+      maxDepthTurns,
+      rootCandidates: rootCandidates.length,
+      stopReason,
+    },
+  }
+}
+
+export function chooseBotTurn(
+  state: LiveLikeState,
+  tuning: BotTuning = DEFAULT_BOT_TUNING,
+  partialOptions: Partial<BotSearchOptions> = {},
+): Axial[] {
+  return chooseBotTurnDetailed(state, tuning, partialOptions).moves
 }
