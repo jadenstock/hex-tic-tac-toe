@@ -5,6 +5,7 @@
   max-height: 100dvh;
   gap: 10px;
   padding: 10px;
+  background: var(--page-background);
 }
 
 .topbar {
@@ -27,6 +28,7 @@
   margin: 0;
   font-size: clamp(1rem, 2vw, 1.45rem);
   letter-spacing: 0.02em;
+  color: var(--ink);
 }
 
 .topbar-actions {
@@ -49,14 +51,10 @@
 
 .network-panel {
   display: grid;
-  grid-template-columns: auto minmax(110px, 140px) auto auto;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
   align-items: center;
-  min-width: min(600px, 100%);
-}
-
-.dock-panel .network-panel {
-  padding: 10px;
+  min-width: 0;
 }
 
 .network-panel input {
@@ -166,28 +164,56 @@
   bottom: 10px;
   display: grid;
   gap: 8px;
+  justify-items: start;
+  align-content: end;
   pointer-events: none;
-  max-height: calc(100% - 20px);
-  overflow-y: auto;
 }
 
-.dock-panel {
+.board-dock-toggle {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--panel), white 24%);
+  color: var(--ink);
+  font-size: 0.82rem;
+  letter-spacing: 0.02em;
+  padding: 7px 12px;
+  cursor: pointer;
+  pointer-events: auto;
+  box-shadow: 0 6px 14px rgba(12, 34, 24, 0.14);
+}
+
+.board-dock-shell {
   border: 1px solid var(--line);
   background: color-mix(in oklab, var(--panel), white 28%);
   border-radius: 12px;
   box-shadow: 0 8px 18px rgba(12, 34, 24, 0.12);
   pointer-events: auto;
+  width: min(100%, 520px);
+  max-height: min(62vh, 640px);
+  overflow: auto;
+  display: grid;
+  gap: 8px;
+  padding: 8px;
 }
 
-.dock-panel summary {
-  cursor: pointer;
-  font-weight: 600;
+.compact-status-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.compact-status-row span {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #ffffff;
+  color: var(--ink-soft);
+  font-size: 0.79rem;
+  padding: 4px 10px;
+}
+
+.dock-panel summary,
+.tuning-panel summary {
   color: var(--ink);
-  padding: 8px 10px;
-}
-
-.dock-panel[open] > summary {
-  border-bottom: 1px solid color-mix(in oklab, var(--line), transparent 35%);
 }
 
 .rules-modal-backdrop {
@@ -229,41 +255,8 @@
   grid-template-columns: 1fr;
   background: color-mix(in oklab, var(--panel-strong), white 35%);
   border: 0;
-  border-radius: 0 0 12px 12px;
+  border-radius: 0;
   padding: 10px;
-}
-
-.dock-tabs {
-  display: inline-flex;
-  width: fit-content;
-  border: 1px solid var(--line);
-  background: #ffffff;
-  border-radius: 999px;
-  padding: 2px;
-  gap: 2px;
-}
-
-.dock-tabs button {
-  border: 0;
-  border-radius: 999px;
-  padding: 5px 12px;
-  font-size: 0.84rem;
-  background: transparent;
-  color: var(--ink-soft);
-  cursor: pointer;
-}
-
-.dock-tabs button.active {
-  background: var(--accent-soft);
-  color: var(--accent);
-  font-weight: 600;
-}
-
-.status-grid {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(140px, 1fr));
-  gap: 8px;
-  width: 100%;
 }
 
 .stat {
@@ -272,6 +265,7 @@
   border-radius: 10px;
   border: 1px solid var(--line);
   background: var(--panel);
+  color: var(--ink);
   padding: 8px 10px;
   min-height: 62px;
 }
@@ -287,6 +281,7 @@
   font-size: 0.88rem;
   line-height: 1.25;
   overflow-wrap: anywhere;
+  color: var(--ink);
 }
 
 .button-row {
@@ -361,6 +356,36 @@
   color: #c2410c;
 }
 
+.auto-bot-group {
+  display: inline-flex;
+  flex-wrap: wrap;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #ffffff;
+  padding: 2px;
+  gap: 2px;
+}
+
+.auto-bot-group button {
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ink-soft);
+  font-size: 0.84rem;
+  padding: 5px 10px;
+  cursor: pointer;
+}
+
+.auto-bot-group button.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.auto-bot-group button.auto-easy {
+  color: var(--accent);
+}
+
 .zoom-readout,
 .drag-readout {
   margin-left: 4px;
@@ -415,7 +440,7 @@
 .tuning-grid {
   margin-top: 8px;
   display: grid;
-  grid-template-columns: repeat(3, minmax(150px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 8px;
 }
 
@@ -491,35 +516,56 @@
   grid-template-columns: repeat(2, minmax(150px, 1fr));
 }
 
-.score-bar {
-  border: 1px solid var(--line);
+.threat-line-x {
+  color: var(--threat-x-text);
+}
+
+.threat-line-o {
+  color: var(--threat-o-text);
+}
+
+.app-shell.theme-dark .toggle-hud,
+.app-shell.theme-dark .network-panel button,
+.app-shell.theme-dark .network-panel input,
+.app-shell.theme-dark .button-row button,
+.app-shell.theme-dark .play-as,
+.app-shell.theme-dark .play-as select,
+.app-shell.theme-dark .auto-bot-group,
+.app-shell.theme-dark .compute-panel,
+.app-shell.theme-dark .tuning-panel,
+.app-shell.theme-dark .hint-pill {
+  background: color-mix(in oklab, var(--panel), black 20%);
+  color: var(--ink);
+  border-color: var(--line);
+}
+
+.app-shell.theme-dark .tuning-grid input {
+  background: color-mix(in oklab, var(--panel), black 22%);
+  color: var(--ink);
+  border-color: var(--line);
+}
+
+.app-shell.theme-dark .auto-bot-group button {
+  color: var(--ink-soft);
+}
+
+.app-shell.theme-dark .auto-bot-group button.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.app-shell.theme-dark .rules-modal {
+  background: color-mix(in oklab, var(--panel), black 12%);
+}
+
+.app-shell.theme-dark .hint-pill::after {
+  background: color-mix(in oklab, var(--panel), black 12%);
+}
+
+.app-shell.theme-dark .compact-status-row span {
   background: #ffffff;
-  border-radius: 999px;
-  display: flex;
-  overflow: hidden;
-  min-height: 34px;
-}
-
-.score-x,
-.score-o {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 0.82rem;
-  white-space: nowrap;
-  padding: 6px 8px;
-}
-
-.score-x {
-  background: color-mix(in oklab, #1e2f97, white 65%);
-  color: #172554;
-  min-width: 50px;
-}
-
-.score-o {
-  background: color-mix(in oklab, #8a1930, white 70%);
-  color: #7f1d1d;
-  flex: 1;
+  color: #0f172a;
+  border-color: #cbd5e1;
 }
 
 @media (max-width: 1080px) {
@@ -530,8 +576,11 @@
 
   .network-panel {
     width: 100%;
-    min-width: 0;
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .board-dock-shell {
+    max-height: min(58vh, 620px);
   }
 }
 
@@ -550,11 +599,6 @@
     left: 8px;
     right: 8px;
     bottom: 8px;
-  }
-
-  .status-grid {
-    grid-template-columns: repeat(2, minmax(110px, 1fr));
-    width: 100%;
   }
 
   .bot-metrics {
