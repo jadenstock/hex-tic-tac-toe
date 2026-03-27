@@ -1,17 +1,29 @@
 import * as path from 'node:path'
 import { CfnOutput, Duration, RemovalPolicy, Stack, StackProps } from 'aws-cdk-lib'
+import * as acm from 'aws-cdk-lib/aws-certificatemanager'
 import * as apigwv2 from 'aws-cdk-lib/aws-apigatewayv2'
 import * as cloudfront from 'aws-cdk-lib/aws-cloudfront'
 import * as origins from 'aws-cdk-lib/aws-cloudfront-origins'
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb'
 import * as iam from 'aws-cdk-lib/aws-iam'
 import * as lambda from 'aws-cdk-lib/aws-lambda'
+import * as route53 from 'aws-cdk-lib/aws-route53'
+import * as targets from 'aws-cdk-lib/aws-route53-targets'
 import * as s3 from 'aws-cdk-lib/aws-s3'
 import * as s3deploy from 'aws-cdk-lib/aws-s3-deployment'
 import { Construct } from 'constructs'
 
+export interface HexTttStackProps extends StackProps {
+  customDomain?: {
+    domainName: string
+    hostedZoneDomain?: string
+    includeWww?: boolean
+    certificateArn: string
+  }
+}
+
 export class HexTttStack extends Stack {
-  constructor(scope: Construct, id: string, props?: StackProps) {
+  constructor(scope: Construct, id: string, props?: HexTttStackProps) {
     super(scope, id, props)
 
     const roomsTable = new dynamodb.Table(this, 'RoomsTable', {
@@ -223,7 +235,8 @@ export class HexTttStack extends Stack {
       autoDeleteObjects: true,
     })
 
-    const distribution = new cloudfront.Distribution(this, 'SiteDistribution', {
+    const customDomain = props?.customDomain
+    const distributionProps: cloudfront.DistributionProps = {
       defaultBehavior: {
         origin: origins.S3BucketOrigin.withOriginAccessControl(siteBucket),
         viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
@@ -241,7 +254,22 @@ export class HexTttStack extends Stack {
           responsePagePath: '/index.html',
         },
       ],
-    })
+      ...(customDomain
+        ? {
+            domainNames: [
+              customDomain.domainName,
+              ...(customDomain.includeWww === false ? [] : [`www.${customDomain.domainName}`]),
+            ],
+            certificate: acm.Certificate.fromCertificateArn(
+              this,
+              'SiteCustomDomainCert',
+              customDomain.certificateArn,
+            ),
+          }
+        : {}),
+    }
+
+    const distribution = new cloudfront.Distribution(this, 'SiteDistribution', distributionProps)
 
     new s3deploy.BucketDeployment(this, 'DeployFrontend', {
       destinationBucket: siteBucket,
@@ -254,6 +282,41 @@ export class HexTttStack extends Stack {
     new CfnOutput(this, 'SiteUrl', {
       value: `https://${distribution.domainName}`,
     })
+
+    if (props?.customDomain) {
+      const hostedZone = route53.HostedZone.fromLookup(this, 'CustomDomainHostedZone', {
+        domainName: props.customDomain.hostedZoneDomain ?? props.customDomain.domainName,
+      })
+      const aliasTarget = route53.RecordTarget.fromAlias(new targets.CloudFrontTarget(distribution))
+
+      new route53.ARecord(this, 'ApexAliasA', {
+        zone: hostedZone,
+        recordName: props.customDomain.domainName,
+        target: aliasTarget,
+      })
+      new route53.AaaaRecord(this, 'ApexAliasAAAA', {
+        zone: hostedZone,
+        recordName: props.customDomain.domainName,
+        target: aliasTarget,
+      })
+
+      if (props.customDomain.includeWww !== false) {
+        new route53.ARecord(this, 'WwwAliasA', {
+          zone: hostedZone,
+          recordName: `www.${props.customDomain.domainName}`,
+          target: aliasTarget,
+        })
+        new route53.AaaaRecord(this, 'WwwAliasAAAA', {
+          zone: hostedZone,
+          recordName: `www.${props.customDomain.domainName}`,
+          target: aliasTarget,
+        })
+      }
+
+      new CfnOutput(this, 'CustomDomainUrl', {
+        value: `https://${props.customDomain.domainName}`,
+      })
+    }
 
     new CfnOutput(this, 'WebSocketUrl', {
       value: `wss://${wsApi.ref}.execute-api.${this.region}.${this.urlSuffix}/${stage.stageName}`,

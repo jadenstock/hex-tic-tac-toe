@@ -74,6 +74,34 @@ cd infra
 npm run deploy
 ```
 
+### Optional custom domain (`he-xo.com`) via Route 53 + CloudFront
+
+The infra app supports a dedicated certificate stack in `us-east-1` plus domain wiring on the main stack.
+
+1. Deploy certificate stack (creates ACM cert with DNS validation in Route 53):
+
+```bash
+cd infra
+npx cdk deploy HexTttCertificateStack \
+  --context domainName=he-xo.com \
+  --context hostedZoneDomain=he-xo.com \
+  --context includeWww=true
+```
+
+2. Copy `CertificateArn` from stack outputs.
+
+3. Deploy main app stack with domain + cert ARN:
+
+```bash
+npx cdk deploy HexTttStack \
+  --context domainName=he-xo.com \
+  --context hostedZoneDomain=he-xo.com \
+  --context includeWww=true \
+  --context certificateArn=<acm-certificate-arn>
+```
+
+This second deploy updates CloudFront aliases/certificate and creates Route 53 alias records (`A`/`AAAA`) for apex and `www`.
+
 ## Useful root scripts
 
 - `npm run infra:install`
