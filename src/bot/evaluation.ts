@@ -1,23 +1,15 @@
+import { createSearchBoard, type SearchBoard, windowEmpties, windowEmptyCount } from './board.ts'
 import type { BotTuning, EvaluationResult, Player } from './types.ts'
-import { DEFAULT_BOT_TUNING, WIN_DIRECTIONS, WIN_LENGTH } from './types.ts'
-
-function toKey(q: number, r: number): string {
-  return `${q},${r}`
-}
-
-function fromKey(key: string): { q: number; r: number } {
-  const [q, r] = key.split(',').map(Number)
-  return { q, r }
-}
+import { DEFAULT_BOT_TUNING, WIN_LENGTH } from './types.ts'
 
 function pressureDiversity(pressure: Map<string, number>): number {
   let total = 0
-  for (const v of pressure.values()) total += v
+  for (const value of pressure.values()) total += value
   if (total <= 0 || pressure.size <= 1) return 0
 
   let entropy = 0
-  for (const v of pressure.values()) {
-    const p = v / total
+  for (const value of pressure.values()) {
+    const p = value / total
     if (p <= 0) continue
     entropy -= p * Math.log(p)
   }
@@ -42,7 +34,7 @@ function scoreOffense(counts: number[], diversity: number, tuning: BotTuning): n
   return (1 - blend) * severityNorm + blend * diversity
 }
 
-export function evaluateBoardState(moves: Map<string, Player>, tuning: BotTuning = DEFAULT_BOT_TUNING): EvaluationResult {
+function evaluateBoard(board: SearchBoard, tuning: BotTuning): EvaluationResult {
   const xThreats = Array<number>(WIN_LENGTH + 1).fill(0)
   const oThreats = Array<number>(WIN_LENGTH + 1).fill(0)
   const xOneTurnFinishRefs = new Map<string, number>()
@@ -52,75 +44,41 @@ export function evaluateBoardState(moves: Map<string, Player>, tuning: BotTuning
   const xPressureMap = new Map<string, number>()
   const oPressureMap = new Map<string, number>()
 
-  if (moves.size > 0) {
-    const occupied = [...moves.keys()].map(fromKey)
-    let minQ = occupied[0].q
-    let maxQ = occupied[0].q
-    let minR = occupied[0].r
-    let maxR = occupied[0].r
-
-    for (const cell of occupied) {
-      if (cell.q < minQ) minQ = cell.q
-      if (cell.q > maxQ) maxQ = cell.q
-      if (cell.r < minR) minR = cell.r
-      if (cell.r > maxR) maxR = cell.r
-    }
-
-    const margin = WIN_LENGTH
-    const qStart = minQ - margin
-    const qEnd = maxQ + margin
-    const rStart = minR - margin
-    const rEnd = maxR + margin
-
-    for (let q = qStart; q <= qEnd; q += 1) {
-      for (let r = rStart; r <= rEnd; r += 1) {
-        for (const [dq, dr] of WIN_DIRECTIONS) {
-          let xCount = 0
-          let oCount = 0
-          const empties: string[] = []
-
-          for (let i = 0; i < WIN_LENGTH; i += 1) {
-            const cellKey = toKey(q + dq * i, r + dr * i)
-            const mark = moves.get(cellKey)
-            if (mark === 'X') xCount += 1
-            if (mark === 'O') oCount += 1
-            if (!mark) empties.push(cellKey)
-            if (xCount > 0 && oCount > 0) break
-          }
-
-          if (xCount > 0 && oCount === 0) {
-            xThreats[xCount] += 1
-            if (xCount >= 3 && xCount <= 5 && empties.length > 0) {
-              const mass = threatPressureMass(xCount)
-              const share = mass / empties.length
-              for (const cell of empties) {
-                xPressureMap.set(cell, (xPressureMap.get(cell) ?? 0) + share)
-              }
-            }
-            if (xCount >= 4 && empties.length <= 2) {
-              const groupKey = empties.slice().sort().join('|')
-              xOneTurnThreatGroups.add(groupKey)
-              for (const cell of empties) {
-                xOneTurnFinishRefs.set(cell, (xOneTurnFinishRefs.get(cell) ?? 0) + 1)
-              }
-            }
-          } else if (oCount > 0 && xCount === 0) {
-            oThreats[oCount] += 1
-            if (oCount >= 3 && oCount <= 5 && empties.length > 0) {
-              const mass = threatPressureMass(oCount)
-              const share = mass / empties.length
-              for (const cell of empties) {
-                oPressureMap.set(cell, (oPressureMap.get(cell) ?? 0) + share)
-              }
-            }
-            if (oCount >= 4 && empties.length <= 2) {
-              const groupKey = empties.slice().sort().join('|')
-              oOneTurnThreatGroups.add(groupKey)
-              for (const cell of empties) {
-                oOneTurnFinishRefs.set(cell, (oOneTurnFinishRefs.get(cell) ?? 0) + 1)
-              }
-            }
-          }
+  for (const window of board.activeWindows.values()) {
+    if (window.xCount > 0 && window.oCount === 0) {
+      xThreats[window.xCount] += 1
+      const emptyCount = windowEmptyCount(window)
+      if (window.xCount >= 3 && window.xCount <= 5 && emptyCount > 0) {
+        const mass = threatPressureMass(window.xCount)
+        const share = mass / emptyCount
+        for (const cell of windowEmpties(board, window)) {
+          xPressureMap.set(cell, (xPressureMap.get(cell) ?? 0) + share)
+        }
+      }
+      if (window.xCount >= 4 && emptyCount <= 2) {
+        const empties = windowEmpties(board, window)
+        const groupKey = empties.slice().sort().join('|')
+        xOneTurnThreatGroups.add(groupKey)
+        for (const cell of empties) {
+          xOneTurnFinishRefs.set(cell, (xOneTurnFinishRefs.get(cell) ?? 0) + 1)
+        }
+      }
+    } else if (window.oCount > 0 && window.xCount === 0) {
+      oThreats[window.oCount] += 1
+      const emptyCount = windowEmptyCount(window)
+      if (window.oCount >= 3 && window.oCount <= 5 && emptyCount > 0) {
+        const mass = threatPressureMass(window.oCount)
+        const share = mass / emptyCount
+        for (const cell of windowEmpties(board, window)) {
+          oPressureMap.set(cell, (oPressureMap.get(cell) ?? 0) + share)
+        }
+      }
+      if (window.oCount >= 4 && emptyCount <= 2) {
+        const empties = windowEmpties(board, window)
+        const groupKey = empties.slice().sort().join('|')
+        oOneTurnThreatGroups.add(groupKey)
+        for (const cell of empties) {
+          oOneTurnFinishRefs.set(cell, (oOneTurnFinishRefs.get(cell) ?? 0) + 1)
         }
       }
     }
@@ -134,20 +92,22 @@ export function evaluateBoardState(moves: Map<string, Player>, tuning: BotTuning
   const oDiversity = pressureDiversity(oPressureMap)
   const xOffense = scoreOffense(xThreats, xDiversity, tuning)
   const oOffense = scoreOffense(oThreats, oDiversity, tuning)
-  const xRawScore = xOffense
-  const oRawScore = oOffense
-  const xScore = Math.max(0, xRawScore)
-  const oScore = Math.max(0, oRawScore)
+  const xScore = Math.max(0, xOffense)
+  const oScore = Math.max(0, oOffense)
   const total = xScore + oScore
   const xShare = total > 0 ? xScore / total : 0.5
+
   let xPressureMax = 0
-  for (const v of xPressureMap.values()) {
-    if (v > xPressureMax) xPressureMax = v
+  for (const value of xPressureMap.values()) {
+    if (value > xPressureMax) xPressureMax = value
   }
   let oPressureMax = 0
-  for (const v of oPressureMap.values()) {
-    if (v > oPressureMax) oPressureMax = v
+  for (const value of oPressureMap.values()) {
+    if (value > oPressureMax) oPressureMax = value
   }
+
+  void xOneTurnFinishRefs
+  void oOneTurnFinishRefs
 
   return {
     xScore,
@@ -170,4 +130,19 @@ export function evaluateBoardState(moves: Map<string, Player>, tuning: BotTuning
     xWillWinNextTurn,
     oWillWinNextTurn,
   }
+}
+
+export function evaluateBoardState(
+  boardOrMoves: SearchBoard | Map<string, Player>,
+  tuning: BotTuning = DEFAULT_BOT_TUNING,
+): EvaluationResult {
+  const board = boardOrMoves instanceof Map
+    ? createSearchBoard({
+        moves: boardOrMoves,
+        moveHistory: [],
+        turn: 'X',
+        placementsLeft: 1,
+      })
+    : boardOrMoves
+  return evaluateBoard(board, tuning)
 }

@@ -70,9 +70,13 @@ export type BotSearchOptions = {
   budget: BotSearchBudget
   explorationC: number
   turnCandidateCount: number
+  childTurnCandidateCount: number
   maxSimulationTurns: number
+  simulationTurnCandidateCount: number
   simulationRadius: number
   simulationTopKFirstMoves: number
+  progressiveWideningBase: number
+  progressiveWideningScale: number
 }
 
 export type BotSearchMode = 'greedy' | 'mcts'
@@ -116,8 +120,12 @@ export const DEFAULT_BOT_SEARCH_OPTIONS: BotSearchOptions = {
     maxNodes: 120000,
   },
   explorationC: 1.15,
-  turnCandidateCount: 7,
+  turnCandidateCount: 8,
+  childTurnCandidateCount: 8,
   maxSimulationTurns: 3,
+  simulationTurnCandidateCount: 4,
   simulationRadius: 3,
   simulationTopKFirstMoves: 2,
+  progressiveWideningBase: 2,
+  progressiveWideningScale: 1.75,
 }

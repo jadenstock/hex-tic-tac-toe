@@ -1896,15 +1896,15 @@ function App() {
                     </div>
                     {lastBotStats ? (
                       <div className="compute-meta">
-                        Last run: {lastBotStats.mode.toUpperCase()} | {(lastBotStats.elapsedMs / 1000).toFixed(3)}s | evals{' '}
+                        Last run: {lastBotStats.mode.toUpperCase()} | {(lastBotStats.elapsedMs / 1000).toFixed(3)}s | board evals{' '}
                         {lastBotStats.boardEvaluations.toLocaleString()} | nodes {lastBotStats.nodesExpanded.toLocaleString()} | playouts{' '}
-                        {lastBotStats.playouts.toLocaleString()} | depth {lastBotStats.maxDepthTurns} turns | root cands{' '}
+                        {lastBotStats.playouts.toLocaleString()} | tree depth {lastBotStats.maxDepthTurns} turns | root lines{' '}
                         {lastBotStats.rootCandidates} | stop {lastBotStats.stopReason}
                       </div>
                     ) : null}
                     {isBotThinking ? (
                       <div className="compute-meta">
-                        Thinking now: {(liveBotElapsedMs / 1000).toFixed(2)}s | evals {liveBotBoardEvals.toLocaleString()} | nodes{' '}
+                        Thinking now: {(liveBotElapsedMs / 1000).toFixed(2)}s | board evals {liveBotBoardEvals.toLocaleString()} | nodes{' '}
                         {liveBotNodes.toLocaleString()} | playouts {liveBotPlayouts.toLocaleString()}
                       </div>
                     ) : null}
