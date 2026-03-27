@@ -83,7 +83,19 @@ export function mergeTuning(config: BotConfig, opts: CliOptions): BotTuning {
 
   tuning.candidateRadius = Math.max(1, Math.min(opts.hardRadiusCap, Math.round(tuning.candidateRadius)))
   tuning.topKFirstMoves = Math.max(1, Math.min(opts.hardTopKCap, Math.round(tuning.topKFirstMoves)))
-  tuning.defenseWeight = Math.max(0, Math.min(1, tuning.defenseWeight))
+  tuning.defenseWeight = Math.max(0, Math.min(2, tuning.defenseWeight))
+  tuning.threatDiversityBlend = Math.max(0, Math.min(1, tuning.threatDiversityBlend))
+  tuning.threatSeverityScale = Math.max(1, Math.min(50000, tuning.threatSeverityScale))
+  tuning.threatWeights = tuning.threatWeights.map((value) => Math.max(0, Math.min(20000, value)))
+  tuning.threatWeights[5] = tuning.threatWeights[4]
+  tuning.immediateDangerPenalty = Math.max(0, Math.min(1_000_000_000, tuning.immediateDangerPenalty))
+  tuning.oneTurnWinBonus = Math.max(0, Math.min(1_000_000_000, tuning.oneTurnWinBonus))
+  tuning.oneTurnForkBonus = Math.max(0, Math.min(1_000_000_000, tuning.oneTurnForkBonus))
+  tuning.oneTurnOverlapPenalty = Math.max(0, Math.min(1_000_000_000, tuning.oneTurnOverlapPenalty))
+  tuning.threat3ClusterBonus = Math.max(0, Math.min(1_000_000_000, tuning.threat3ClusterBonus))
+  tuning.threat4ForkBonus = Math.max(0, Math.min(1_000_000_000, tuning.threat4ForkBonus))
+  tuning.threat5ForkBonus = Math.max(0, Math.min(1_000_000_000, tuning.threat5ForkBonus))
+  tuning.threatBreadthWeights = tuning.threatBreadthWeights.map((value) => Math.max(0, Math.min(20000, value)))
 
   return tuning
 }

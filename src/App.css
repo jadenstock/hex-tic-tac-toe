@@ -39,6 +39,51 @@
   justify-content: flex-end;
 }
 
+.quick-bot {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #ffffff;
+}
+
+.quick-bot-start {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #ffffff;
+  color: var(--ink-soft);
+  font-size: 0.84rem;
+  font-weight: 700;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+
+.quick-bot-start.is-on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.quick-bot-side {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ink-soft);
+  font-size: 0.8rem;
+  padding: 0 6px 0 2px;
+}
+
+.quick-bot-side select {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #ffffff;
+  color: var(--ink);
+  font-size: 0.82rem;
+  padding: 2px 8px;
+}
+
 .toggle-hud {
   border: 1px solid var(--line);
   border-radius: 999px;
@@ -527,6 +572,8 @@
 .app-shell.theme-dark .toggle-hud,
 .app-shell.theme-dark .network-panel button,
 .app-shell.theme-dark .network-panel input,
+.app-shell.theme-dark .quick-bot,
+.app-shell.theme-dark .quick-bot-side select,
 .app-shell.theme-dark .button-row button,
 .app-shell.theme-dark .play-as,
 .app-shell.theme-dark .play-as select,
@@ -537,6 +584,22 @@
   background: color-mix(in oklab, var(--panel), black 20%);
   color: var(--ink);
   border-color: var(--line);
+}
+
+.app-shell.theme-dark .quick-bot-side {
+  color: var(--ink-soft);
+}
+
+.app-shell.theme-dark .quick-bot-start {
+  border-color: var(--line);
+  background: color-mix(in oklab, var(--panel), black 20%);
+  color: var(--ink-soft);
+}
+
+.app-shell.theme-dark .quick-bot-start.is-on {
+  border-color: color-mix(in oklab, var(--accent), white 20%);
+  background: color-mix(in oklab, var(--accent-soft), black 14%);
+  color: var(--accent);
 }
 
 .app-shell.theme-dark .tuning-grid input {

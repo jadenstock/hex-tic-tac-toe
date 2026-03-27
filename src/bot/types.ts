@@ -1,0 +1,123 @@
+export type Player = 'X' | 'O'
+
+export type MoveRecord = {
+  q: number
+  r: number
+  mark: Player
+}
+
+export type LiveLikeState = {
+  moves: Map<string, Player>
+  moveHistory: MoveRecord[]
+  turn: Player
+  placementsLeft: number
+}
+
+export type Axial = { q: number; r: number }
+
+export type EvaluationResult = {
+  xScore: number
+  oScore: number
+  xShare: number
+  objectiveForX: number
+  objectiveForO: number
+  xThreats: number[]
+  oThreats: number[]
+  xOffense: number
+  oOffense: number
+  xDiversity: number
+  oDiversity: number
+  xPressureMap: Map<string, number>
+  oPressureMap: Map<string, number>
+  xPressureMax: number
+  oPressureMax: number
+  xOneTurnWins: number
+  oOneTurnWins: number
+  xWillWinNextTurn: boolean
+  oWillWinNextTurn: boolean
+}
+
+export const WIN_LENGTH = 6
+export const WIN_DIRECTIONS: Array<[number, number]> = [
+  [1, 0],
+  [0, 1],
+  [1, -1],
+]
+
+export type BotTuning = {
+  threatWeights: number[]
+  defenseWeight: number
+  threatDiversityBlend: number
+  threatSeverityScale: number
+  immediateDangerPenalty: number
+  oneTurnWinBonus: number
+  threatBreadthWeights: number[]
+  oneTurnForkBonus: number
+  oneTurnOverlapPenalty: number
+  threat3ClusterBonus: number
+  threat4ForkBonus: number
+  threat5ForkBonus: number
+  candidateRadius: number
+  topKFirstMoves: number
+}
+
+export type BotSearchBudget = {
+  maxTimeMs: number
+  maxNodes: number
+}
+
+export type BotSearchOptions = {
+  budget: BotSearchBudget
+  explorationC: number
+  turnCandidateCount: number
+  maxSimulationTurns: number
+  simulationRadius: number
+  simulationTopKFirstMoves: number
+}
+
+export type BotSearchMode = 'greedy' | 'mcts'
+
+export type BotSearchStats = {
+  mode: BotSearchMode
+  elapsedMs: number
+  nodesExpanded: number
+  playouts: number
+  boardEvaluations: number
+  maxDepthTurns: number
+  rootCandidates: number
+  stopReason: 'budget_zero' | 'time' | 'nodes' | 'terminal' | 'no_candidates' | 'fallback' | 'early_win'
+}
+
+export type BotTurnDecision = {
+  moves: Axial[]
+  stats: BotSearchStats
+}
+
+export const DEFAULT_BOT_TUNING: BotTuning = {
+  threatWeights: [0, 0, 6, 36, 860, 860, 20000],
+  defenseWeight: 0.8,
+  threatDiversityBlend: 0.35,
+  threatSeverityScale: 1200,
+  immediateDangerPenalty: 150000,
+  oneTurnWinBonus: 3500,
+  threatBreadthWeights: [0, 0, 0, 0, 0, 0, 0],
+  oneTurnForkBonus: 27300,
+  oneTurnOverlapPenalty: 6975,
+  threat3ClusterBonus: 120,
+  threat4ForkBonus: 17400,
+  threat5ForkBonus: 15000,
+  candidateRadius: 4,
+  topKFirstMoves: 5,
+}
+
+export const DEFAULT_BOT_SEARCH_OPTIONS: BotSearchOptions = {
+  budget: {
+    maxTimeMs: 600,
+    maxNodes: 120000,
+  },
+  explorationC: 1.15,
+  turnCandidateCount: 7,
+  maxSimulationTurns: 3,
+  simulationRadius: 3,
+  simulationTopKFirstMoves: 2,
+}

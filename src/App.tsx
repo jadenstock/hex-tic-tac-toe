@@ -3,6 +3,7 @@ import './App.css'
 import {
   DEFAULT_BOT_SEARCH_OPTIONS,
   DEFAULT_BOT_TUNING,
+  chooseBotTurnDetailedAsync,
   chooseBotTurnDetailed,
   evaluateBoardState,
   type BotSearchStats,
@@ -627,6 +628,10 @@ function HintPill({ text }: { text: string }) {
   )
 }
 
+function clampValue(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value))
+}
+
 function App() {
   const wrapperRef = useRef<HTMLDivElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
@@ -656,16 +661,21 @@ function App() {
   })
   const [hideDeadHexes, setHideDeadHexes] = useState(false)
   const [showThreatHighlights, setShowThreatHighlights] = useState(false)
+  const [showPressureMap, setShowPressureMap] = useState(false)
   const [autoBotEnabled, setAutoBotEnabled] = useState(false)
   const [autoBotSide, setAutoBotSide] = useState<'X' | 'O' | 'both'>('both')
+  const [quickPlayerSide, setQuickPlayerSide] = useState<Player>('X')
+  const [quickBotSide, setQuickBotSide] = useState<Player>('O')
   const [botThinkSeconds, setBotThinkSeconds] = useState(0)
   const [botTuning, setBotTuning] = useState<BotTuning>(DEFAULT_BOT_TUNING)
+  const [isBotThinking, setIsBotThinking] = useState(false)
+  const [liveBotNodes, setLiveBotNodes] = useState(0)
+  const [liveBotPlayouts, setLiveBotPlayouts] = useState(0)
+  const [liveBotBoardEvals, setLiveBotBoardEvals] = useState(0)
+  const [liveBotElapsedMs, setLiveBotElapsedMs] = useState(0)
   const [lastBotStats, setLastBotStats] = useState<BotSearchStats | null>(null)
   const [showRulesModal, setShowRulesModal] = useState(false)
-  const [dockOpen, setDockOpen] = useState(() => {
-    if (typeof window === 'undefined') return true
-    return window.matchMedia('(min-width: 1080px)').matches
-  })
+  const [dockOpen, setDockOpen] = useState(true)
 
   const dragRef = useRef<{
     pointerId: number
@@ -733,6 +743,7 @@ function App() {
 
   const totalLiveMoves = liveState.moves.size
   const totalPlanMoves = planMoves.size
+  const topVsBotEnabled = autoBotEnabled && autoBotSide !== 'both'
   const canUndo = liveState.moveHistory.length > 0
   const highlightedKeys = useMemo(() => {
     if (liveState.moveHistory.length === 0) {
@@ -818,10 +829,10 @@ function App() {
       },
       turnCandidateCount: Math.max(5, Math.min(12, 5 + Math.floor(normalized * 7))),
       maxSimulationTurns: Math.max(2, Math.min(6, 2 + Math.floor(normalized * 4))),
-      simulationRadius: Math.max(2, Math.min(6, Math.min(botTuning.candidateRadius, 2 + Math.floor(normalized * 5)))),
+      simulationRadius: Math.max(2, Math.min(6, 2 + Math.floor(normalized * 4))),
       simulationTopKFirstMoves: Math.max(1, Math.min(4, 1 + Math.floor(normalized * 3))),
     }
-  }, [botThinkSeconds, botTuning.candidateRadius])
+  }, [botThinkSeconds])
 
   const liveStatus = useMemo(() => {
     if (liveState.winner) {
@@ -1010,7 +1021,9 @@ function App() {
     dispatchLive({ type: 'undo' })
   }, [joinedRoom, mode])
 
-  const runBotTurn = useCallback(() => {
+  const runBotTurn = useCallback(async () => {
+    if (isBotThinking) return
+
     if (mode !== 'live') {
       setNetworkError('Bot play is only available in Live mode.')
       return
@@ -1021,50 +1034,84 @@ function App() {
       return
     }
 
-    const decision = chooseBotTurnDetailed(
-      {
-        moves: liveState.moves,
-        moveHistory: liveState.moveHistory,
-        turn: liveState.turn,
-        placementsLeft: liveState.placementsLeft,
-      },
-      botTuning,
-      botSearchOptions,
-    )
-    setLastBotStats(decision.stats)
-    const plannedMoves = decision.moves
+    setIsBotThinking(true)
+    setLiveBotNodes(0)
+    setLiveBotPlayouts(0)
+    setLiveBotBoardEvals(0)
+    setLiveBotElapsedMs(0)
 
-    if (plannedMoves.length === 0) {
-      return
-    }
+    try {
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 0))
+      const decision =
+        botSearchOptions.budget.maxTimeMs > 0 && botSearchOptions.budget.maxNodes > 0
+          ? await chooseBotTurnDetailedAsync(
+              {
+                moves: liveState.moves,
+                moveHistory: liveState.moveHistory,
+                turn: liveState.turn,
+                placementsLeft: liveState.placementsLeft,
+              },
+              botTuning,
+              botSearchOptions,
+              {
+                yieldEveryMs: 16,
+                onProgress: (progress) => {
+                  setLiveBotNodes(progress.nodesExpanded)
+                  setLiveBotPlayouts(progress.playouts)
+                  setLiveBotBoardEvals(progress.boardEvaluations)
+                  setLiveBotElapsedMs(progress.elapsedMs)
+                },
+              },
+            )
+          : chooseBotTurnDetailed(
+              {
+                moves: liveState.moves,
+                moveHistory: liveState.moveHistory,
+                turn: liveState.turn,
+                placementsLeft: liveState.placementsLeft,
+              },
+              botTuning,
+              botSearchOptions,
+            )
 
-    setNetworkError(null)
+      setLastBotStats(decision.stats)
+      const plannedMoves = decision.moves
 
-    if (joinedRoom && wsRef.current?.readyState !== WebSocket.OPEN) {
-      setNetworkError('Room socket is not connected. Rejoin or reconnect before bot play.')
-      return
-    }
-
-    if (joinedRoom && wsRef.current?.readyState === WebSocket.OPEN) {
-      for (const move of plannedMoves) {
-        wsRef.current.send(
-          JSON.stringify({
-            action: 'place',
-            q: move.q,
-            r: move.r,
-            mark: liveState.turn,
-          }),
-        )
+      if (plannedMoves.length === 0) {
+        return
       }
-      return
-    }
 
-    for (const move of plannedMoves) {
-      dispatchLive({ type: 'place', q: move.q, r: move.r })
+      setNetworkError(null)
+
+      if (joinedRoom && wsRef.current?.readyState !== WebSocket.OPEN) {
+        setNetworkError('Room socket is not connected. Rejoin or reconnect before bot play.')
+        return
+      }
+
+      if (joinedRoom && wsRef.current?.readyState === WebSocket.OPEN) {
+        for (const move of plannedMoves) {
+          wsRef.current.send(
+            JSON.stringify({
+              action: 'place',
+              q: move.q,
+              r: move.r,
+              mark: liveState.turn,
+            }),
+          )
+        }
+        return
+      }
+
+      for (const move of plannedMoves) {
+        dispatchLive({ type: 'place', q: move.q, r: move.r })
+      }
+    } finally {
+      setIsBotThinking(false)
     }
   }, [
     botSearchOptions,
     botTuning,
+    isBotThinking,
     joinedRoom,
     liveState.moveHistory,
     liveState.moves,
@@ -1077,16 +1124,8 @@ function App() {
   const setThreatWeight = (idx: number, value: number) => {
     setBotTuning((prev) => {
       const next = [...prev.threatWeights]
-      next[idx] = value
+      next[idx] = clampValue(value, 0, 20000)
       return { ...prev, threatWeights: next }
-    })
-  }
-
-  const setBreadthWeight = (idx: number, value: number) => {
-    setBotTuning((prev) => {
-      const next = [...prev.threatBreadthWeights]
-      next[idx] = value
-      return { ...prev, threatBreadthWeights: next }
     })
   }
 
@@ -1101,6 +1140,18 @@ function App() {
     setAutoBotEnabled(true)
     lastAutoBotSignatureRef.current = ''
   }
+
+  const applyTopVsBot = useCallback((enabled: boolean) => {
+    if (quickPlayerSide === quickBotSide) {
+      setNetworkError('Player side and bot side cannot be the same.')
+      return
+    }
+
+    setMode('live')
+    setPlayAs(quickPlayerSide)
+    setAutoBotMode(enabled ? quickBotSide : 'off')
+    setNetworkError(null)
+  }, [quickBotSide, quickPlayerSide])
 
   useEffect(() => {
     if (!autoBotEnabled || mode !== 'live' || liveState.winner) {
@@ -1121,7 +1172,7 @@ function App() {
     lastAutoBotSignatureRef.current = signature
 
     const timer = window.setTimeout(() => {
-      runBotTurn()
+      void runBotTurn()
     }, 180)
 
     return () => {
@@ -1210,6 +1261,21 @@ function App() {
 
         ctx.fillStyle = deadCell ? theme.deadHexFill : fillGrid
         ctx.fill()
+        if (showPressureMap && !occupied) {
+          const xPressure = liveEvaluation.xPressureMap.get(key) ?? 0
+          const oPressure = liveEvaluation.oPressureMap.get(key) ?? 0
+          const xNorm = liveEvaluation.xPressureMax > 0 ? xPressure / liveEvaluation.xPressureMax : 0
+          const oNorm = liveEvaluation.oPressureMax > 0 ? oPressure / liveEvaluation.oPressureMax : 0
+          const net = xNorm - oNorm
+          const intensity = Math.max(0, Math.min(1, Math.abs(net)))
+          if (intensity > 0.025) {
+            ctx.save()
+            ctx.globalAlpha = 0.12 + 0.36 * intensity
+            ctx.fillStyle = net >= 0 ? theme.xFill : theme.oFill
+            ctx.fill()
+            ctx.restore()
+          }
+        }
         ctx.strokeStyle = deadCell ? theme.deadHexStroke : strokeGrid
         ctx.lineWidth = 1
         ctx.stroke()
@@ -1407,6 +1473,10 @@ function App() {
     liveState.moveHistory,
     liveState.winner,
     mode,
+    liveEvaluation.oPressureMap,
+    liveEvaluation.oPressureMax,
+    liveEvaluation.xPressureMap,
+    liveEvaluation.xPressureMax,
     planMoves,
     size.height,
     size.width,
@@ -1415,6 +1485,7 @@ function App() {
     moveNumberByKey,
     pieceStyle,
     showMoveNumbers,
+    showPressureMap,
     showThreatHighlights,
     threatTargets,
     theme,
@@ -1545,6 +1616,59 @@ function App() {
           <h1>Hexagonal Tic-Tac-Toe</h1>
         </div>
         <div className="topbar-actions">
+          <div className="quick-bot">
+            <button
+              className={`quick-bot-start ${topVsBotEnabled ? 'is-on' : 'is-off'}`}
+              onClick={() => applyTopVsBot(!topVsBotEnabled)}
+              type="button"
+            >
+              {topVsBotEnabled ? 'Bot: On' : 'Bot: Off'}
+            </button>
+            <label className="quick-bot-side">
+              Player
+              <select
+                value={quickPlayerSide}
+                onChange={(event) => {
+                  const next = event.target.value as Player
+                  setQuickPlayerSide(next)
+                  if (topVsBotEnabled) {
+                    if (next === quickBotSide) {
+                      setNetworkError('Player side and bot side cannot be the same.')
+                      return
+                    }
+                    setMode('live')
+                    setPlayAs(next)
+                    setNetworkError(null)
+                  }
+                }}
+              >
+                <option value="X">X</option>
+                <option value="O">O</option>
+              </select>
+            </label>
+            <label className="quick-bot-side">
+              Bot
+              <select
+                value={quickBotSide}
+                onChange={(event) => {
+                  const next = event.target.value as Player
+                  setQuickBotSide(next)
+                  if (topVsBotEnabled) {
+                    if (next === quickPlayerSide) {
+                      setNetworkError('Player side and bot side cannot be the same.')
+                      return
+                    }
+                    setMode('live')
+                    setAutoBotMode(next)
+                    setNetworkError(null)
+                  }
+                }}
+              >
+                <option value="X">X</option>
+                <option value="O">O</option>
+              </select>
+            </label>
+          </div>
           <div className={`ws-pill ${wsStatus}`}>{wsStatus}</div>
           <div className="room-pill">{joinedRoom ? `Game: ${joinedRoom}` : 'Local only'}</div>
           <button className="toggle-hud" onClick={() => setShowRulesModal(true)} type="button">
@@ -1631,7 +1755,7 @@ function App() {
                   </section>
                 </details>
 
-                <details className="dock-panel" open>
+                <details className="dock-panel">
                   <summary>Play</summary>
                   <section className="controls">
                     <div className="button-row">
@@ -1747,8 +1871,8 @@ function App() {
                     </div>
                   </div>
                   <div className="button-row">
-                    <button onClick={runBotTurn} type="button" disabled={mode !== 'live' || !!liveState.winner}>
-                      Play bot turn ({liveState.turn})
+                    <button onClick={() => void runBotTurn()} type="button" disabled={mode !== 'live' || !!liveState.winner || isBotThinking}>
+                      {isBotThinking ? 'Bot thinking…' : `Play bot turn (${liveState.turn})`}
                     </button>
                   </div>
                   <div className="compute-panel">
@@ -1772,195 +1896,131 @@ function App() {
                     </div>
                     {lastBotStats ? (
                       <div className="compute-meta">
-                        Last run: {lastBotStats.mode.toUpperCase()} | {(lastBotStats.elapsedMs / 1000).toFixed(3)}s | nodes{' '}
-                        {lastBotStats.nodesExpanded.toLocaleString()} | playouts {lastBotStats.playouts.toLocaleString()} | depth{' '}
-                        {lastBotStats.maxDepthTurns} turns | root cands {lastBotStats.rootCandidates} | stop {lastBotStats.stopReason}
+                        Last run: {lastBotStats.mode.toUpperCase()} | {(lastBotStats.elapsedMs / 1000).toFixed(3)}s | evals{' '}
+                        {lastBotStats.boardEvaluations.toLocaleString()} | nodes {lastBotStats.nodesExpanded.toLocaleString()} | playouts{' '}
+                        {lastBotStats.playouts.toLocaleString()} | depth {lastBotStats.maxDepthTurns} turns | root cands{' '}
+                        {lastBotStats.rootCandidates} | stop {lastBotStats.stopReason}
+                      </div>
+                    ) : null}
+                    {isBotThinking ? (
+                      <div className="compute-meta">
+                        Thinking now: {(liveBotElapsedMs / 1000).toFixed(2)}s | evals {liveBotBoardEvals.toLocaleString()} | nodes{' '}
+                        {liveBotNodes.toLocaleString()} | playouts {liveBotPlayouts.toLocaleString()}
                       </div>
                     ) : null}
                   </div>
                   <details className="tuning-panel">
-                    <summary>Advanced tuning (opinionated defaults)</summary>
+                    <summary>Advanced tuning (threat + diversity model)</summary>
                     <div className="tuning-grid">
+                        <label>
+                          <span className="tuning-label-text">
+                            Threat-2 base <HintPill text="Small value for uncontested 2-threat windows (not included in pressure-map diversity)." />
+                          </span>
+                          <input
+                            type="number"
+                            min={0}
+                            max={20000}
+                            step={1}
+                            value={botTuning.threatWeights[2]}
+                            onChange={(e) => setThreatWeight(2, Number(e.target.value))}
+                          />
+                        </label>
                         <label>
                           <span className="tuning-label-text">
                             Threat-3 base <HintPill text="Base value of each uncontested 3-in-a-row threat window." />
                           </span>
                           <input
                             type="number"
+                            min={0}
+                            max={20000}
+                            step={1}
                             value={botTuning.threatWeights[3]}
                             onChange={(e) => setThreatWeight(3, Number(e.target.value))}
                           />
                         </label>
                         <label>
                           <span className="tuning-label-text">
-                            Threat-4 base <HintPill text="Base value of each uncontested 4-in-a-row threat window." />
+                            Threat-4/5 base <HintPill text="Shared base value for uncontested 4-threats and 5-threats." />
                           </span>
                           <input
                             type="number"
+                            min={0}
+                            max={20000}
+                            step={1}
                             value={botTuning.threatWeights[4]}
-                            onChange={(e) => setThreatWeight(4, Number(e.target.value))}
+                            onChange={(e) => {
+                              const value = clampValue(Number(e.target.value) || 0, 0, 20000)
+                              setBotTuning((prev) => {
+                                const next = [...prev.threatWeights]
+                                next[4] = value
+                                next[5] = value
+                                return { ...prev, threatWeights: next }
+                              })
+                            }}
                           />
                         </label>
                         <label>
                           <span className="tuning-label-text">
-                            Threat-5 base <HintPill text="Base value of each uncontested 5-in-a-row threat window." />
+                            Threat vs diversity mix{' '}
+                            <HintPill text="0.00 = threat severity only, 1.00 = diversity only. Middle values blend both normalized signals." />
                           </span>
-                          <input
-                            type="number"
-                            value={botTuning.threatWeights[5]}
-                            onChange={(e) => setThreatWeight(5, Number(e.target.value))}
-                          />
+                          <div>
+                            <input
+                              type="range"
+                              min={0}
+                              max={1}
+                              step={0.01}
+                              value={botTuning.threatDiversityBlend}
+                              onChange={(e) =>
+                                setBotTuning((prev) => ({
+                                  ...prev,
+                                  threatDiversityBlend: clampValue(Number(e.target.value) || 0, 0, 1),
+                                }))
+                              }
+                            />
+                            <div className="compute-meta">Value: {botTuning.threatDiversityBlend.toFixed(2)}</div>
+                          </div>
                         </label>
                         <label>
                           <span className="tuning-label-text">
-                            Threat-3 breadth{' '}
-                            <HintPill text="Extra bonus for having many 3-threats at once (scales with count squared)." />
+                            Threat normalization scale{' '}
+                            <HintPill text="Saturation scale for raw threat severity before blending with diversity. Higher means slower saturation." />
                           </span>
                           <input
                             type="number"
-                            value={botTuning.threatBreadthWeights[3]}
-                            onChange={(e) => setBreadthWeight(3, Number(e.target.value))}
-                          />
-                        </label>
-                        <label>
-                          <span className="tuning-label-text">
-                            Threat-4 breadth{' '}
-                            <HintPill text="Extra bonus for multiple 4-threats at once; encourages fork creation." />
-                          </span>
-                          <input
-                            type="number"
-                            value={botTuning.threatBreadthWeights[4]}
-                            onChange={(e) => setBreadthWeight(4, Number(e.target.value))}
-                          />
-                        </label>
-                        <label>
-                          <span className="tuning-label-text">
-                            Threat-5 breadth <HintPill text="Extra bonus for multiple 5-threats; usually near forced wins." />
-                          </span>
-                          <input
-                            type="number"
-                            value={botTuning.threatBreadthWeights[5]}
-                            onChange={(e) => setBreadthWeight(5, Number(e.target.value))}
+                            min={1}
+                            max={50000}
+                            step={50}
+                            value={botTuning.threatSeverityScale}
+                            onChange={(e) =>
+                              setBotTuning((prev) => ({
+                                ...prev,
+                                threatSeverityScale: clampValue(Number(e.target.value) || 0, 1, 50000),
+                              }))
+                            }
                           />
                         </label>
                         <label>
                           <span className="tuning-label-text">
                             Defense weight{' '}
-                            <HintPill text="Blend between offense and defense. 0.5 means balanced; higher values prioritize reducing opponent score." />
+                            <HintPill text="Offense/defense slider. Higher values prioritize suppressing opponent offense; lower values favor pure self-pressure." />
                           </span>
-                          <input
-                            type="number"
-                            min={0}
-                            max={1}
-                            step={0.05}
-                            value={botTuning.defenseWeight}
-                            onChange={(e) =>
-                              setBotTuning((prev) => ({
-                                ...prev,
-                                defenseWeight: Math.max(0, Math.min(1, Number(e.target.value) || 0)),
-                              }))
-                            }
-                          />
-                        </label>
-                        <label>
-                          <span className="tuning-label-text">
-                            Immediate danger penalty{' '}
-                            <HintPill text="Large penalty applied whenever opponent still has any one-turn win threat group after your move." />
-                          </span>
-                          <input
-                            type="number"
-                            value={botTuning.immediateDangerPenalty}
-                            onChange={(e) =>
-                              setBotTuning((prev) => ({
-                                ...prev,
-                                immediateDangerPenalty: Math.max(0, Number(e.target.value) || 0),
-                              }))
-                            }
-                          />
-                        </label>
-                        <label>
-                          <span className="tuning-label-text">
-                            One-turn win bonus{' '}
-                            <HintPill text="Bonus per unique empty cell that completes a win in one turn (up to two placements)." />
-                          </span>
-                          <input
-                            type="number"
-                            value={botTuning.oneTurnWinBonus}
-                            onChange={(e) => setBotTuning((prev) => ({ ...prev, oneTurnWinBonus: Number(e.target.value) }))}
-                          />
-                        </label>
-                        <label>
-                          <span className="tuning-label-text">
-                            Threat-3 cluster bonus <HintPill text="Extra emphasis on building dense groups of 3-threats." />
-                          </span>
-                          <input
-                            type="number"
-                            value={botTuning.threat3ClusterBonus}
-                            onChange={(e) =>
-                              setBotTuning((prev) => ({
-                                ...prev,
-                                threat3ClusterBonus: Number(e.target.value),
-                              }))
-                            }
-                          />
-                        </label>
-                        <label>
-                          <span className="tuning-label-text">
-                            Threat-4 fork bonus{' '}
-                            <HintPill text="Additional bonus when there is more than one 4-threat; models dual-threat pressure." />
-                          </span>
-                          <input
-                            type="number"
-                            value={botTuning.threat4ForkBonus}
-                            onChange={(e) => setBotTuning((prev) => ({ ...prev, threat4ForkBonus: Number(e.target.value) }))}
-                          />
-                        </label>
-                        <label>
-                          <span className="tuning-label-text">
-                            Threat-5 fork bonus{' '}
-                            <HintPill text="Additional bonus when there is more than one 5-threat; often decisive." />
-                          </span>
-                          <input
-                            type="number"
-                            value={botTuning.threat5ForkBonus}
-                            onChange={(e) => setBotTuning((prev) => ({ ...prev, threat5ForkBonus: Number(e.target.value) }))}
-                          />
-                        </label>
-                        <label>
-                          <span className="tuning-label-text">
-                            Candidate radius{' '}
-                            <HintPill text="How far from existing stones the bot considers candidate cells. Higher is wider but slower." />
-                          </span>
-                          <input
-                            type="number"
-                            min={1}
-                            max={7}
-                            value={botTuning.candidateRadius}
-                            onChange={(e) =>
-                              setBotTuning((prev) => ({
-                                ...prev,
-                                candidateRadius: Math.max(1, Math.min(7, Number(e.target.value) || 1)),
-                              }))
-                            }
-                          />
-                        </label>
-                        <label>
-                          <span className="tuning-label-text">
-                            Top-K first moves{' '}
-                            <HintPill text="For 2-placement turns, evaluate this many best first moves before choosing the line with best follow-up second move." />
-                          </span>
-                          <input
-                            type="number"
-                            min={1}
-                            max={20}
-                            value={botTuning.topKFirstMoves}
-                            onChange={(e) =>
-                              setBotTuning((prev) => ({
-                                ...prev,
-                                topKFirstMoves: Math.max(1, Math.min(20, Math.floor(Number(e.target.value) || 1))),
-                              }))
-                            }
-                          />
+                          <div>
+                            <input
+                              type="range"
+                              min={0}
+                              max={2}
+                              step={0.05}
+                              value={botTuning.defenseWeight}
+                              onChange={(e) =>
+                                setBotTuning((prev) => ({
+                                  ...prev,
+                                  defenseWeight: clampValue(Number(e.target.value) || 0, 0, 2),
+                                }))
+                              }
+                            />
+                            <div className="compute-meta">Value: {botTuning.defenseWeight.toFixed(2)}</div>
+                          </div>
                         </label>
                     </div>
                     <div className="button-row">
@@ -2006,6 +2066,14 @@ function App() {
                           type="checkbox"
                           checked={showThreatHighlights}
                           onChange={(event) => setShowThreatHighlights(event.target.checked)}
+                        />
+                      </label>
+                      <label className="play-as">
+                        Show pressure map
+                        <input
+                          type="checkbox"
+                          checked={showPressureMap}
+                          onChange={(event) => setShowPressureMap(event.target.checked)}
                         />
                       </label>
                       <div className="auto-bot-group" role="group" aria-label="Color palette options">
