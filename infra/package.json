@@ -5,7 +5,9 @@
   "scripts": {
     "build": "tsc",
     "synth": "cdk synth",
-    "deploy": "cdk deploy --require-approval never",
+    "deploy": "bash scripts/deploy-hex-ttt.sh",
+    "deploy:raw": "cdk deploy --require-approval never",
+    "deploy:cert": "cdk deploy HexTttCertificateStack --require-approval never -c domainName=${DOMAIN_NAME:-he-xo.com} -c hostedZoneDomain=${HOSTED_ZONE_DOMAIN:-he-xo.com} -c includeWww=${INCLUDE_WWW:-true}",
     "destroy": "cdk destroy"
   },
   "devDependencies": {

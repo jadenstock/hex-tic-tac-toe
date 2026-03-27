@@ -12,7 +12,18 @@ const domainName = app.node.tryGetContext('domainName') as string | undefined
 const hostedZoneDomain = app.node.tryGetContext('hostedZoneDomain') as string | undefined
 const certificateArn = app.node.tryGetContext('certificateArn') as string | undefined
 const includeWwwContext = app.node.tryGetContext('includeWww')
-const includeWww = includeWwwContext === undefined ? true : includeWwwContext === 'true'
+const includeWww =
+  includeWwwContext === undefined
+    ? true
+    : typeof includeWwwContext === 'boolean'
+      ? includeWwwContext
+      : String(includeWwwContext).toLowerCase() === 'true'
+
+if ((domainName && !certificateArn) || (!domainName && certificateArn)) {
+  throw new Error(
+    'Invalid custom-domain context: domainName and certificateArn must be provided together (or both omitted).',
+  )
+}
 
 if (domainName) {
   new HexTttCertificateStack(app, 'HexTttCertificateStack', {
