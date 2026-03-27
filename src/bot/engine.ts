@@ -10,8 +10,8 @@ export type {
   LiveLikeState,
   MoveRecord,
   Player,
-} from './types'
+} from './types.ts'
 
-export { DEFAULT_BOT_SEARCH_OPTIONS, DEFAULT_BOT_TUNING, WIN_DIRECTIONS, WIN_LENGTH } from './types'
-export { evaluateBoardState } from './evaluation'
-export { chooseBotTurn, chooseBotTurnDetailed, chooseBotTurnDetailedAsync, chooseGreedyTurn } from './search'
+export { DEFAULT_BOT_SEARCH_OPTIONS, DEFAULT_BOT_TUNING, WIN_DIRECTIONS, WIN_LENGTH } from './types.ts'
+export { evaluateBoardState } from './evaluation.ts'
+export { chooseBotTurn, chooseBotTurnDetailed, chooseBotTurnDetailedAsync, chooseGreedyTurn } from './search.ts'

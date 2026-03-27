@@ -1,4 +1,4 @@
-import { evaluateBoardState } from './evaluation'
+import { evaluateBoardState } from './evaluation.ts'
 import type {
   Axial,
   BotSearchOptions,
@@ -8,8 +8,8 @@ import type {
   EvaluationResult,
   LiveLikeState,
   Player,
-} from './types'
-import { DEFAULT_BOT_SEARCH_OPTIONS, DEFAULT_BOT_TUNING, WIN_DIRECTIONS, WIN_LENGTH } from './types'
+} from './types.ts'
+import { DEFAULT_BOT_SEARCH_OPTIONS, DEFAULT_BOT_TUNING, WIN_DIRECTIONS, WIN_LENGTH } from './types.ts'
 
 let activeBoardEvalCounter: { count: number } | null = null
 

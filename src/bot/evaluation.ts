@@ -1,5 +1,5 @@
-import type { BotTuning, EvaluationResult, Player } from './types'
-import { DEFAULT_BOT_TUNING, WIN_DIRECTIONS, WIN_LENGTH } from './types'
+import type { BotTuning, EvaluationResult, Player } from './types.ts'
+import { DEFAULT_BOT_TUNING, WIN_DIRECTIONS, WIN_LENGTH } from './types.ts'
 
 function toKey(q: number, r: number): string {
   return `${q},${r}`
