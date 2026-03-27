@@ -15,14 +15,13 @@ import {
   type AppliedBoardTurn,
   type SearchBoard,
 } from './board.ts'
-import { evaluateBoardState } from './evaluation.ts'
+import { evaluateBoardSummary, type EvaluationSummary } from './evaluation.ts'
 import type {
   Axial,
   BotSearchOptions,
   BotSearchStats,
   BotTuning,
   BotTurnDecision,
-  EvaluationResult,
   LiveLikeState,
   Player,
 } from './types.ts'
@@ -30,7 +29,7 @@ import { DEFAULT_BOT_SEARCH_OPTIONS, DEFAULT_BOT_TUNING } from './types.ts'
 
 type SearchContext = {
   boardEvalCounter: { count: number }
-  evaluationCache: Map<string, EvaluationResult>
+  evaluationCache: Map<string, EvaluationSummary>
   candidateCache: Map<string, Axial[][]>
 }
 
@@ -81,12 +80,12 @@ function createSearchContext(): SearchContext {
   }
 }
 
-function evaluateBoardStateTracked(board: SearchBoard, tuning: BotTuning, context: SearchContext): EvaluationResult {
+function evaluateBoardStateTracked(board: SearchBoard, tuning: BotTuning, context: SearchContext): EvaluationSummary {
   const key = boardStateKey(board)
   const cached = context.evaluationCache.get(key)
   if (cached) return cached
   context.boardEvalCounter.count += 1
-  const result = evaluateBoardState(board, tuning)
+  const result = evaluateBoardSummary(board, tuning)
   context.evaluationCache.set(key, result)
   return result
 }
@@ -264,13 +263,13 @@ function collectLegalCandidates(board: SearchBoard, player: Player, tuning: BotT
   return sortAxials(candidateCells(board, tuning.candidateRadius))
 }
 
-function objectiveForPlayer(result: EvaluationResult, player: Player, tuning: BotTuning): number {
+function objectiveForPlayer(result: EvaluationSummary, player: Player, tuning: BotTuning): number {
   const own = player === 'X' ? result.xScore : result.oScore
   const opp = player === 'X' ? result.oScore : result.xScore
   return own - tuning.defenseWeight * opp
 }
 
-function opponentOneTurnWins(result: EvaluationResult, player: Player): number {
+function opponentOneTurnWins(result: EvaluationSummary, player: Player): number {
   return player === 'X' ? result.oOneTurnWins : result.xOneTurnWins
 }
 
@@ -357,11 +356,12 @@ function collectWinningTurnLines(board: SearchBoard, player: Player, tuning: Bot
 
     const secondOptions = collectLegalCandidates(board, player, tuning)
     for (const second of secondOptions) {
+      const key = canonicalLineKey([first, second])
+      if (seen.has(key)) continue
       const secondUndo = makeBoardMove(board, second, player)
       if (!secondUndo) continue
       if (secondUndo.winner === player) {
         const line = [first, second]
-        const key = canonicalLineKey(line)
         if (!seen.has(key)) {
           seen.add(key)
           winners.push(line)
@@ -477,6 +477,7 @@ function enumerateTurnCandidates(
 
   const firstCandidates = firstRanked.slice(0, Math.max(1, policy.firstMoveBeam))
   const lines: Array<{ line: Axial[]; objective: number; ownScore: number; immediateWin: boolean; oppOneTurnWins: number }> = []
+  const seenPairKeys = new Set<string>()
 
   for (const first of firstCandidates) {
     const firstUndo = makeBoardMove(board, first.option, player)
@@ -509,6 +510,9 @@ function enumerateTurnCandidates(
     }
 
     for (const second of secondRanked) {
+      const pairKey = canonicalLineKey([first.option, second.option])
+      if (seenPairKeys.has(pairKey)) continue
+      seenPairKeys.add(pairKey)
       const secondUndo = makeBoardMove(board, second.option, player)
       if (!secondUndo) continue
       const evalResult = evaluateBoardStateTracked(board, tuning, context)

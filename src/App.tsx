@@ -666,7 +666,7 @@ function App() {
   const [autoBotSide, setAutoBotSide] = useState<'X' | 'O' | 'both'>('both')
   const [quickPlayerSide, setQuickPlayerSide] = useState<Player>('X')
   const [quickBotSide, setQuickBotSide] = useState<Player>('O')
-  const [botThinkSeconds, setBotThinkSeconds] = useState(1)
+  const [botThinkSeconds, setBotThinkSeconds] = useState(2)
   const [botTuning, setBotTuning] = useState<BotTuning>(DEFAULT_BOT_TUNING)
   const [isBotThinking, setIsBotThinking] = useState(false)
   const [liveBotNodes, setLiveBotNodes] = useState(0)
