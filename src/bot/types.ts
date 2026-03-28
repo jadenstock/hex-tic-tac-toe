@@ -44,6 +44,10 @@ export const WIN_DIRECTIONS: Array<[number, number]> = [
   [1, -1],
 ]
 
+// Threat-2 windows are preemptives: with two placements next turn, they can be
+// promoted into true 4/5-threats. Keep their control weight modest but nonzero.
+export const THREAT_PRESSURE_WEIGHTS = [0, 0, 0.55, 1, 2.5, 2.5, 0]
+
 export type BotTuning = {
   threatWeights: number[]
   defenseWeight: number
@@ -99,8 +103,8 @@ export type BotTurnDecision = {
 
 export const DEFAULT_BOT_TUNING: BotTuning = {
   threatWeights: [0, 0, 6, 36, 860, 860, 20000],
-  defenseWeight: 0.8,
-  threatDiversityBlend: 0.35,
+  defenseWeight: 1,
+  threatDiversityBlend: 0.5,
   threatSeverityScale: 1200,
   immediateDangerPenalty: 150000,
   oneTurnWinBonus: 3500,

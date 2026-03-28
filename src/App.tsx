@@ -1914,7 +1914,7 @@ function App() {
                     <div className="tuning-grid">
                         <label>
                           <span className="tuning-label-text">
-                            Threat-2 base <HintPill text="Small value for uncontested 2-threat windows (not included in pressure-map diversity)." />
+                            Threat-2 base <HintPill text="Small value for uncontested 2-threat windows and preemptive control pressure." />
                           </span>
                           <input
                             type="number"

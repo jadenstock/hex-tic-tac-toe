@@ -1,5 +1,5 @@
 import type { Axial, LiveLikeState, MoveRecord, Player } from './types.ts'
-import { WIN_DIRECTIONS, WIN_LENGTH } from './types.ts'
+import { THREAT_PRESSURE_WEIGHTS, WIN_DIRECTIONS, WIN_LENGTH } from './types.ts'
 
 const HASH_MASK = (1n << 64n) - 1n
 
@@ -142,8 +142,9 @@ function applyWindowContribution(
   if (window.xCount > 0 && window.oCount === 0) {
     board.xThreats[window.xCount] += delta
     const emptyCount = WIN_LENGTH - window.xCount
-    if (window.xCount >= 3 && window.xCount <= 5 && emptyCount > 0) {
-      const share = (window.xCount === 3 ? 1 : 2.5) / emptyCount
+    const pressureWeight = THREAT_PRESSURE_WEIGHTS[window.xCount] ?? 0
+    if (pressureWeight > 0 && emptyCount > 0) {
+      const share = pressureWeight / emptyCount
       for (const cellKey of window.cellKeys) {
         if (windowCellIsOccupied(board, cellKey, changedKey, changedOccupied)) continue
         adjustPressureSummary(board, 'X', cellKey, share * delta)
@@ -157,8 +158,9 @@ function applyWindowContribution(
   } else if (window.oCount > 0 && window.xCount === 0) {
     board.oThreats[window.oCount] += delta
     const emptyCount = WIN_LENGTH - window.oCount
-    if (window.oCount >= 3 && window.oCount <= 5 && emptyCount > 0) {
-      const share = (window.oCount === 3 ? 1 : 2.5) / emptyCount
+    const pressureWeight = THREAT_PRESSURE_WEIGHTS[window.oCount] ?? 0
+    if (pressureWeight > 0 && emptyCount > 0) {
+      const share = pressureWeight / emptyCount
       for (const cellKey of window.cellKeys) {
         if (windowCellIsOccupied(board, cellKey, changedKey, changedOccupied)) continue
         adjustPressureSummary(board, 'O', cellKey, share * delta)
