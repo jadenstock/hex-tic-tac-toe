@@ -39,6 +39,30 @@
   justify-content: flex-end;
 }
 
+.topbar-brushes {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.topbar-brushes button {
+  border: 1px solid var(--line);
+  background: #ffffff;
+  color: var(--ink);
+  border-radius: 999px;
+  padding: 6px 12px;
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+.topbar-brushes button.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+
 .quick-bot {
   display: inline-flex;
   align-items: center;
@@ -49,10 +73,17 @@
   background: #ffffff;
 }
 
-.quick-bot-start {
-  border: 1px solid var(--line);
+.quick-bot-label {
+  color: var(--ink-soft);
+  font-size: 0.8rem;
+  font-weight: 700;
+  padding: 0 4px 0 8px;
+}
+
+.quick-bot-action {
+  border: 0;
   border-radius: 999px;
-  background: #ffffff;
+  background: transparent;
   color: var(--ink-soft);
   font-size: 0.84rem;
   font-weight: 700;
@@ -60,28 +91,9 @@
   cursor: pointer;
 }
 
-.quick-bot-start.is-on {
-  border-color: var(--accent);
+.quick-bot-action.active {
   background: var(--accent-soft);
   color: var(--accent);
-}
-
-.quick-bot-side {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--ink-soft);
-  font-size: 0.8rem;
-  padding: 0 6px 0 2px;
-}
-
-.quick-bot-side select {
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  background: #ffffff;
-  color: var(--ink);
-  font-size: 0.82rem;
-  padding: 2px 8px;
 }
 
 .toggle-hud {
@@ -193,6 +205,13 @@
   border: 1px solid var(--line);
   background: #f5f9f7;
   position: relative;
+}
+
+.board-theme-toggle {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  z-index: 2;
 }
 
 .board {
@@ -366,6 +385,14 @@
   font-size: 0.85rem;
 }
 
+.topbar-mode {
+  flex: 0 0 auto;
+}
+
+.topbar-mode select {
+  min-width: 88px;
+}
+
 .button-row button {
   border: 1px solid var(--line);
   background: #ffffff;
@@ -392,22 +419,37 @@
   font-weight: 600;
 }
 
-.button-row button.plan-x {
+.button-row button.sandbox-x,
+.topbar-brushes button.sandbox-x {
   border-color: #8b5cf6;
 }
 
-.button-row button.plan-x.active {
+.button-row button.sandbox-x.active,
+.topbar-brushes button.sandbox-x.active {
   background: #ede9fe;
   color: #6d28d9;
 }
 
-.button-row button.plan-o {
+.button-row button.sandbox-o,
+.topbar-brushes button.sandbox-o {
   border-color: #f97316;
 }
 
-.button-row button.plan-o.active {
+.button-row button.sandbox-o.active,
+.topbar-brushes button.sandbox-o.active {
   background: #ffedd5;
   color: #c2410c;
+}
+
+.button-row button.sandbox-erase,
+.topbar-brushes button.sandbox-erase {
+  border-color: #64748b;
+}
+
+.button-row button.sandbox-erase.active,
+.topbar-brushes button.sandbox-erase.active {
+  background: #e2e8f0;
+  color: #334155;
 }
 
 .auto-bot-group {
@@ -582,7 +624,6 @@
 .app-shell.theme-dark .network-panel button,
 .app-shell.theme-dark .network-panel input,
 .app-shell.theme-dark .quick-bot,
-.app-shell.theme-dark .quick-bot-side select,
 .app-shell.theme-dark .button-row button,
 .app-shell.theme-dark .play-as,
 .app-shell.theme-dark .play-as select,
@@ -595,18 +636,18 @@
   border-color: var(--line);
 }
 
-.app-shell.theme-dark .quick-bot-side {
+.app-shell.theme-dark .quick-bot-label,
+.app-shell.theme-dark .quick-bot-action {
   color: var(--ink-soft);
 }
 
-.app-shell.theme-dark .quick-bot-start {
-  border-color: var(--line);
+.app-shell.theme-dark .topbar-brushes button {
   background: color-mix(in oklab, var(--panel), black 20%);
-  color: var(--ink-soft);
+  color: var(--ink);
+  border-color: var(--line);
 }
 
-.app-shell.theme-dark .quick-bot-start.is-on {
-  border-color: color-mix(in oklab, var(--accent), white 20%);
+.app-shell.theme-dark .quick-bot-action.active {
   background: color-mix(in oklab, var(--accent-soft), black 14%);
   color: var(--accent);
 }
@@ -675,6 +716,11 @@
 
   .board-dock {
     left: 8px;
+    right: 8px;
+    bottom: 8px;
+  }
+
+  .board-theme-toggle {
     right: 8px;
     bottom: 8px;
   }

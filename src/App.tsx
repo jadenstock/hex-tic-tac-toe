@@ -12,10 +12,11 @@ import {
 } from './bot/engine'
 
 type Player = 'X' | 'O'
-type Mode = 'live' | 'plan'
+type Mode = 'live' | 'sandbox'
 type PlayAs = 'any' | Player
 type PieceStyle = 'glyph' | 'fill'
-type PaletteId = 'spruce' | 'sunset' | 'graphite' | 'midnight' | 'volcanic' | 'cobalt' | 'amber-night'
+type PaletteId = 'spruce' | 'sunset' | 'graphite' | 'midnight' | 'volcanic' | 'cobalt' | 'amber-night' | 'arena'
+type SandboxBrush = Player | 'erase'
 
 type Camera = {
   x: number
@@ -88,6 +89,29 @@ type LiveAction =
     }
   | {
       type: 'clear'
+    }
+
+type SandboxAction =
+  | {
+      type: 'placeMark'
+      q: number
+      r: number
+      mark: Player
+    }
+  | {
+      type: 'erase'
+      q: number
+      r: number
+    }
+  | {
+      type: 'undo'
+    }
+  | {
+      type: 'clear'
+    }
+  | {
+      type: 'load'
+      state: LiveGameState
     }
 
 type WsStatus = 'disconnected' | 'connecting' | 'connected'
@@ -352,6 +376,37 @@ const THEMES: Record<PaletteId, ThemePalette> = {
     threatTextX: '#fde047',
     threatTextO: '#93c5fd',
   },
+  arena: {
+    dark: true,
+    ink: '#e6edf7',
+    inkSoft: '#9aa8bf',
+    panel: '#18212d',
+    panelStrong: '#121923',
+    line: '#243243',
+    accent: '#f6c542',
+    accentSoft: '#40351a',
+    warn: '#f59e0b',
+    pageBackground: 'radial-gradient(circle at 20% 20%, #1c2531 0%, #121923 50%, #0b1017 100%)',
+    boardBackground: '#111821',
+    boardGridFill: '#18222e',
+    boardGridStroke: '#2a394b',
+    xColor: '#f6c542',
+    oColor: '#8ac4ff',
+    xFill: '#f6c542',
+    oFill: '#8ac4ff',
+    hoverLive: '#f6c542',
+    hoverPlan: '#8ac4ff',
+    highlightRing: '#ffffff',
+    highlightFill: 'rgba(255, 255, 255, 0.08)',
+    deadHexFill: 'rgba(255, 255, 255, 0.025)',
+    deadHexStroke: 'rgba(255, 255, 255, 0.025)',
+    threatX4: 'rgba(246, 197, 66, 0.34)',
+    threatX5: 'rgba(246, 197, 66, 0.68)',
+    threatO4: 'rgba(138, 196, 255, 0.34)',
+    threatO5: 'rgba(138, 196, 255, 0.68)',
+    threatTextX: '#f6c542',
+    threatTextO: '#8ac4ff',
+  },
 }
 
 function toKey(q: number, r: number): string {
@@ -450,6 +505,39 @@ function createInitialLiveState(): LiveGameState {
     placementsLeft: 1,
     winner: null,
   }
+}
+
+function createInitialSandboxState(): LiveGameState {
+  return createInitialLiveState()
+}
+
+function createSandboxState(moveHistory: MoveRecord[]): LiveGameState {
+  return deriveLiveState(moveHistory)
+}
+
+function sandboxReducer(state: LiveGameState, action: SandboxAction): LiveGameState {
+  if (action.type === 'clear') {
+    return createInitialSandboxState()
+  }
+
+  if (action.type === 'load') {
+    return createSandboxState(action.state.moveHistory)
+  }
+
+  if (action.type === 'undo') {
+    if (state.moveHistory.length === 0) return state
+    return createSandboxState(state.moveHistory.slice(0, -1))
+  }
+
+  const key = toKey(action.q, action.r)
+  if (action.type === 'erase') {
+    if (!state.moves.has(key)) return state
+    return createSandboxState(state.moveHistory.filter((move) => toKey(move.q, move.r) !== key))
+  }
+
+  const nextHistory = state.moveHistory.filter((move) => toKey(move.q, move.r) !== key)
+  nextHistory.push({ q: action.q, r: action.r, mark: action.mark, actorType: 'human' })
+  return createSandboxState(nextHistory)
 }
 
 function liveReducer(state: LiveGameState, action: LiveAction): LiveGameState {
@@ -596,6 +684,10 @@ function participantSummary(participants: ParticipantMap | null): string | null 
   return `${x} vs ${o}`
 }
 
+function isDarkPalette(paletteId: PaletteId): boolean {
+  return THEMES[paletteId].dark
+}
+
 function canBelongToPlayerWinningSix(board: Map<string, Player>, q: number, r: number, player: Player): boolean {
   const opponent: Player = player === 'X' ? 'O' : 'X'
   if (board.get(toKey(q, r)) === opponent) {
@@ -711,8 +803,8 @@ function App() {
   const [playAs, setPlayAs] = useState<PlayAs>('any')
 
   const [liveState, dispatchLive] = useReducer(liveReducer, undefined, createInitialLiveState)
-  const [planBrush, setPlanBrush] = useState<Player>('X')
-  const [planMoves, setPlanMoves] = useState<Map<string, Player>>(new Map())
+  const [sandboxState, dispatchSandbox] = useReducer(sandboxReducer, undefined, createInitialSandboxState)
+  const [sandboxBrush, setSandboxBrush] = useState<SandboxBrush>('X')
 
   const [gameCodeInput, setGameCodeInput] = useState('')
   const [joinedRoom, setJoinedRoom] = useState<string | null>(null)
@@ -733,8 +825,6 @@ function App() {
   const [showPressureMap, setShowPressureMap] = useState(false)
   const [autoBotEnabled, setAutoBotEnabled] = useState(false)
   const [autoBotSide, setAutoBotSide] = useState<'X' | 'O' | 'both'>('both')
-  const [quickPlayerSide, setQuickPlayerSide] = useState<Player>('X')
-  const [quickBotSide, setQuickBotSide] = useState<Player>('O')
   const [botThinkSeconds, setBotThinkSeconds] = useState(2)
   const [botTuning, setBotTuning] = useState<BotTuning>(DEFAULT_BOT_TUNING)
   const [isBotThinking, setIsBotThinking] = useState(false)
@@ -757,6 +847,8 @@ function App() {
     started: boolean
   } | null>(null)
   const lastAutoBotSignatureRef = useRef('')
+  const lastLightPaletteRef = useRef<PaletteId>(isDarkPalette(paletteId) ? 'spruce' : paletteId)
+  const lastDarkPaletteRef = useRef<PaletteId>(isDarkPalette(paletteId) ? paletteId : 'midnight')
 
   const wsUrl = import.meta.env.VITE_WS_URL as string | undefined
   const apiBaseUrl = (import.meta.env.VITE_API_URL as string | undefined) ?? '/api'
@@ -820,6 +912,15 @@ function App() {
   }, [replayRecord, replayStep])
 
   useEffect(() => {
+    if (isDarkPalette(paletteId)) {
+      lastDarkPaletteRef.current = paletteId
+      return
+    }
+
+    lastLightPaletteRef.current = paletteId
+  }, [paletteId])
+
+  useEffect(() => {
     const wrapper = wrapperRef.current
     if (!wrapper) return
 
@@ -867,36 +968,39 @@ function App() {
     [screenToWorld],
   )
 
+  const displayState = isReplayMode ? liveState : mode === 'sandbox' ? sandboxState : liveState
   const totalLiveMoves = liveState.moves.size
-  const totalPlanMoves = planMoves.size
-  const topVsBotEnabled = autoBotEnabled && autoBotSide !== 'both'
-  const canUndo = liveState.moveHistory.length > 0
+  const totalSandboxMoves = sandboxState.moves.size
+  const autoBotForX = autoBotEnabled && (autoBotSide === 'X' || autoBotSide === 'both')
+  const autoBotForO = autoBotEnabled && (autoBotSide === 'O' || autoBotSide === 'both')
+  const showConnectedStatus = joinedRoom !== null && wsStatus === 'connected'
+  const canUndo = isReplayMode ? false : mode === 'sandbox' ? sandboxState.moveHistory.length > 0 : liveState.moveHistory.length > 0
   const highlightedKeys = useMemo(() => {
-    if (liveState.moveHistory.length === 0) {
+    if (displayState.moveHistory.length === 0) {
       return new Set<string>()
     }
 
     const next = new Set<string>()
-    const lastMark = liveState.moveHistory[liveState.moveHistory.length - 1].mark
+    const lastMark = displayState.moveHistory[displayState.moveHistory.length - 1].mark
 
-    for (let i = liveState.moveHistory.length - 1; i >= 0; i -= 1) {
-      const move = liveState.moveHistory[i]
+    for (let i = displayState.moveHistory.length - 1; i >= 0; i -= 1) {
+      const move = displayState.moveHistory[i]
       if (move.mark !== lastMark) break
       next.add(toKey(move.q, move.r))
       if (next.size >= 2) break
     }
 
     return next
-  }, [liveState.moveHistory])
+  }, [displayState.moveHistory])
   const moveNumberByKey = useMemo(() => {
     const next = new Map<string, number>()
-    for (let idx = 0; idx < liveState.moveHistory.length; idx += 1) {
-      const move = liveState.moveHistory[idx]
+    for (let idx = 0; idx < displayState.moveHistory.length; idx += 1) {
+      const move = displayState.moveHistory[idx]
       const moveNumber = idx === 0 ? 1 : Math.floor((idx - 1) / 4) + 2
       next.set(toKey(move.q, move.r), moveNumber)
     }
     return next
-  }, [liveState.moveHistory])
+  }, [displayState.moveHistory])
   const theme = THEMES[paletteId]
   const appThemeVars = useMemo<CSSProperties>(() => {
     return {
@@ -915,7 +1019,7 @@ function App() {
   }, [theme])
 
   const modeLabel = useMemo(() => {
-    return mode === 'live' ? 'Game' : 'Plan (sandbox)'
+    return mode === 'live' ? 'Game' : 'Sandbox'
   }, [mode])
   const currentParticipants = useMemo(() => {
     if (replayRecord) return replayRecord.participants
@@ -928,14 +1032,14 @@ function App() {
     if (!currentGameId || typeof window === 'undefined') return null
     return `${window.location.origin}/games/${currentGameId}`
   }, [currentGameId])
-  const liveEvaluation = useMemo(() => evaluateBoardState(liveState.moves, botTuning), [botTuning, liveState.moves])
-  const threatTargets = useMemo(() => collectThreatTargets(liveState.moves), [liveState.moves])
+  const liveEvaluation = useMemo(() => evaluateBoardState(displayState.moves, botTuning), [botTuning, displayState.moves])
+  const threatTargets = useMemo(() => collectThreatTargets(displayState.moves), [displayState.moves])
   const hoverTrainingLabel = useMemo(() => {
     if (!hoverHex || (!hideDeadHexes && !showThreatHighlights)) return null
 
     const key = toKey(hoverHex.q, hoverHex.r)
     const tags: string[] = []
-    const dead = isDeadHex(liveState.moves, hoverHex.q, hoverHex.r)
+    const dead = isDeadHex(displayState.moves, hoverHex.q, hoverHex.r)
     if (hideDeadHexes && dead) tags.push('dead hex')
     if (showThreatHighlights) {
       if (threatTargets.x5.has(key)) tags.push('X 5-threat finisher')
@@ -946,7 +1050,7 @@ function App() {
 
     if (tags.length === 0) return null
     return `${key}: ${tags.join(' | ')}`
-  }, [hideDeadHexes, hoverHex, liveState.moves, showThreatHighlights, threatTargets])
+  }, [displayState.moves, hideDeadHexes, hoverHex, showThreatHighlights, threatTargets])
   const botSearchOptions = useMemo<BotSearchOptions>(() => {
     if (botThinkSeconds <= 0) {
       return {
@@ -976,12 +1080,16 @@ function App() {
       return `Replay move ${replayStep}/${replayRecord.moveHistory.length}`
     }
 
-    if (liveState.winner) {
-      return `${liveState.winner} wins with 6 in a row. Board locked.`
+    if (mode === 'sandbox') {
+      return `Sandbox editing (${totalSandboxMoves} piece${totalSandboxMoves === 1 ? '' : 's'})`
     }
 
-    return `${liveState.turn} to move (${liveState.placementsLeft} placement${liveState.placementsLeft === 1 ? '' : 's'} left)`
-  }, [liveState.placementsLeft, liveState.turn, liveState.winner, replayRecord, replayStep])
+    if (displayState.winner) {
+      return `${displayState.winner} wins with 6 in a row. Board locked.`
+    }
+
+    return `${displayState.turn} to move (${displayState.placementsLeft} placement${displayState.placementsLeft === 1 ? '' : 's'} left)`
+  }, [displayState.placementsLeft, displayState.turn, displayState.winner, mode, replayRecord, replayStep, totalSandboxMoves])
 
   const syncFromWireBoard = useCallback((wireBoard: unknown, wireHistory?: unknown) => {
     const moves = boardObjectToMap(wireBoard)
@@ -1137,6 +1245,7 @@ function App() {
       setNetworkError(null)
 
       const participants = buildParticipants(autoBotEnabled, autoBotSide, joinedRoom)
+      const snapshotState = mode === 'sandbox' ? sandboxState : liveState
       const response = await fetch(`${apiBaseUrl}/games`, {
         method: 'POST',
         headers: {
@@ -1144,12 +1253,12 @@ function App() {
         },
         body: JSON.stringify({
           roomId: joinedRoom,
-          gameMode: joinedRoom ? 'live-room-snapshot' : 'local-live',
-          status: liveState.winner ? 'completed' : 'snapshot',
-          resultType: liveState.winner ? 'win' : 'snapshot',
-          winner: liveState.winner,
+          gameMode: mode === 'sandbox' ? 'sandbox' : joinedRoom ? 'live-room-snapshot' : 'local-live',
+          status: snapshotState.winner ? 'completed' : 'snapshot',
+          resultType: snapshotState.winner ? 'win' : 'snapshot',
+          winner: snapshotState.winner,
           participants,
-          moveHistory: liveState.moveHistory,
+          moveHistory: snapshotState.moveHistory,
         }),
       })
 
@@ -1165,11 +1274,53 @@ function App() {
     } catch (error) {
       setNetworkError(error instanceof Error ? error.message : 'Failed to save tracked game.')
     }
-  }, [apiBaseUrl, autoBotEnabled, autoBotSide, joinedRoom, liveState.moveHistory, liveState.winner])
+  }, [apiBaseUrl, autoBotEnabled, autoBotSide, joinedRoom, liveState, mode, sandboxState])
+
+  const handleModeChange = useCallback(
+    (nextMode: Mode) => {
+      if (nextMode === mode || isReplayMode) return
+
+      if (nextMode === 'sandbox') {
+        dispatchSandbox({ type: 'load', state: liveState })
+      } else if (!joinedRoom) {
+        dispatchLive({
+          type: 'sync',
+          moves: sandboxState.moves,
+          moveHistory: sandboxState.moveHistory,
+        })
+      }
+
+      setMode(nextMode)
+      setNetworkError(null)
+    },
+    [isReplayMode, joinedRoom, liveState, mode, sandboxState.moveHistory, sandboxState.moves],
+  )
+
+  const toggleThemeTone = useCallback(() => {
+    setPaletteId((current) => (isDarkPalette(current) ? lastLightPaletteRef.current : lastDarkPaletteRef.current))
+  }, [])
+
+  const applyAppearancePreset = useCallback((nextPalette: PaletteId, nextPieceStyle?: PieceStyle) => {
+    setPaletteId(nextPalette)
+    if (nextPieceStyle) {
+      setPieceStyle(nextPieceStyle)
+    }
+  }, [])
 
   const placeMove = useCallback(
     (q: number, r: number) => {
       if (isReplayMode) {
+        return
+      }
+
+      if (mode === 'sandbox') {
+        setNetworkError(null)
+        if (sandboxBrush === 'erase') {
+          dispatchSandbox({ type: 'erase', q, r })
+          return
+        }
+
+        dispatchSandbox({ type: 'placeMark', q, r, mark: sandboxBrush })
         return
       }
 
@@ -1201,27 +1352,17 @@ function App() {
         dispatchLive({ type: 'place', q, r })
         return
       }
-
-      const key = toKey(q, r)
-
-      setPlanMoves((prev) => {
-        const next = new Map(prev)
-        const existing = next.get(key)
-
-        if (existing === planBrush) {
-          next.delete(key)
-          return next
-        }
-
-        next.set(key, planBrush)
-        return next
-      })
     },
-    [isReplayMode, joinedRoom, liveState.turn, liveState.winner, mode, planBrush, playAs],
+    [isReplayMode, joinedRoom, liveState.turn, liveState.winner, mode, playAs, sandboxBrush],
   )
 
   const undoMove = useCallback(() => {
-    if (mode !== 'live' || isReplayMode) return
+    if (isReplayMode) return
+
+    if (mode === 'sandbox') {
+      dispatchSandbox({ type: 'undo' })
+      return
+    }
 
     if (joinedRoom && wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(
@@ -1238,13 +1379,11 @@ function App() {
   const runBotTurn = useCallback(async () => {
     if (isBotThinking) return
     if (isReplayMode) return
+    if (mode !== 'live') return
 
-    if (mode !== 'live') {
-      setNetworkError('Bot play is only available in Live mode.')
-      return
-    }
+    const sourceState = liveState
 
-    if (liveState.winner) {
+    if (sourceState.winner) {
       setNetworkError('Game already has a winner.')
       return
     }
@@ -1261,10 +1400,10 @@ function App() {
         botSearchOptions.budget.maxTimeMs > 0 && botSearchOptions.budget.maxNodes > 0
           ? await chooseBotTurnDetailedAsync(
               {
-                moves: liveState.moves,
-                moveHistory: liveState.moveHistory,
-                turn: liveState.turn,
-                placementsLeft: liveState.placementsLeft,
+                moves: sourceState.moves,
+                moveHistory: sourceState.moveHistory,
+                turn: sourceState.turn,
+                placementsLeft: sourceState.placementsLeft,
               },
               botTuning,
               botSearchOptions,
@@ -1280,10 +1419,10 @@ function App() {
             )
           : chooseBotTurnDetailed(
               {
-                moves: liveState.moves,
-                moveHistory: liveState.moveHistory,
-                turn: liveState.turn,
-                placementsLeft: liveState.placementsLeft,
+                moves: sourceState.moves,
+                moveHistory: sourceState.moveHistory,
+                turn: sourceState.turn,
+                placementsLeft: sourceState.placementsLeft,
               },
               botTuning,
               botSearchOptions,
@@ -1298,19 +1437,19 @@ function App() {
 
       setNetworkError(null)
 
-      if (joinedRoom && wsRef.current?.readyState !== WebSocket.OPEN) {
+      if (mode === 'live' && joinedRoom && wsRef.current?.readyState !== WebSocket.OPEN) {
         setNetworkError('Room socket is not connected. Rejoin or reconnect before bot play.')
         return
       }
 
-      if (joinedRoom && wsRef.current?.readyState === WebSocket.OPEN) {
+      if (mode === 'live' && joinedRoom && wsRef.current?.readyState === WebSocket.OPEN) {
         for (const move of plannedMoves) {
           wsRef.current.send(
             JSON.stringify({
               action: 'place',
               q: move.q,
               r: move.r,
-              mark: liveState.turn,
+              mark: sourceState.turn,
             }),
           )
         }
@@ -1327,14 +1466,10 @@ function App() {
     botSearchOptions,
     botTuning,
     isBotThinking,
-    joinedRoom,
-    liveState.moveHistory,
-    liveState.moves,
-    liveState.placementsLeft,
-    liveState.turn,
-    liveState.winner,
-    mode,
     isReplayMode,
+    joinedRoom,
+    liveState,
+    mode,
   ])
 
   const setThreatWeight = (idx: number, value: number) => {
@@ -1345,29 +1480,50 @@ function App() {
     })
   }
 
-  const setAutoBotMode = (side: 'off' | 'X' | 'O' | 'both') => {
+  const setAutoBotMode = useCallback((side: 'off' | 'X' | 'O' | 'both') => {
+    const botOwnsX = side === 'X' || side === 'both'
+    const botOwnsO = side === 'O' || side === 'both'
+    if ((playAs === 'X' && botOwnsX) || (playAs === 'O' && botOwnsO)) {
+      setNetworkError(`Play as ${playAs} conflicts with bot control for ${playAs}. Choose the other side or Any.`)
+      return false
+    }
+
     if (side === 'off') {
       setAutoBotEnabled(false)
       lastAutoBotSignatureRef.current = ''
-      return
+      setNetworkError(null)
+      return true
     }
 
     setAutoBotSide(side)
     setAutoBotEnabled(true)
     lastAutoBotSignatureRef.current = ''
-  }
-
-  const applyTopVsBot = useCallback((enabled: boolean) => {
-    if (quickPlayerSide === quickBotSide) {
-      setNetworkError('Player side and bot side cannot be the same.')
-      return
-    }
-
-    setMode('live')
-    setPlayAs(quickPlayerSide)
-    setAutoBotMode(enabled ? quickBotSide : 'off')
     setNetworkError(null)
-  }, [quickBotSide, quickPlayerSide])
+    return true
+  }, [playAs])
+
+  const handlePlayAsChange = useCallback(
+    (nextPlayAs: PlayAs) => {
+      if ((nextPlayAs === 'X' && autoBotForX) || (nextPlayAs === 'O' && autoBotForO)) {
+        setNetworkError(`Bot is already set to play ${nextPlayAs}. Choose the other side or Any.`)
+        return
+      }
+
+      setPlayAs(nextPlayAs)
+      setNetworkError(null)
+    },
+    [autoBotForO, autoBotForX],
+  )
+
+  const toggleAutoBotSide = useCallback(
+    (side: Player) => {
+      const nextX = side === 'X' ? !autoBotForX : autoBotForX
+      const nextO = side === 'O' ? !autoBotForO : autoBotForO
+      const nextMode = nextX && nextO ? 'both' : nextX ? 'X' : nextO ? 'O' : 'off'
+      setAutoBotMode(nextMode)
+    },
+    [autoBotForO, autoBotForX, setAutoBotMode],
+  )
 
   useEffect(() => {
     if (!autoBotEnabled || mode !== 'live' || liveState.winner) {
@@ -1444,7 +1600,7 @@ function App() {
       if (deadHexCache.has(key)) {
         return deadHexCache.get(key) ?? false
       }
-      const dead = isDeadHex(liveState.moves, q, r)
+      const dead = isDeadHex(displayState.moves, q, r)
       deadHexCache.set(key, dead)
       return dead
     }
@@ -1455,7 +1611,7 @@ function App() {
 
       for (let q = qMin; q <= qMax; q += 1) {
         const key = toKey(q, r)
-        const occupied = liveState.moves.has(key)
+        const occupied = displayState.moves.has(key)
         const deadCell = cachedIsDead(q, r)
         if (hideDeadHexes && deadCell && !occupied) {
           continue
@@ -1500,7 +1656,7 @@ function App() {
 
     if (hoverHex) {
       const key = toKey(hoverHex.q, hoverHex.r)
-      const showHover = mode === 'plan' || (!liveState.moves.has(key) && !liveState.winner)
+      const showHover = mode === 'sandbox' || (!displayState.moves.has(key) && !displayState.winner)
       if (showHover) {
         const world = axialToWorld(hoverHex.q, hoverHex.r, BASE_HEX_SIZE)
         const screen = worldToScreen(world.x, world.y)
@@ -1522,7 +1678,7 @@ function App() {
       }
     }
 
-    for (const [key, player] of liveState.moves.entries()) {
+    for (const [key, player] of displayState.moves.entries()) {
       const { q, r } = fromKey(key)
       const world = axialToWorld(q, r, BASE_HEX_SIZE)
       const screen = worldToScreen(world.x, world.y)
@@ -1605,7 +1761,7 @@ function App() {
 
     if (showThreatHighlights) {
       const drawThreatDot = (key: string, fill: string, line: string, radiusScale: number) => {
-        if (liveState.moves.has(key)) return
+        if (displayState.moves.has(key)) return
         const { q, r } = fromKey(key)
         const world = axialToWorld(q, r, BASE_HEX_SIZE)
         const screen = worldToScreen(world.x, world.y)
@@ -1635,34 +1791,7 @@ function App() {
       }
     }
 
-    for (const [key, player] of planMoves.entries()) {
-      const { q, r } = fromKey(key)
-      const world = axialToWorld(q, r, BASE_HEX_SIZE)
-      const screen = worldToScreen(world.x, world.y)
-      const radius = BASE_HEX_SIZE * camera.zoom * 0.35
-
-      ctx.save()
-      ctx.lineWidth = Math.max(1.5, camera.zoom * 1.8)
-      ctx.strokeStyle = player === 'X' ? 'rgba(126, 34, 206, 0.8)' : 'rgba(234, 88, 12, 0.82)'
-      ctx.setLineDash([4, 4])
-
-      if (player === 'X') {
-        ctx.beginPath()
-        ctx.moveTo(screen.x - radius, screen.y - radius)
-        ctx.lineTo(screen.x + radius, screen.y + radius)
-        ctx.moveTo(screen.x + radius, screen.y - radius)
-        ctx.lineTo(screen.x - radius, screen.y + radius)
-        ctx.stroke()
-      } else {
-        ctx.beginPath()
-        ctx.arc(screen.x, screen.y, radius, 0, Math.PI * 2)
-        ctx.stroke()
-      }
-
-      ctx.restore()
-    }
-
-    if (liveState.winner) {
+    if (displayState.winner && mode !== 'sandbox') {
       ctx.save()
       ctx.fillStyle = 'rgba(10, 18, 14, 0.22)'
       ctx.fillRect(0, 0, size.width, size.height)
@@ -1672,28 +1801,31 @@ function App() {
       ctx.font = '700 34px ui-sans-serif, system-ui, sans-serif'
       ctx.textAlign = 'center'
       ctx.textBaseline = 'middle'
-      const label = `${liveState.winner} wins`
+      const label = `${displayState.winner} wins`
       ctx.strokeText(label, size.width / 2, size.height / 2 - 12)
       ctx.fillText(label, size.width / 2, size.height / 2 - 12)
       ctx.font = '600 15px ui-sans-serif, system-ui, sans-serif'
       ctx.fillStyle = '#e2e8f0'
-      ctx.fillText('Board is locked. Use Undo or Sync/Clear to continue.', size.width / 2, size.height / 2 + 18)
+      ctx.fillText(
+        'Board is locked. Use Undo or Sync/Clear to continue.',
+        size.width / 2,
+        size.height / 2 + 18,
+      )
       ctx.restore()
     }
   }, [
     camera.x,
     camera.y,
     camera.zoom,
+    displayState.moveHistory,
+    displayState.moves,
+    displayState.winner,
     hoverHex,
-    liveState.moves,
-    liveState.moveHistory,
-    liveState.winner,
     mode,
     liveEvaluation.oPressureMap,
     liveEvaluation.oPressureMax,
     liveEvaluation.xPressureMap,
     liveEvaluation.xPressureMax,
-    planMoves,
     size.height,
     size.width,
     highlightedKeys,
@@ -1804,16 +1936,14 @@ function App() {
     }))
   }
 
-  const clearPlan = () => {
-    setPlanMoves(new Map())
-    setPlanBrush('X')
-  }
-
   const clearAll = () => {
     if (isReplayMode) return
 
-    setPlanMoves(new Map())
-    setPlanBrush('X')
+    if (mode === 'sandbox') {
+      dispatchSandbox({ type: 'clear' })
+      setSandboxBrush('X')
+      return
+    }
 
     if (joinedRoom && wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(
@@ -1834,62 +1964,56 @@ function App() {
           <h1>{isReplayMode ? 'Tracked Game Replay' : 'Hexagonal Tic-Tac-Toe'}</h1>
         </div>
         <div className="topbar-actions">
-          {isReplayMode ? null : (
-            <div className="quick-bot">
+          {!isReplayMode ? (
+            <label className="play-as topbar-mode">
+              Mode
+              <select value={mode} onChange={(event) => handleModeChange(event.target.value as Mode)}>
+                <option value="live">Live</option>
+                <option value="sandbox">Sandbox</option>
+              </select>
+            </label>
+          ) : null}
+          {!isReplayMode && mode === 'live' ? (
+            <div className="quick-bot" role="group" aria-label="Bot controls">
+              <span className="quick-bot-label">Bot</span>
+              <button className="quick-bot-action" onClick={() => void runBotTurn()} type="button" disabled={!!displayState.winner || isBotThinking}>
+                {isBotThinking ? 'Thinking…' : 'Next move'}
+              </button>
               <button
-                className={`quick-bot-start ${topVsBotEnabled ? 'is-on' : 'is-off'}`}
-                onClick={() => applyTopVsBot(!topVsBotEnabled)}
+                className={autoBotForX ? 'quick-bot-action active' : 'quick-bot-action'}
+                onClick={() => toggleAutoBotSide('X')}
                 type="button"
               >
-                {topVsBotEnabled ? 'Bot: On' : 'Bot: Off'}
+                Auto X
               </button>
-              <label className="quick-bot-side">
-                Player
-                <select
-                  value={quickPlayerSide}
-                  onChange={(event) => {
-                    const next = event.target.value as Player
-                    setQuickPlayerSide(next)
-                    if (topVsBotEnabled) {
-                      if (next === quickBotSide) {
-                        setNetworkError('Player side and bot side cannot be the same.')
-                        return
-                      }
-                      setMode('live')
-                      setPlayAs(next)
-                      setNetworkError(null)
-                    }
-                  }}
-                >
-                  <option value="X">X</option>
-                  <option value="O">O</option>
-                </select>
-              </label>
-              <label className="quick-bot-side">
-                Bot
-                <select
-                  value={quickBotSide}
-                  onChange={(event) => {
-                    const next = event.target.value as Player
-                    setQuickBotSide(next)
-                    if (topVsBotEnabled) {
-                      if (next === quickPlayerSide) {
-                        setNetworkError('Player side and bot side cannot be the same.')
-                        return
-                      }
-                      setMode('live')
-                      setAutoBotMode(next)
-                      setNetworkError(null)
-                    }
-                  }}
-                >
-                  <option value="X">X</option>
-                  <option value="O">O</option>
-                </select>
-              </label>
+              <button
+                className={autoBotForO ? 'quick-bot-action active' : 'quick-bot-action'}
+                onClick={() => toggleAutoBotSide('O')}
+                type="button"
+              >
+                Auto O
+              </button>
             </div>
-          )}
-          {isReplayMode ? <div className="room-pill">Replay: {replayGameId}</div> : <div className={`ws-pill ${wsStatus}`}>{wsStatus}</div>}
+          ) : null}
+          {!isReplayMode && mode === 'sandbox' ? (
+            <div className="topbar-brushes" role="group" aria-label="Sandbox brush">
+              <button className={sandboxBrush === 'X' ? 'active sandbox-x' : 'sandbox-x'} onClick={() => setSandboxBrush('X')} type="button">
+                Place X
+              </button>
+              <button className={sandboxBrush === 'O' ? 'active sandbox-o' : 'sandbox-o'} onClick={() => setSandboxBrush('O')} type="button">
+                Place O
+              </button>
+              <button
+                className={sandboxBrush === 'erase' ? 'active sandbox-erase' : 'sandbox-erase'}
+                onClick={() => setSandboxBrush('erase')}
+                type="button"
+              >
+                Erase
+              </button>
+            </div>
+          ) : null}
+          {isReplayMode ? <div className="room-pill">Replay: {replayGameId}</div> : null}
+          {showConnectedStatus ? <div className="ws-pill connected">Connected</div> : null}
           <div className="room-pill">{joinedRoom ? `Room: ${joinedRoom}` : participantModeLabel ?? 'Local only'}</div>
           {currentGameId ? <div className="room-pill">Game ID: {currentGameId.slice(0, 12)}</div> : null}
           {!isReplayMode ? (
@@ -1908,7 +2032,11 @@ function App() {
         </div>
       </header>
 
-      {liveState.winner && !isReplayMode ? <div className="winner-banner">{liveState.winner} wins. Game locked until undo or sync/reset.</div> : null}
+      {displayState.winner && !isReplayMode ? (
+        <div className="winner-banner">
+          {displayState.winner} wins. {mode === 'sandbox' ? 'Keep editing or clear the setup.' : 'Game locked until undo or sync/reset.'}
+        </div>
+      ) : null}
       {replayRecord ? (
         <div className="winner-banner">
           {participantModeLabel ?? 'Tracked replay'} · {replayRecord.participants.X.label} vs {replayRecord.participants.O.label}
@@ -1941,9 +2069,12 @@ function App() {
       ) : null}
 
       <main className="board-wrapper" ref={wrapperRef}>
+        <button className="toggle-hud board-theme-toggle" onClick={toggleThemeTone} type="button">
+          {theme.dark ? 'Light mode' : 'Dark mode'}
+        </button>
         <canvas
           ref={canvasRef}
-          className={`board ${liveState.winner || isReplayMode ? 'board-locked' : ''}`}
+          className={`board ${(isReplayMode || (mode === 'live' && displayState.winner)) ? 'board-locked' : ''}`}
           onPointerDown={onPointerDown}
           onPointerMove={onPointerMove}
           onPointerUp={onPointerUp}
@@ -2044,50 +2175,47 @@ function App() {
                       <summary>Play</summary>
                       <section className="controls">
                         <div className="button-row">
-                          <label className="play-as">
-                            Play as
-                            <select value={playAs} onChange={(event) => setPlayAs(event.target.value as PlayAs)}>
-                              <option value="any">Any</option>
-                              <option value="X">X</option>
-                              <option value="O">O</option>
-                            </select>
-                          </label>
-                          <button className={mode === 'live' ? 'active' : ''} onClick={() => setMode('live')} type="button">
-                            Game mode
-                          </button>
-                          <button className={mode === 'plan' ? 'active' : ''} onClick={() => setMode('plan')} type="button">
-                            Plan mode
-                          </button>
-                          {mode === 'plan' ? (
-                            <button className={planBrush === 'X' ? 'active plan-x' : 'plan-x'} onClick={() => setPlanBrush('X')} type="button">
-                              Plan X
-                            </button>
-                          ) : null}
-                          {mode === 'plan' ? (
-                            <button className={planBrush === 'O' ? 'active plan-o' : 'plan-o'} onClick={() => setPlanBrush('O')} type="button">
-                              Plan O
-                            </button>
-                          ) : null}
-                          {mode === 'plan' ? (
-                            <button onClick={clearPlan} type="button">
-                              Clear plan
-                            </button>
+                          {mode === 'live' ? (
+                            <label className="play-as">
+                              Play as
+                              <select value={playAs} onChange={(event) => handlePlayAsChange(event.target.value as PlayAs)}>
+                                <option value="any">Any</option>
+                                <option value="X">X</option>
+                                <option value="O">O</option>
+                              </select>
+                            </label>
                           ) : null}
                           <button onClick={undoMove} type="button" disabled={!canUndo}>
-                            Undo last
+                            {mode === 'sandbox' ? 'Undo edit' : 'Undo last'}
                           </button>
                           <button onClick={clearAll} type="button">
-                            {joinedRoom ? 'Sync room' : 'Clear local'}
+                            {mode === 'sandbox' ? 'Clear sandbox' : joinedRoom ? 'Sync room' : 'Clear local'}
                           </button>
-                          <button onClick={saveTrackedSnapshot} type="button">
-                            Save Game Snapshot
-                          </button>
+                          {mode === 'sandbox' ? (
+                            <button className={sandboxBrush === 'X' ? 'active sandbox-x' : 'sandbox-x'} onClick={() => setSandboxBrush('X')} type="button">
+                              Place X
+                            </button>
+                          ) : null}
+                          {mode === 'sandbox' ? (
+                            <button className={sandboxBrush === 'O' ? 'active sandbox-o' : 'sandbox-o'} onClick={() => setSandboxBrush('O')} type="button">
+                              Place O
+                            </button>
+                          ) : null}
+                          {mode === 'sandbox' ? (
+                            <button
+                              className={sandboxBrush === 'erase' ? 'active sandbox-erase' : 'sandbox-erase'}
+                              onClick={() => setSandboxBrush('erase')}
+                              type="button"
+                            >
+                              Erase
+                            </button>
+                          ) : null}
                           <button onClick={resetView} type="button">
                             Recenter view
                           </button>
                           <div className="zoom-readout">Zoom: {(camera.zoom * 100).toFixed(0)}%</div>
                           <div className="drag-readout">
-                            {mode === 'plan' ? `Plan marks: ${totalPlanMoves}` : `Moves played: ${totalLiveMoves}`}
+                            {mode === 'sandbox' ? `Sandbox pieces: ${totalSandboxMoves}` : `Moves played: ${totalLiveMoves}`}
                           </div>
                         </div>
                       </section>
@@ -2096,228 +2224,230 @@ function App() {
                     <details className="dock-panel">
                       <summary>Bot</summary>
                       <section className="controls">
-                        <section className="bot-panel">
-                      <div className="button-row">
-                        <div className="auto-bot-group" role="group" aria-label="Bot autoplay mode">
-                          <button
-                            type="button"
-                            className={!autoBotEnabled ? 'active' : ''}
-                            onClick={() => setAutoBotMode('off')}
-                          >
-                            Auto off
-                          </button>
-                          <button
-                            type="button"
-                            className={autoBotEnabled && autoBotSide === 'O' ? 'active auto-easy' : 'auto-easy'}
-                            onClick={() => setAutoBotMode('O')}
-                          >
-                            Auto O
-                          </button>
-                          <button
-                            type="button"
-                            className={autoBotEnabled && autoBotSide === 'X' ? 'active' : ''}
-                            onClick={() => setAutoBotMode('X')}
-                          >
-                            Auto X
-                          </button>
-                          <button
-                            type="button"
-                            className={autoBotEnabled && autoBotSide === 'both' ? 'active auto-easy' : 'auto-easy'}
-                            onClick={() => setAutoBotMode('both')}
-                          >
-                            Auto both
-                          </button>
-                        </div>
-                        <div className="drag-readout">
-                          {mode === 'live'
-                            ? `Bot will place ${liveState.placementsLeft} mark${liveState.placementsLeft === 1 ? '' : 's'}`
-                            : 'Switch to Live mode for bot play'}
-                        </div>
-                      </div>
-                      <div className="bot-metrics">
-                        <div className="stat">
-                          <span>X Threats</span>
-                          <strong className="threat-line-x">
-                            1:{liveEvaluation.xThreats[1]} 2:{liveEvaluation.xThreats[2]} 3:{liveEvaluation.xThreats[3]} 4:
-                            {liveEvaluation.xThreats[4]} 5:{liveEvaluation.xThreats[5]}
-                          </strong>
-                        </div>
-                        <div className="stat">
-                          <span>O Threats</span>
-                          <strong className="threat-line-o">
-                            1:{liveEvaluation.oThreats[1]} 2:{liveEvaluation.oThreats[2]} 3:{liveEvaluation.oThreats[3]} 4:
-                            {liveEvaluation.oThreats[4]} 5:{liveEvaluation.oThreats[5]}
-                          </strong>
-                        </div>
-                        <div className="stat">
-                          <span>X One-turn wins</span>
-                          <strong>{liveEvaluation.xOneTurnWins}</strong>
-                        </div>
-                        <div className="stat">
-                          <span>O One-turn wins</span>
-                          <strong>{liveEvaluation.oOneTurnWins}</strong>
-                        </div>
-                      </div>
-                      <div className="button-row">
-                        <button onClick={() => void runBotTurn()} type="button" disabled={mode !== 'live' || !!liveState.winner || isBotThinking}>
-                          {isBotThinking ? 'Bot thinking…' : `Play bot turn (${liveState.turn})`}
-                        </button>
-                      </div>
-                      <div className="compute-panel">
-                        <label className="compute-label" htmlFor="bot-compute-slider">
-                          Search time limit: {botThinkSeconds.toFixed(1)}s
-                          <HintPill text="0.0s uses greedy only. Higher values run budgeted MCTS with guided (non-random) simulation and larger node caps." />
-                        </label>
-                        <input
-                          id="bot-compute-slider"
-                          type="range"
-                          min={0}
-                          max={12}
-                          step={0.1}
-                          value={botThinkSeconds}
-                          onChange={(event) => setBotThinkSeconds(Math.max(0, Math.min(12, Number(event.target.value) || 0)))}
-                        />
-                        <div className="compute-meta">
-                          {botThinkSeconds <= 0
-                            ? 'Mode: Greedy (no search)'
-                            : `Mode: MCTS | Budget: ${botSearchOptions.budget.maxTimeMs}ms or ${botSearchOptions.budget.maxNodes.toLocaleString()} nodes`}
-                        </div>
-                        {lastBotStats ? (
-                          <div className="compute-meta">
-                            Last run: {lastBotStats.mode.toUpperCase()} | {(lastBotStats.elapsedMs / 1000).toFixed(3)}s | board evals{' '}
-                            {lastBotStats.boardEvaluations.toLocaleString()} | nodes {lastBotStats.nodesExpanded.toLocaleString()} | playouts{' '}
-                            {lastBotStats.playouts.toLocaleString()} | tree depth {lastBotStats.maxDepthTurns} turns | root lines{' '}
-                            {lastBotStats.rootCandidates} | stop {lastBotStats.stopReason}
-                          </div>
-                        ) : null}
-                        {isBotThinking ? (
-                          <div className="compute-meta">
-                            Thinking now: {(liveBotElapsedMs / 1000).toFixed(2)}s | board evals {liveBotBoardEvals.toLocaleString()} | nodes{' '}
-                            {liveBotNodes.toLocaleString()} | playouts {liveBotPlayouts.toLocaleString()}
-                          </div>
-                        ) : null}
-                      </div>
-                      <details className="tuning-panel">
-                        <summary>Advanced tuning (threat + diversity model)</summary>
-                        <div className="tuning-grid">
-                            <label>
-                              <span className="tuning-label-text">
-                                Threat-2 base <HintPill text="Small value for uncontested 2-threat windows and preemptive control pressure." />
-                              </span>
-                              <input
-                                type="number"
-                                min={0}
-                                max={20000}
-                                step={1}
-                                value={botTuning.threatWeights[2]}
-                                onChange={(e) => setThreatWeight(2, Number(e.target.value))}
-                              />
-                            </label>
-                            <label>
-                              <span className="tuning-label-text">
-                                Threat-3 base <HintPill text="Base value of each uncontested 3-in-a-row threat window." />
-                              </span>
-                              <input
-                                type="number"
-                                min={0}
-                                max={20000}
-                                step={1}
-                                value={botTuning.threatWeights[3]}
-                                onChange={(e) => setThreatWeight(3, Number(e.target.value))}
-                              />
-                            </label>
-                            <label>
-                              <span className="tuning-label-text">
-                                Threat-4/5 base <HintPill text="Shared base value for uncontested 4-threats and 5-threats." />
-                              </span>
-                              <input
-                                type="number"
-                                min={0}
-                                max={20000}
-                                step={1}
-                                value={botTuning.threatWeights[4]}
-                                onChange={(e) => {
-                                  const value = clampValue(Number(e.target.value) || 0, 0, 20000)
-                                  setBotTuning((prev) => {
-                                    const next = [...prev.threatWeights]
-                                    next[4] = value
-                                    next[5] = value
-                                    return { ...prev, threatWeights: next }
-                                  })
-                                }}
-                              />
-                            </label>
-                            <label>
-                              <span className="tuning-label-text">
-                                Threat vs diversity mix{' '}
-                                <HintPill text="0.00 = threat severity only, 1.00 = diversity only. Middle values blend both normalized signals." />
-                              </span>
-                              <div>
-                                <input
-                                  type="range"
-                                  min={0}
-                                  max={1}
-                                  step={0.01}
-                                  value={botTuning.threatDiversityBlend}
-                                  onChange={(e) =>
-                                    setBotTuning((prev) => ({
-                                      ...prev,
-                                      threatDiversityBlend: clampValue(Number(e.target.value) || 0, 0, 1),
-                                    }))
-                                  }
-                                />
-                                <div className="compute-meta">Value: {botTuning.threatDiversityBlend.toFixed(2)}</div>
+                        {mode === 'sandbox' ? (
+                          <div className="drag-readout">Switch back to Live in the top bar to let the bot play from this setup.</div>
+                        ) : (
+                          <section className="bot-panel">
+                            <div className="button-row">
+                              <div className="auto-bot-group" role="group" aria-label="Bot autoplay mode">
+                                <button
+                                  type="button"
+                                  className={!autoBotEnabled ? 'active' : ''}
+                                  onClick={() => setAutoBotMode('off')}
+                                >
+                                  Auto off
+                                </button>
+                                <button
+                                  type="button"
+                                  className={autoBotEnabled && autoBotSide === 'O' ? 'active auto-easy' : 'auto-easy'}
+                                  onClick={() => setAutoBotMode('O')}
+                                >
+                                  Auto O
+                                </button>
+                                <button
+                                  type="button"
+                                  className={autoBotEnabled && autoBotSide === 'X' ? 'active' : ''}
+                                  onClick={() => setAutoBotMode('X')}
+                                >
+                                  Auto X
+                                </button>
+                                <button
+                                  type="button"
+                                  className={autoBotEnabled && autoBotSide === 'both' ? 'active auto-easy' : 'auto-easy'}
+                                  onClick={() => setAutoBotMode('both')}
+                                >
+                                  Auto both
+                                </button>
                               </div>
-                            </label>
-                            <label>
-                              <span className="tuning-label-text">
-                                Threat normalization scale{' '}
-                                <HintPill text="Saturation scale for raw threat severity before blending with diversity. Higher means slower saturation." />
-                              </span>
-                              <input
-                                type="number"
-                                min={1}
-                                max={50000}
-                                step={50}
-                                value={botTuning.threatSeverityScale}
-                                onChange={(e) =>
-                                  setBotTuning((prev) => ({
-                                    ...prev,
-                                    threatSeverityScale: clampValue(Number(e.target.value) || 0, 1, 50000),
-                                  }))
-                                }
-                              />
-                            </label>
-                            <label>
-                              <span className="tuning-label-text">
-                                Defense weight{' '}
-                                <HintPill text="Offense/defense slider. Higher values prioritize suppressing opponent offense; lower values favor pure self-pressure." />
-                              </span>
-                              <div>
-                                <input
-                                  type="range"
-                                  min={0}
-                                  max={2}
-                                  step={0.05}
-                                  value={botTuning.defenseWeight}
-                                  onChange={(e) =>
-                                    setBotTuning((prev) => ({
-                                      ...prev,
-                                      defenseWeight: clampValue(Number(e.target.value) || 0, 0, 2),
-                                    }))
-                                  }
-                                />
-                                <div className="compute-meta">Value: {botTuning.defenseWeight.toFixed(2)}</div>
+                              <div className="drag-readout">
+                                {`Bot will place ${displayState.placementsLeft} mark${displayState.placementsLeft === 1 ? '' : 's'} from ${mode}`}
                               </div>
-                            </label>
-                        </div>
-                        <div className="button-row">
-                          <button onClick={() => setBotTuning(DEFAULT_BOT_TUNING)} type="button">
-                            Reset to defaults
-                          </button>
-                        </div>
-                      </details>
-                        </section>
+                            </div>
+                            <div className="bot-metrics">
+                              <div className="stat">
+                                <span>X Threats</span>
+                                <strong className="threat-line-x">
+                                  1:{liveEvaluation.xThreats[1]} 2:{liveEvaluation.xThreats[2]} 3:{liveEvaluation.xThreats[3]} 4:
+                                  {liveEvaluation.xThreats[4]} 5:{liveEvaluation.xThreats[5]}
+                                </strong>
+                              </div>
+                              <div className="stat">
+                                <span>O Threats</span>
+                                <strong className="threat-line-o">
+                                  1:{liveEvaluation.oThreats[1]} 2:{liveEvaluation.oThreats[2]} 3:{liveEvaluation.oThreats[3]} 4:
+                                  {liveEvaluation.oThreats[4]} 5:{liveEvaluation.oThreats[5]}
+                                </strong>
+                              </div>
+                              <div className="stat">
+                                <span>X One-turn wins</span>
+                                <strong>{liveEvaluation.xOneTurnWins}</strong>
+                              </div>
+                              <div className="stat">
+                                <span>O One-turn wins</span>
+                                <strong>{liveEvaluation.oOneTurnWins}</strong>
+                              </div>
+                            </div>
+                            <div className="button-row">
+                              <button onClick={() => void runBotTurn()} type="button" disabled={!!displayState.winner || isBotThinking}>
+                                {isBotThinking ? 'Bot thinking…' : `Play bot turn (${displayState.turn})`}
+                              </button>
+                            </div>
+                            <div className="compute-panel">
+                              <label className="compute-label" htmlFor="bot-compute-slider">
+                                Search time limit: {botThinkSeconds.toFixed(1)}s
+                                <HintPill text="0.0s uses greedy only. Higher values run budgeted MCTS with guided (non-random) simulation and larger node caps." />
+                              </label>
+                              <input
+                                id="bot-compute-slider"
+                                type="range"
+                                min={0}
+                                max={12}
+                                step={0.1}
+                                value={botThinkSeconds}
+                                onChange={(event) => setBotThinkSeconds(Math.max(0, Math.min(12, Number(event.target.value) || 0)))}
+                              />
+                              <div className="compute-meta">
+                                {botThinkSeconds <= 0
+                                  ? 'Mode: Greedy (no search)'
+                                  : `Mode: MCTS | Budget: ${botSearchOptions.budget.maxTimeMs}ms or ${botSearchOptions.budget.maxNodes.toLocaleString()} nodes`}
+                              </div>
+                              {lastBotStats ? (
+                                <div className="compute-meta">
+                                  Last run: {lastBotStats.mode.toUpperCase()} | {(lastBotStats.elapsedMs / 1000).toFixed(3)}s | board evals{' '}
+                                  {lastBotStats.boardEvaluations.toLocaleString()} | nodes {lastBotStats.nodesExpanded.toLocaleString()} | playouts{' '}
+                                  {lastBotStats.playouts.toLocaleString()} | tree depth {lastBotStats.maxDepthTurns} turns | root lines{' '}
+                                  {lastBotStats.rootCandidates} | stop {lastBotStats.stopReason}
+                                </div>
+                              ) : null}
+                              {isBotThinking ? (
+                                <div className="compute-meta">
+                                  Thinking now: {(liveBotElapsedMs / 1000).toFixed(2)}s | board evals {liveBotBoardEvals.toLocaleString()} | nodes{' '}
+                                  {liveBotNodes.toLocaleString()} | playouts {liveBotPlayouts.toLocaleString()}
+                                </div>
+                              ) : null}
+                            </div>
+                            <details className="tuning-panel">
+                              <summary>Advanced tuning (threat + diversity model)</summary>
+                              <div className="tuning-grid">
+                                <label>
+                                  <span className="tuning-label-text">
+                                    Threat-2 base <HintPill text="Small value for uncontested 2-threat windows and preemptive control pressure." />
+                                  </span>
+                                  <input
+                                    type="number"
+                                    min={0}
+                                    max={20000}
+                                    step={1}
+                                    value={botTuning.threatWeights[2]}
+                                    onChange={(e) => setThreatWeight(2, Number(e.target.value))}
+                                  />
+                                </label>
+                                <label>
+                                  <span className="tuning-label-text">
+                                    Threat-3 base <HintPill text="Base value of each uncontested 3-in-a-row threat window." />
+                                  </span>
+                                  <input
+                                    type="number"
+                                    min={0}
+                                    max={20000}
+                                    step={1}
+                                    value={botTuning.threatWeights[3]}
+                                    onChange={(e) => setThreatWeight(3, Number(e.target.value))}
+                                  />
+                                </label>
+                                <label>
+                                  <span className="tuning-label-text">
+                                    Threat-4/5 base <HintPill text="Shared base value for uncontested 4-threats and 5-threats." />
+                                  </span>
+                                  <input
+                                    type="number"
+                                    min={0}
+                                    max={20000}
+                                    step={1}
+                                    value={botTuning.threatWeights[4]}
+                                    onChange={(e) => {
+                                      const value = clampValue(Number(e.target.value) || 0, 0, 20000)
+                                      setBotTuning((prev) => {
+                                        const next = [...prev.threatWeights]
+                                        next[4] = value
+                                        next[5] = value
+                                        return { ...prev, threatWeights: next }
+                                      })
+                                    }}
+                                  />
+                                </label>
+                                <label>
+                                  <span className="tuning-label-text">
+                                    Threat vs diversity mix{' '}
+                                    <HintPill text="0.00 = threat severity only, 1.00 = diversity only. Middle values blend both normalized signals." />
+                                  </span>
+                                  <div>
+                                    <input
+                                      type="range"
+                                      min={0}
+                                      max={1}
+                                      step={0.01}
+                                      value={botTuning.threatDiversityBlend}
+                                      onChange={(e) =>
+                                        setBotTuning((prev) => ({
+                                          ...prev,
+                                          threatDiversityBlend: clampValue(Number(e.target.value) || 0, 0, 1),
+                                        }))
+                                      }
+                                    />
+                                    <div className="compute-meta">Value: {botTuning.threatDiversityBlend.toFixed(2)}</div>
+                                  </div>
+                                </label>
+                                <label>
+                                  <span className="tuning-label-text">
+                                    Threat normalization scale{' '}
+                                    <HintPill text="Saturation scale for raw threat severity before blending with diversity. Higher means slower saturation." />
+                                  </span>
+                                  <input
+                                    type="number"
+                                    min={1}
+                                    max={50000}
+                                    step={50}
+                                    value={botTuning.threatSeverityScale}
+                                    onChange={(e) =>
+                                      setBotTuning((prev) => ({
+                                        ...prev,
+                                        threatSeverityScale: clampValue(Number(e.target.value) || 0, 1, 50000),
+                                      }))
+                                    }
+                                  />
+                                </label>
+                                <label>
+                                  <span className="tuning-label-text">
+                                    Defense weight{' '}
+                                    <HintPill text="Offense/defense slider. Higher values prioritize suppressing opponent offense; lower values favor pure self-pressure." />
+                                  </span>
+                                  <div>
+                                    <input
+                                      type="range"
+                                      min={0}
+                                      max={2}
+                                      step={0.05}
+                                      value={botTuning.defenseWeight}
+                                      onChange={(e) =>
+                                        setBotTuning((prev) => ({
+                                          ...prev,
+                                          defenseWeight: clampValue(Number(e.target.value) || 0, 0, 2),
+                                        }))
+                                      }
+                                    />
+                                    <div className="compute-meta">Value: {botTuning.defenseWeight.toFixed(2)}</div>
+                                  </div>
+                                </label>
+                              </div>
+                              <div className="button-row">
+                                <button onClick={() => setBotTuning(DEFAULT_BOT_TUNING)} type="button">
+                                  Reset to defaults
+                                </button>
+                              </div>
+                            </details>
+                          </section>
+                        )}
                       </section>
                     </details>
                   </>
@@ -2415,6 +2545,13 @@ function App() {
                           onClick={() => setPaletteId('amber-night')}
                         >
                           Amber Night
+                        </button>
+                        <button
+                          type="button"
+                          className={paletteId === 'arena' && pieceStyle === 'fill' ? 'active' : ''}
+                          onClick={() => applyAppearancePreset('arena', 'fill')}
+                        >
+                          Arena
                         </button>
                       </div>
                       {hoverTrainingLabel ? <div className="drag-readout">{hoverTrainingLabel}</div> : null}
