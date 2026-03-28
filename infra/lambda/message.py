@@ -9,6 +9,8 @@ import boto3
 from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 
+from archive_store import normalize_move_history, normalize_participants, new_game_id, write_archive
+
 rooms_table = boto3.resource('dynamodb').Table(os.environ['ROOMS_TABLE'])
 connections_table = boto3.resource('dynamodb').Table(os.environ['CONNECTIONS_TABLE'])
 connections_room_index = os.environ['CONNECTIONS_ROOM_INDEX']
@@ -66,30 +68,6 @@ def _load_room(room_id: str):
     return room_resp.get('Item')
 
 
-def _normalize_move_history(raw_history: Any) -> list[Dict[str, Any]]:
-    if not isinstance(raw_history, list):
-        return []
-
-    normalized: list[Dict[str, Any]] = []
-    for move in raw_history:
-        if not isinstance(move, dict):
-            continue
-
-        mark = str(move.get('mark', '')).upper()
-        if mark not in ('X', 'O'):
-            continue
-
-        try:
-            q = int(move.get('q'))
-            r = int(move.get('r'))
-        except (TypeError, ValueError):
-            continue
-
-        normalized.append({'q': q, 'r': r, 'mark': mark})
-
-    return normalized
-
-
 def _build_board_from_history(move_history: list[Dict[str, Any]]) -> Dict[str, str]:
     board: Dict[str, str] = {}
     for move in move_history:
@@ -123,32 +101,31 @@ def _find_winner(board: Dict[str, str]) -> str | None:
     return None
 
 
-def _touch_room_expiry(
-    room_id: str,
-    board_state: Dict[str, str] | None = None,
-    move_history: list[Dict[str, Any]] | None = None,
-):
+def _save_room(room: Dict[str, Any]):
     now = int(time.time())
     expires_at = now + ROOM_TTL_SECONDS
+    room['updatedAt'] = now
+    room['expiresAt'] = expires_at
+    room['archiveKey'] = f"games/{room['gameId']}.json"
+    rooms_table.put_item(Item=room)
+    write_archive(room)
 
-    update_expression = 'SET updatedAt = :updatedAt, expiresAt = :expiresAt'
-    expression_values: Dict[str, Any] = {
-        ':updatedAt': now,
-        ':expiresAt': expires_at,
+
+def _room_snapshot_payload(room: Dict[str, Any], msg_type: str = 'state_snapshot', created: bool = False) -> Dict[str, Any]:
+    payload = {
+        'type': msg_type,
+        'roomId': room['roomId'],
+        'gameId': room.get('gameId'),
+        'boardState': room.get('boardState', {}),
+        'moveHistory': normalize_move_history(room.get('moveHistory', [])),
+        'participants': normalize_participants(room.get('participants')),
+        'status': room.get('status'),
+        'winner': room.get('winner'),
+        'resultType': room.get('resultType'),
     }
-
-    if board_state is not None and move_history is not None:
-        update_expression = (
-            'SET boardState = :boardState, moveHistory = :moveHistory, updatedAt = :updatedAt, expiresAt = :expiresAt'
-        )
-        expression_values[':boardState'] = board_state
-        expression_values[':moveHistory'] = move_history
-
-    rooms_table.update_item(
-        Key={'roomId': room_id},
-        UpdateExpression=update_expression,
-        ExpressionAttributeValues=expression_values,
-    )
+    if created:
+        payload['created'] = True
+    return payload
 
 
 def _broadcast_room(client, room_id: str, payload: Dict[str, Any]):
@@ -194,25 +171,34 @@ def _new_game_code() -> str:
     return ''.join(secrets.choice(GAME_CODE_CHARS) for _ in range(GAME_CODE_LEN))
 
 
-def _create_room() -> str | None:
+def _create_room(participants: Dict[str, Any], game_mode: str) -> Dict[str, Any] | None:
     now = int(time.time())
     expires_at = now + ROOM_TTL_SECONDS
 
     for _ in range(20):
         room_id = _new_game_code()
+        room = {
+            'roomId': room_id,
+            'gameId': new_game_id(),
+            'boardState': {},
+            'moveHistory': [],
+            'participants': normalize_participants(participants),
+            'status': 'pending',
+            'resultType': None,
+            'winner': None,
+            'gameMode': game_mode or 'live',
+            'createdAt': now,
+            'updatedAt': now,
+            'expiresAt': expires_at,
+        }
+        room['archiveKey'] = f"games/{room['gameId']}.json"
         try:
             rooms_table.put_item(
-                Item={
-                    'roomId': room_id,
-                    'boardState': {},
-                    'moveHistory': [],
-                    'createdAt': now,
-                    'updatedAt': now,
-                    'expiresAt': expires_at,
-                },
+                Item=room,
                 ConditionExpression='attribute_not_exists(roomId)',
             )
-            return room_id
+            write_archive(room)
+            return room
         except ClientError as exc:
             if exc.response.get('Error', {}).get('Code') != 'ConditionalCheckFailedException':
                 raise
@@ -222,25 +208,20 @@ def _create_room() -> str | None:
 
 def _handle_create(event: Dict[str, Any]) -> Dict[str, Any]:
     connection_id = event['requestContext']['connectionId']
+    body = _parse_body(event)
     client = _ws_client(event)
 
-    room_id = _create_room()
-    if not room_id:
+    room = _create_room(body.get('participants', {}), str(body.get('gameMode') or 'live'))
+    if not room:
         _send_error(client, connection_id, 'failed to create game code')
         return _response(500, {'ok': False})
 
-    _upsert_connection_room(connection_id, room_id)
+    _upsert_connection_room(connection_id, room['roomId'])
 
     _post_to_connection(
         client,
         connection_id,
-        {
-            'type': 'state_snapshot',
-            'roomId': room_id,
-            'boardState': {},
-            'moveHistory': [],
-            'created': True,
-        },
+        _room_snapshot_payload(room, created=True),
     )
 
     return _response(200, {'ok': True})
@@ -262,20 +243,10 @@ def _handle_join(event: Dict[str, Any]) -> Dict[str, Any]:
         _send_error(client, connection_id, 'game not found')
         return _response(404, {'ok': False})
 
-    move_history = _normalize_move_history(room.get('moveHistory', []))
     _upsert_connection_room(connection_id, room_id)
-    _touch_room_expiry(room_id)
+    _save_room(room)
 
-    _post_to_connection(
-        client,
-        connection_id,
-        {
-            'type': 'state_snapshot',
-            'roomId': room_id,
-            'boardState': room.get('boardState', {}),
-            'moveHistory': move_history,
-        },
-    )
+    _post_to_connection(client, connection_id, _room_snapshot_payload(room))
 
     return _response(200, {'ok': True})
 
@@ -312,7 +283,7 @@ def _handle_place(event: Dict[str, Any]) -> Dict[str, Any]:
         _send_error(client, connection_id, 'game not found')
         return _response(404, {'ok': False})
 
-    move_history = _normalize_move_history(room.get('moveHistory', []))
+    move_history = normalize_move_history(room.get('moveHistory', []))
     board_state = dict(room.get('boardState', {}))
     winner = _find_winner(board_state)
     if winner:
@@ -323,21 +294,29 @@ def _handle_place(event: Dict[str, Any]) -> Dict[str, Any]:
         _send_error(client, connection_id, 'cell already occupied')
         return _response(409, {'ok': False})
 
+    participants = normalize_participants(room.get('participants'))
+    actor_type = participants.get(mark, {}).get('type')
     board_state[f'{q},{r}'] = mark
-    move_history.append({'q': q, 'r': r, 'mark': mark})
+    move_history.append({'q': q, 'r': r, 'mark': mark, 'actorType': actor_type})
 
-    _touch_room_expiry(room_id, board_state, move_history)
+    room['boardState'] = board_state
+    room['moveHistory'] = move_history
+    room['winner'] = _find_winner(board_state)
+    room['status'] = 'completed' if room['winner'] else 'active'
+    room['resultType'] = 'win' if room['winner'] else None
+    room.setdefault('startedAt', int(time.time()))
+    if room['winner']:
+        room['endedAt'] = int(time.time())
+    else:
+        room.pop('endedAt', None)
+    _save_room(room)
 
-    payload = {
-        'type': 'move_applied',
-        'roomId': room_id,
-        'boardState': board_state,
-        'moveHistory': move_history,
-        'move': {
-            'q': q,
-            'r': r,
-            'mark': mark,
-        },
+    payload = _room_snapshot_payload(room, msg_type='move_applied')
+    payload['move'] = {
+        'q': q,
+        'r': r,
+        'mark': mark,
+        'actorType': actor_type,
     }
     _broadcast_room(client, room_id, payload)
 
@@ -363,19 +342,9 @@ def _handle_sync(event: Dict[str, Any]) -> Dict[str, Any]:
         _send_error(client, connection_id, 'game not found')
         return _response(404, {'ok': False})
 
-    move_history = _normalize_move_history(room.get('moveHistory', []))
-    _touch_room_expiry(room_id)
+    _save_room(room)
 
-    _post_to_connection(
-        client,
-        connection_id,
-        {
-            'type': 'state_snapshot',
-            'roomId': room_id,
-            'boardState': room.get('boardState', {}),
-            'moveHistory': move_history,
-        },
-    )
+    _post_to_connection(client, connection_id, _room_snapshot_payload(room))
 
     return _response(200, {'ok': True})
 
@@ -399,25 +368,29 @@ def _handle_undo(event: Dict[str, Any]) -> Dict[str, Any]:
         _send_error(client, connection_id, 'game not found')
         return _response(404, {'ok': False})
 
-    move_history = _normalize_move_history(room.get('moveHistory', []))
+    move_history = normalize_move_history(room.get('moveHistory', []))
     if not move_history:
         _send_error(client, connection_id, 'no moves to undo')
         return _response(400, {'ok': False})
 
     move_history.pop()
     board_state = _build_board_from_history(move_history)
-    _touch_room_expiry(room_id, board_state, move_history)
+    room['boardState'] = board_state
+    room['moveHistory'] = move_history
+    room['winner'] = _find_winner(board_state)
+    room['status'] = 'completed' if room['winner'] else ('active' if move_history else 'pending')
+    room['resultType'] = 'win' if room['winner'] else None
+    if move_history:
+        room.setdefault('startedAt', room.get('createdAt', int(time.time())))
+    else:
+        room.pop('startedAt', None)
+    if room['winner']:
+        room['endedAt'] = int(time.time())
+    else:
+        room.pop('endedAt', None)
+    _save_room(room)
 
-    _broadcast_room(
-        client,
-        room_id,
-        {
-            'type': 'move_undone',
-            'roomId': room_id,
-            'boardState': board_state,
-            'moveHistory': move_history,
-        },
-    )
+    _broadcast_room(client, room_id, _room_snapshot_payload(room, msg_type='move_undone'))
 
     return _response(200, {'ok': True})
 

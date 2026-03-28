@@ -167,6 +167,15 @@
   font-size: 0.86rem;
 }
 
+.tracked-notice {
+  border: 1px solid #bfdbfe;
+  background: #eff6ff;
+  color: #1d4ed8;
+  border-radius: 10px;
+  padding: 8px 10px;
+  font-size: 0.86rem;
+}
+
 .winner-banner {
   border: 1px solid #d97706;
   background: #fffbeb;
@@ -623,6 +632,12 @@
 
 .app-shell.theme-dark .hint-pill::after {
   background: color-mix(in oklab, var(--panel), black 12%);
+}
+
+.app-shell.theme-dark .tracked-notice {
+  background: color-mix(in oklab, #1d4ed8, black 82%);
+  color: #bfdbfe;
+  border-color: #1d4ed8;
 }
 
 .app-shell.theme-dark .compact-status-row span {

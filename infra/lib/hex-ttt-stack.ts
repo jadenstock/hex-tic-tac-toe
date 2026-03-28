@@ -1,5 +1,5 @@
 import * as path from 'node:path'
-import { CfnOutput, Duration, RemovalPolicy, Stack, StackProps } from 'aws-cdk-lib'
+import { CfnOutput, Duration, Fn, RemovalPolicy, Stack, StackProps } from 'aws-cdk-lib'
 import * as acm from 'aws-cdk-lib/aws-certificatemanager'
 import * as apigwv2 from 'aws-cdk-lib/aws-apigatewayv2'
 import * as cloudfront from 'aws-cdk-lib/aws-cloudfront'
@@ -235,11 +235,100 @@ export class HexTttStack extends Stack {
       autoDeleteObjects: true,
     })
 
+    const archiveBucket = new s3.Bucket(this, 'ArchiveBucket', {
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      enforceSSL: true,
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      removalPolicy: RemovalPolicy.DESTROY,
+      autoDeleteObjects: true,
+      versioned: true,
+    })
+
+    const trackedGamesFn = new lambda.Function(this, 'TrackedGamesFn', {
+      runtime: lambda.Runtime.PYTHON_3_12,
+      code: lambdaCode,
+      handler: 'tracked_games.handler',
+      environment: {
+        ...lambdaEnv,
+        ARCHIVE_BUCKET: archiveBucket.bucketName,
+      },
+      timeout: Duration.seconds(20),
+    })
+
+    messageFn.addEnvironment('ARCHIVE_BUCKET', archiveBucket.bucketName)
+    archiveBucket.grantReadWrite(messageFn)
+    archiveBucket.grantReadWrite(trackedGamesFn)
+
+    const trackedGamesApi = new apigwv2.CfnApi(this, 'TrackedGamesApi', {
+      name: 'hex-ttt-games',
+      protocolType: 'HTTP',
+    })
+
+    const trackedGamesIntegration = new apigwv2.CfnIntegration(this, 'TrackedGamesIntegration', {
+      apiId: trackedGamesApi.ref,
+      integrationType: 'AWS_PROXY',
+      integrationUri: toIntegrationUri(trackedGamesFn),
+      payloadFormatVersion: '2.0',
+    })
+
+    const trackedGamesGetRoute = new apigwv2.CfnRoute(this, 'TrackedGamesGetRoute', {
+      apiId: trackedGamesApi.ref,
+      routeKey: 'GET /games/{gameId}',
+      target: `integrations/${trackedGamesIntegration.ref}`,
+    })
+
+    const trackedGamesGetApiPrefixedRoute = new apigwv2.CfnRoute(this, 'TrackedGamesGetApiPrefixedRoute', {
+      apiId: trackedGamesApi.ref,
+      routeKey: 'GET /api/games/{gameId}',
+      target: `integrations/${trackedGamesIntegration.ref}`,
+    })
+
+    const trackedGamesPostRoute = new apigwv2.CfnRoute(this, 'TrackedGamesPostRoute', {
+      apiId: trackedGamesApi.ref,
+      routeKey: 'POST /games',
+      target: `integrations/${trackedGamesIntegration.ref}`,
+    })
+
+    const trackedGamesPostApiPrefixedRoute = new apigwv2.CfnRoute(this, 'TrackedGamesPostApiPrefixedRoute', {
+      apiId: trackedGamesApi.ref,
+      routeKey: 'POST /api/games',
+      target: `integrations/${trackedGamesIntegration.ref}`,
+    })
+
+    const trackedGamesStage = new apigwv2.CfnStage(this, 'TrackedGamesStage', {
+      apiId: trackedGamesApi.ref,
+      stageName: '$default',
+      autoDeploy: true,
+    })
+    trackedGamesStage.node.addDependency(trackedGamesGetRoute)
+    trackedGamesStage.node.addDependency(trackedGamesGetApiPrefixedRoute)
+    trackedGamesStage.node.addDependency(trackedGamesPostRoute)
+    trackedGamesStage.node.addDependency(trackedGamesPostApiPrefixedRoute)
+
+    const trackedGamesSourceArn = `arn:aws:execute-api:${this.region}:${this.account}:${trackedGamesApi.ref}/*/*`
+    trackedGamesFn.addPermission('AllowInvokeTrackedGames', {
+      principal: new iam.ServicePrincipal('apigateway.amazonaws.com'),
+      sourceArn: trackedGamesSourceArn,
+    })
+
+    const trackedGamesApiDomain = Fn.select(2, Fn.split('/', trackedGamesApi.attrApiEndpoint))
+
     const customDomain = props?.customDomain
     const distributionProps: cloudfront.DistributionProps = {
       defaultBehavior: {
         origin: origins.S3BucketOrigin.withOriginAccessControl(siteBucket),
         viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+      },
+      additionalBehaviors: {
+        'api/*': {
+          origin: new origins.HttpOrigin(trackedGamesApiDomain, {
+            protocolPolicy: cloudfront.OriginProtocolPolicy.HTTPS_ONLY,
+          }),
+          viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+          allowedMethods: cloudfront.AllowedMethods.ALLOW_ALL,
+          cachePolicy: cloudfront.CachePolicy.CACHING_DISABLED,
+          originRequestPolicy: cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER,
+        },
       },
       defaultRootObject: 'index.html',
       errorResponses: [
@@ -328,6 +417,14 @@ export class HexTttStack extends Stack {
 
     new CfnOutput(this, 'ConnectionsTableName', {
       value: connectionsTable.tableName,
+    })
+
+    new CfnOutput(this, 'ArchiveBucketName', {
+      value: archiveBucket.bucketName,
+    })
+
+    new CfnOutput(this, 'TrackedGamesApiUrl', {
+      value: trackedGamesApi.attrApiEndpoint,
     })
   }
 }

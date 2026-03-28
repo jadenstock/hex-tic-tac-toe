@@ -32,6 +32,36 @@ type MoveRecord = {
   q: number
   r: number
   mark: Player
+  actorType?: ParticipantType
+}
+
+type ParticipantType = 'human' | 'bot'
+
+type ParticipantInfo = {
+  type: ParticipantType
+  label: string
+  botId?: string
+  botVersion?: string
+  userId?: string | null
+}
+
+type ParticipantMap = Record<Player, ParticipantInfo>
+
+type ReplayRecord = {
+  gameId: string
+  roomId?: string | null
+  status: string
+  createdAt: number
+  updatedAt: number
+  startedAt?: number | null
+  endedAt?: number | null
+  visibility: string
+  gameMode: string
+  participants: ParticipantMap
+  winner: Player | null
+  resultType?: string | null
+  moveHistory: MoveRecord[]
+  finalBoard: Record<string, Player>
 }
 
 type LiveGameState = {
@@ -521,13 +551,49 @@ function moveHistoryObjectToArray(value: unknown): MoveRecord[] {
     const mark = raw.mark
     const q = Number(raw.q)
     const r = Number(raw.r)
+    const actorType = raw.actorType === 'human' || raw.actorType === 'bot' ? raw.actorType : undefined
 
     if ((mark === 'X' || mark === 'O') && Number.isInteger(q) && Number.isInteger(r)) {
-      next.push({ q, r, mark })
+      next.push({ q, r, mark, actorType })
     }
   }
 
   return next
+}
+
+function parseReplayGameId(pathname: string): string | null {
+  const match = pathname.match(/^\/games\/([^/]+)$/)
+  return match ? decodeURIComponent(match[1]) : null
+}
+
+function buildParticipants(autoBotEnabled: boolean, autoBotSide: 'X' | 'O' | 'both', joinedRoom: string | null): ParticipantMap {
+  const buildParticipant = (mark: Player): ParticipantInfo => {
+    const isBot = autoBotEnabled && (autoBotSide === 'both' || autoBotSide === mark)
+    if (isBot) {
+      return {
+        type: 'bot',
+        label: 'Hex Bot',
+        botId: 'local-engine',
+      }
+    }
+
+    return {
+      type: 'human',
+      label: joinedRoom ? `Player ${mark}` : `Local ${mark}`,
+    }
+  }
+
+  return {
+    X: buildParticipant('X'),
+    O: buildParticipant('O'),
+  }
+}
+
+function participantSummary(participants: ParticipantMap | null): string | null {
+  if (!participants) return null
+  const x = participants.X.type === 'bot' ? 'Bot' : 'Human'
+  const o = participants.O.type === 'bot' ? 'Bot' : 'Human'
+  return `${x} vs ${o}`
 }
 
 function canBelongToPlayerWinningSix(board: Map<string, Player>, q: number, r: number, player: Player): boolean {
@@ -650,6 +716,9 @@ function App() {
 
   const [gameCodeInput, setGameCodeInput] = useState('')
   const [joinedRoom, setJoinedRoom] = useState<string | null>(null)
+  const [trackedGameId, setTrackedGameId] = useState<string | null>(null)
+  const [trackedParticipants, setTrackedParticipants] = useState<ParticipantMap | null>(null)
+  const [trackedGameNotice, setTrackedGameNotice] = useState<string | null>(null)
   const [wsStatus, setWsStatus] = useState<WsStatus>('disconnected')
   const [networkError, setNetworkError] = useState<string | null>(null)
   const [showMoveNumbers, setShowMoveNumbers] = useState(false)
@@ -676,6 +745,10 @@ function App() {
   const [lastBotStats, setLastBotStats] = useState<BotSearchStats | null>(null)
   const [showRulesModal, setShowRulesModal] = useState(false)
   const [dockOpen, setDockOpen] = useState(true)
+  const [replayRecord, setReplayRecord] = useState<ReplayRecord | null>(null)
+  const [replayError, setReplayError] = useState<string | null>(null)
+  const [replayStep, setReplayStep] = useState(0)
+  const [isReplayLoading, setIsReplayLoading] = useState(false)
 
   const dragRef = useRef<{
     pointerId: number
@@ -686,12 +759,65 @@ function App() {
   const lastAutoBotSignatureRef = useRef('')
 
   const wsUrl = import.meta.env.VITE_WS_URL as string | undefined
+  const apiBaseUrl = (import.meta.env.VITE_API_URL as string | undefined) ?? '/api'
+  const replayGameId = typeof window === 'undefined' ? null : parseReplayGameId(window.location.pathname)
+  const isReplayMode = replayGameId !== null
 
   useEffect(() => {
     return () => {
       wsRef.current?.close()
     }
   }, [])
+
+  useEffect(() => {
+    if (!isReplayMode || !replayGameId) return
+
+    let cancelled = false
+    setIsReplayLoading(true)
+    setReplayError(null)
+
+    void fetch(`${apiBaseUrl}/games/${encodeURIComponent(replayGameId)}`)
+      .then(async (response) => {
+        if (!response.ok) {
+          throw new Error(response.status === 404 ? 'Tracked game not found.' : 'Failed to load tracked game.')
+        }
+
+        const payload = (await response.json()) as ReplayRecord
+        if (cancelled) return
+
+        setReplayRecord({
+          ...payload,
+          moveHistory: moveHistoryObjectToArray(payload.moveHistory),
+          participants: payload.participants,
+          winner: payload.winner === 'X' || payload.winner === 'O' ? payload.winner : null,
+        })
+        setReplayStep(moveHistoryObjectToArray(payload.moveHistory).length)
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return
+        setReplayError(error instanceof Error ? error.message : 'Failed to load tracked game.')
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setIsReplayLoading(false)
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [apiBaseUrl, isReplayMode, replayGameId])
+
+  useEffect(() => {
+    if (!replayRecord) return
+
+    const clampedStep = clampValue(replayStep, 0, replayRecord.moveHistory.length)
+    dispatchLive({
+      type: 'sync',
+      moves: new Map(),
+      moveHistory: replayRecord.moveHistory.slice(0, clampedStep),
+    })
+  }, [replayRecord, replayStep])
 
   useEffect(() => {
     const wrapper = wrapperRef.current
@@ -791,6 +917,17 @@ function App() {
   const modeLabel = useMemo(() => {
     return mode === 'live' ? 'Game' : 'Plan (sandbox)'
   }, [mode])
+  const currentParticipants = useMemo(() => {
+    if (replayRecord) return replayRecord.participants
+    if (trackedParticipants) return trackedParticipants
+    return buildParticipants(autoBotEnabled, autoBotSide, joinedRoom)
+  }, [autoBotEnabled, autoBotSide, joinedRoom, replayRecord, trackedParticipants])
+  const participantModeLabel = useMemo(() => participantSummary(currentParticipants), [currentParticipants])
+  const currentGameId = replayRecord?.gameId ?? trackedGameId
+  const trackedGameUrl = useMemo(() => {
+    if (!currentGameId || typeof window === 'undefined') return null
+    return `${window.location.origin}/games/${currentGameId}`
+  }, [currentGameId])
   const liveEvaluation = useMemo(() => evaluateBoardState(liveState.moves, botTuning), [botTuning, liveState.moves])
   const threatTargets = useMemo(() => collectThreatTargets(liveState.moves), [liveState.moves])
   const hoverTrainingLabel = useMemo(() => {
@@ -835,12 +972,16 @@ function App() {
   }, [botThinkSeconds])
 
   const liveStatus = useMemo(() => {
+    if (replayRecord) {
+      return `Replay move ${replayStep}/${replayRecord.moveHistory.length}`
+    }
+
     if (liveState.winner) {
       return `${liveState.winner} wins with 6 in a row. Board locked.`
     }
 
     return `${liveState.turn} to move (${liveState.placementsLeft} placement${liveState.placementsLeft === 1 ? '' : 's'} left)`
-  }, [liveState.placementsLeft, liveState.turn, liveState.winner])
+  }, [liveState.placementsLeft, liveState.turn, liveState.winner, replayRecord, replayStep])
 
   const syncFromWireBoard = useCallback((wireBoard: unknown, wireHistory?: unknown) => {
     const moves = boardObjectToMap(wireBoard)
@@ -878,8 +1019,10 @@ function App() {
           const message = JSON.parse(event.data as string) as {
             type?: string
             roomId?: string
+            gameId?: string
             boardState?: unknown
             moveHistory?: unknown
+            participants?: ParticipantMap
             message?: string
           }
 
@@ -893,6 +1036,12 @@ function App() {
             if (resolvedRoom) {
               setGameCodeInput(resolvedRoom)
             }
+            if (message.gameId) {
+              setTrackedGameId(message.gameId)
+            }
+            if (message.participants) {
+              setTrackedParticipants(message.participants)
+            }
             setWsStatus('connected')
             return
           }
@@ -901,12 +1050,24 @@ function App() {
             if (message.boardState) {
               syncFromWireBoard(message.boardState, message.moveHistory)
             }
+            if (message.gameId) {
+              setTrackedGameId(message.gameId)
+            }
+            if (message.participants) {
+              setTrackedParticipants(message.participants)
+            }
             return
           }
 
           if (message.type === 'move_undone') {
             if (message.boardState) {
               syncFromWireBoard(message.boardState, message.moveHistory)
+            }
+            if (message.gameId) {
+              setTrackedGameId(message.gameId)
+            }
+            if (message.participants) {
+              setTrackedParticipants(message.participants)
             }
             return
           }
@@ -938,8 +1099,10 @@ function App() {
       return
     }
 
-    openSocket({ action: 'create' })
-  }, [openSocket, wsUrl])
+    const participants = buildParticipants(autoBotEnabled, autoBotSide, null)
+    setTrackedParticipants(participants)
+    openSocket({ action: 'create', participants, gameMode: 'live-room' })
+  }, [autoBotEnabled, autoBotSide, openSocket, wsUrl])
 
   const joinGame = useCallback(() => {
     const roomId = gameCodeInput.trim().toUpperCase()
@@ -957,8 +1120,59 @@ function App() {
     )
   }, [gameCodeInput, openSocket])
 
+  const copyTrackedLink = useCallback(async () => {
+    if (!trackedGameUrl) return
+
+    try {
+      await navigator.clipboard.writeText(trackedGameUrl)
+      setTrackedGameNotice('Tracked game link copied.')
+    } catch {
+      setTrackedGameNotice(`Tracked game link: ${trackedGameUrl}`)
+    }
+  }, [trackedGameUrl])
+
+  const saveTrackedSnapshot = useCallback(async () => {
+    try {
+      setTrackedGameNotice(null)
+      setNetworkError(null)
+
+      const participants = buildParticipants(autoBotEnabled, autoBotSide, joinedRoom)
+      const response = await fetch(`${apiBaseUrl}/games`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          roomId: joinedRoom,
+          gameMode: joinedRoom ? 'live-room-snapshot' : 'local-live',
+          status: liveState.winner ? 'completed' : 'snapshot',
+          resultType: liveState.winner ? 'win' : 'snapshot',
+          winner: liveState.winner,
+          participants,
+          moveHistory: liveState.moveHistory,
+        }),
+      })
+
+      if (!response.ok) {
+        throw new Error('Failed to save tracked game.')
+      }
+
+      const payload = (await response.json()) as { gameId: string; path: string }
+      setTrackedGameId(payload.gameId)
+      setTrackedParticipants(participants)
+      const url = typeof window === 'undefined' ? payload.path : `${window.location.origin}${payload.path}`
+      setTrackedGameNotice(`Tracked game saved: ${url}`)
+    } catch (error) {
+      setNetworkError(error instanceof Error ? error.message : 'Failed to save tracked game.')
+    }
+  }, [apiBaseUrl, autoBotEnabled, autoBotSide, joinedRoom, liveState.moveHistory, liveState.winner])
+
   const placeMove = useCallback(
     (q: number, r: number) => {
+      if (isReplayMode) {
+        return
+      }
+
       if (mode === 'live') {
         if (liveState.winner) {
           setNetworkError(`Game over: ${liveState.winner} already won.`)
@@ -1003,11 +1217,11 @@ function App() {
         return next
       })
     },
-    [joinedRoom, liveState.turn, liveState.winner, mode, planBrush, playAs],
+    [isReplayMode, joinedRoom, liveState.turn, liveState.winner, mode, planBrush, playAs],
   )
 
   const undoMove = useCallback(() => {
-    if (mode !== 'live') return
+    if (mode !== 'live' || isReplayMode) return
 
     if (joinedRoom && wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(
@@ -1019,10 +1233,11 @@ function App() {
     }
 
     dispatchLive({ type: 'undo' })
-  }, [joinedRoom, mode])
+  }, [isReplayMode, joinedRoom, mode])
 
   const runBotTurn = useCallback(async () => {
     if (isBotThinking) return
+    if (isReplayMode) return
 
     if (mode !== 'live') {
       setNetworkError('Bot play is only available in Live mode.')
@@ -1119,6 +1334,7 @@ function App() {
     liveState.turn,
     liveState.winner,
     mode,
+    isReplayMode,
   ])
 
   const setThreatWeight = (idx: number, value: number) => {
@@ -1594,6 +1810,8 @@ function App() {
   }
 
   const clearAll = () => {
+    if (isReplayMode) return
+
     setPlanMoves(new Map())
     setPlanBrush('X')
 
@@ -1613,73 +1831,93 @@ function App() {
     <div className={`app-shell ${theme.dark ? 'theme-dark' : ''}`} style={appThemeVars}>
       <header className="topbar">
         <div className="title-block">
-          <h1>Hexagonal Tic-Tac-Toe</h1>
+          <h1>{isReplayMode ? 'Tracked Game Replay' : 'Hexagonal Tic-Tac-Toe'}</h1>
         </div>
         <div className="topbar-actions">
-          <div className="quick-bot">
-            <button
-              className={`quick-bot-start ${topVsBotEnabled ? 'is-on' : 'is-off'}`}
-              onClick={() => applyTopVsBot(!topVsBotEnabled)}
-              type="button"
-            >
-              {topVsBotEnabled ? 'Bot: On' : 'Bot: Off'}
+          {isReplayMode ? null : (
+            <div className="quick-bot">
+              <button
+                className={`quick-bot-start ${topVsBotEnabled ? 'is-on' : 'is-off'}`}
+                onClick={() => applyTopVsBot(!topVsBotEnabled)}
+                type="button"
+              >
+                {topVsBotEnabled ? 'Bot: On' : 'Bot: Off'}
+              </button>
+              <label className="quick-bot-side">
+                Player
+                <select
+                  value={quickPlayerSide}
+                  onChange={(event) => {
+                    const next = event.target.value as Player
+                    setQuickPlayerSide(next)
+                    if (topVsBotEnabled) {
+                      if (next === quickBotSide) {
+                        setNetworkError('Player side and bot side cannot be the same.')
+                        return
+                      }
+                      setMode('live')
+                      setPlayAs(next)
+                      setNetworkError(null)
+                    }
+                  }}
+                >
+                  <option value="X">X</option>
+                  <option value="O">O</option>
+                </select>
+              </label>
+              <label className="quick-bot-side">
+                Bot
+                <select
+                  value={quickBotSide}
+                  onChange={(event) => {
+                    const next = event.target.value as Player
+                    setQuickBotSide(next)
+                    if (topVsBotEnabled) {
+                      if (next === quickPlayerSide) {
+                        setNetworkError('Player side and bot side cannot be the same.')
+                        return
+                      }
+                      setMode('live')
+                      setAutoBotMode(next)
+                      setNetworkError(null)
+                    }
+                  }}
+                >
+                  <option value="X">X</option>
+                  <option value="O">O</option>
+                </select>
+              </label>
+            </div>
+          )}
+          {isReplayMode ? <div className="room-pill">Replay: {replayGameId}</div> : <div className={`ws-pill ${wsStatus}`}>{wsStatus}</div>}
+          <div className="room-pill">{joinedRoom ? `Room: ${joinedRoom}` : participantModeLabel ?? 'Local only'}</div>
+          {currentGameId ? <div className="room-pill">Game ID: {currentGameId.slice(0, 12)}</div> : null}
+          {!isReplayMode ? (
+            <button className="toggle-hud" onClick={() => void saveTrackedSnapshot()} type="button">
+              Save Game Snapshot
             </button>
-            <label className="quick-bot-side">
-              Player
-              <select
-                value={quickPlayerSide}
-                onChange={(event) => {
-                  const next = event.target.value as Player
-                  setQuickPlayerSide(next)
-                  if (topVsBotEnabled) {
-                    if (next === quickBotSide) {
-                      setNetworkError('Player side and bot side cannot be the same.')
-                      return
-                    }
-                    setMode('live')
-                    setPlayAs(next)
-                    setNetworkError(null)
-                  }
-                }}
-              >
-                <option value="X">X</option>
-                <option value="O">O</option>
-              </select>
-            </label>
-            <label className="quick-bot-side">
-              Bot
-              <select
-                value={quickBotSide}
-                onChange={(event) => {
-                  const next = event.target.value as Player
-                  setQuickBotSide(next)
-                  if (topVsBotEnabled) {
-                    if (next === quickPlayerSide) {
-                      setNetworkError('Player side and bot side cannot be the same.')
-                      return
-                    }
-                    setMode('live')
-                    setAutoBotMode(next)
-                    setNetworkError(null)
-                  }
-                }}
-              >
-                <option value="X">X</option>
-                <option value="O">O</option>
-              </select>
-            </label>
-          </div>
-          <div className={`ws-pill ${wsStatus}`}>{wsStatus}</div>
-          <div className="room-pill">{joinedRoom ? `Game: ${joinedRoom}` : 'Local only'}</div>
+          ) : null}
+          {trackedGameUrl ? (
+            <button className="toggle-hud" onClick={() => void copyTrackedLink()} type="button">
+              Copy link
+            </button>
+          ) : null}
           <button className="toggle-hud" onClick={() => setShowRulesModal(true)} type="button">
             Rules
           </button>
         </div>
       </header>
 
-      {liveState.winner ? <div className="winner-banner">{liveState.winner} wins. Game locked until undo or sync/reset.</div> : null}
+      {liveState.winner && !isReplayMode ? <div className="winner-banner">{liveState.winner} wins. Game locked until undo or sync/reset.</div> : null}
+      {replayRecord ? (
+        <div className="winner-banner">
+          {participantModeLabel ?? 'Tracked replay'} · {replayRecord.participants.X.label} vs {replayRecord.participants.O.label}
+        </div>
+      ) : null}
 
       {networkError ? <div className="network-error">{networkError}</div> : null}
+      {trackedGameNotice ? <div className="tracked-notice">{trackedGameNotice}</div> : null}
+      {replayError ? <div className="network-error">{replayError}</div> : null}
       {showRulesModal ? (
         <div className="rules-modal-backdrop" onClick={() => setShowRulesModal(false)} role="presentation">
           <section
@@ -1705,7 +1943,7 @@ function App() {
       <main className="board-wrapper" ref={wrapperRef}>
         <canvas
           ref={canvasRef}
-          className={`board ${liveState.winner ? 'board-locked' : ''}`}
+          className={`board ${liveState.winner || isReplayMode ? 'board-locked' : ''}`}
           onPointerDown={onPointerDown}
           onPointerMove={onPointerMove}
           onPointerUp={onPointerUp}
@@ -1727,311 +1965,363 @@ function App() {
             {dockOpen ? (
               <section className="board-dock-shell" id="board-dock-shell">
                 <div className="compact-status-row">
-                  <span>{modeLabel}</span>
+                  <span>{isReplayMode ? 'Replay' : modeLabel}</span>
                   <span>{liveStatus}</span>
                   <span>Zoom {(camera.zoom * 100).toFixed(0)}%</span>
+                  {participantModeLabel ? <span>{participantModeLabel}</span> : null}
                 </div>
 
-                <details className="dock-panel">
-                  <summary>Connection</summary>
-                  <section className="controls">
-                    <div className="network-panel">
-                      <button onClick={hostGame} type="button">
-                        Host game
-                      </button>
-                      <input
-                        value={gameCodeInput}
-                        onChange={(e) => setGameCodeInput(e.target.value.toUpperCase())}
-                        placeholder="Game code"
-                        maxLength={5}
-                      />
-                      <button onClick={joinGame} type="button">
-                        Join by code
-                      </button>
-                      <button onClick={leaveRoom} type="button" disabled={!joinedRoom}>
-                        Leave
-                      </button>
-                    </div>
-                  </section>
-                </details>
-
-                <details className="dock-panel">
-                  <summary>Play</summary>
-                  <section className="controls">
-                    <div className="button-row">
-                      <label className="play-as">
-                        Play as
-                        <select value={playAs} onChange={(event) => setPlayAs(event.target.value as PlayAs)}>
-                          <option value="any">Any</option>
-                          <option value="X">X</option>
-                          <option value="O">O</option>
-                        </select>
-                      </label>
-                      <button className={mode === 'live' ? 'active' : ''} onClick={() => setMode('live')} type="button">
-                        Game mode
-                      </button>
-                      <button className={mode === 'plan' ? 'active' : ''} onClick={() => setMode('plan')} type="button">
-                        Plan mode
-                      </button>
-                      {mode === 'plan' ? (
-                        <button className={planBrush === 'X' ? 'active plan-x' : 'plan-x'} onClick={() => setPlanBrush('X')} type="button">
-                          Plan X
+                {isReplayMode ? (
+                  <details className="dock-panel" open>
+                    <summary>Replay</summary>
+                    <section className="controls">
+                      <div className="button-row">
+                        <button onClick={() => setReplayStep(0)} type="button" disabled={!replayRecord || replayStep <= 0}>
+                          Start
                         </button>
-                      ) : null}
-                      {mode === 'plan' ? (
-                        <button className={planBrush === 'O' ? 'active plan-o' : 'plan-o'} onClick={() => setPlanBrush('O')} type="button">
-                          Plan O
+                        <button
+                          onClick={() => setReplayStep((prev) => Math.max(0, prev - 1))}
+                          type="button"
+                          disabled={!replayRecord || replayStep <= 0}
+                        >
+                          Prev
                         </button>
-                      ) : null}
-                      {mode === 'plan' ? (
-                        <button onClick={clearPlan} type="button">
-                          Clear plan
+                        <button
+                          onClick={() => setReplayStep((prev) => Math.min(replayRecord?.moveHistory.length ?? 0, prev + 1))}
+                          type="button"
+                          disabled={!replayRecord || replayStep >= replayRecord.moveHistory.length}
+                        >
+                          Next
                         </button>
-                      ) : null}
-                      <button onClick={undoMove} type="button" disabled={!canUndo}>
-                        Undo last
-                      </button>
-                      <button onClick={clearAll} type="button">
-                        {joinedRoom ? 'Sync room' : 'Clear local'}
-                      </button>
-                      <button onClick={resetView} type="button">
-                        Recenter view
-                      </button>
-                      <div className="zoom-readout">Zoom: {(camera.zoom * 100).toFixed(0)}%</div>
-                      <div className="drag-readout">
-                        {mode === 'plan' ? `Plan marks: ${totalPlanMoves}` : `Moves played: ${totalLiveMoves}`}
+                        <button
+                          onClick={() => setReplayStep(replayRecord?.moveHistory.length ?? 0)}
+                          type="button"
+                          disabled={!replayRecord || replayStep >= replayRecord.moveHistory.length}
+                        >
+                          End
+                        </button>
+                        <button onClick={resetView} type="button">
+                          Recenter view
+                        </button>
                       </div>
-                    </div>
-                  </section>
-                </details>
-
-                <details className="dock-panel">
-                  <summary>Bot</summary>
-                  <section className="controls">
-                    <section className="bot-panel">
-                  <div className="button-row">
-                    <div className="auto-bot-group" role="group" aria-label="Bot autoplay mode">
-                      <button
-                        type="button"
-                        className={!autoBotEnabled ? 'active' : ''}
-                        onClick={() => setAutoBotMode('off')}
-                      >
-                        Auto off
-                      </button>
-                      <button
-                        type="button"
-                        className={autoBotEnabled && autoBotSide === 'O' ? 'active auto-easy' : 'auto-easy'}
-                        onClick={() => setAutoBotMode('O')}
-                      >
-                        Auto O
-                      </button>
-                      <button
-                        type="button"
-                        className={autoBotEnabled && autoBotSide === 'X' ? 'active' : ''}
-                        onClick={() => setAutoBotMode('X')}
-                      >
-                        Auto X
-                      </button>
-                      <button
-                        type="button"
-                        className={autoBotEnabled && autoBotSide === 'both' ? 'active auto-easy' : 'auto-easy'}
-                        onClick={() => setAutoBotMode('both')}
-                      >
-                        Auto both
-                      </button>
-                    </div>
-                    <div className="drag-readout">
-                      {mode === 'live'
-                        ? `Bot will place ${liveState.placementsLeft} mark${liveState.placementsLeft === 1 ? '' : 's'}`
-                        : 'Switch to Live mode for bot play'}
-                    </div>
-                  </div>
-                  <div className="bot-metrics">
-                    <div className="stat">
-                      <span>X Threats</span>
-                      <strong className="threat-line-x">
-                        1:{liveEvaluation.xThreats[1]} 2:{liveEvaluation.xThreats[2]} 3:{liveEvaluation.xThreats[3]} 4:
-                        {liveEvaluation.xThreats[4]} 5:{liveEvaluation.xThreats[5]}
-                      </strong>
-                    </div>
-                    <div className="stat">
-                      <span>O Threats</span>
-                      <strong className="threat-line-o">
-                        1:{liveEvaluation.oThreats[1]} 2:{liveEvaluation.oThreats[2]} 3:{liveEvaluation.oThreats[3]} 4:
-                        {liveEvaluation.oThreats[4]} 5:{liveEvaluation.oThreats[5]}
-                      </strong>
-                    </div>
-                    <div className="stat">
-                      <span>X One-turn wins</span>
-                      <strong>{liveEvaluation.xOneTurnWins}</strong>
-                    </div>
-                    <div className="stat">
-                      <span>O One-turn wins</span>
-                      <strong>{liveEvaluation.oOneTurnWins}</strong>
-                    </div>
-                  </div>
-                  <div className="button-row">
-                    <button onClick={() => void runBotTurn()} type="button" disabled={mode !== 'live' || !!liveState.winner || isBotThinking}>
-                      {isBotThinking ? 'Bot thinking…' : `Play bot turn (${liveState.turn})`}
-                    </button>
-                  </div>
-                  <div className="compute-panel">
-                    <label className="compute-label" htmlFor="bot-compute-slider">
-                      Search time limit: {botThinkSeconds.toFixed(1)}s
-                      <HintPill text="0.0s uses greedy only. Higher values run budgeted MCTS with guided (non-random) simulation and larger node caps." />
-                    </label>
-                    <input
-                      id="bot-compute-slider"
-                      type="range"
-                      min={0}
-                      max={12}
-                      step={0.1}
-                      value={botThinkSeconds}
-                      onChange={(event) => setBotThinkSeconds(Math.max(0, Math.min(12, Number(event.target.value) || 0)))}
-                    />
-                    <div className="compute-meta">
-                      {botThinkSeconds <= 0
-                        ? 'Mode: Greedy (no search)'
-                        : `Mode: MCTS | Budget: ${botSearchOptions.budget.maxTimeMs}ms or ${botSearchOptions.budget.maxNodes.toLocaleString()} nodes`}
-                    </div>
-                    {lastBotStats ? (
-                      <div className="compute-meta">
-                        Last run: {lastBotStats.mode.toUpperCase()} | {(lastBotStats.elapsedMs / 1000).toFixed(3)}s | board evals{' '}
-                        {lastBotStats.boardEvaluations.toLocaleString()} | nodes {lastBotStats.nodesExpanded.toLocaleString()} | playouts{' '}
-                        {lastBotStats.playouts.toLocaleString()} | tree depth {lastBotStats.maxDepthTurns} turns | root lines{' '}
-                        {lastBotStats.rootCandidates} | stop {lastBotStats.stopReason}
+                      <div className="button-row">
+                        <div className="drag-readout">
+                          {isReplayLoading
+                            ? 'Loading tracked game…'
+                            : replayRecord
+                              ? `Step ${replayStep} of ${replayRecord.moveHistory.length}`
+                              : 'Replay unavailable'}
+                        </div>
                       </div>
-                    ) : null}
-                    {isBotThinking ? (
-                      <div className="compute-meta">
-                        Thinking now: {(liveBotElapsedMs / 1000).toFixed(2)}s | board evals {liveBotBoardEvals.toLocaleString()} | nodes{' '}
-                        {liveBotNodes.toLocaleString()} | playouts {liveBotPlayouts.toLocaleString()}
-                      </div>
-                    ) : null}
-                  </div>
-                  <details className="tuning-panel">
-                    <summary>Advanced tuning (threat + diversity model)</summary>
-                    <div className="tuning-grid">
-                        <label>
-                          <span className="tuning-label-text">
-                            Threat-2 base <HintPill text="Small value for uncontested 2-threat windows and preemptive control pressure." />
-                          </span>
-                          <input
-                            type="number"
-                            min={0}
-                            max={20000}
-                            step={1}
-                            value={botTuning.threatWeights[2]}
-                            onChange={(e) => setThreatWeight(2, Number(e.target.value))}
-                          />
-                        </label>
-                        <label>
-                          <span className="tuning-label-text">
-                            Threat-3 base <HintPill text="Base value of each uncontested 3-in-a-row threat window." />
-                          </span>
-                          <input
-                            type="number"
-                            min={0}
-                            max={20000}
-                            step={1}
-                            value={botTuning.threatWeights[3]}
-                            onChange={(e) => setThreatWeight(3, Number(e.target.value))}
-                          />
-                        </label>
-                        <label>
-                          <span className="tuning-label-text">
-                            Threat-4/5 base <HintPill text="Shared base value for uncontested 4-threats and 5-threats." />
-                          </span>
-                          <input
-                            type="number"
-                            min={0}
-                            max={20000}
-                            step={1}
-                            value={botTuning.threatWeights[4]}
-                            onChange={(e) => {
-                              const value = clampValue(Number(e.target.value) || 0, 0, 20000)
-                              setBotTuning((prev) => {
-                                const next = [...prev.threatWeights]
-                                next[4] = value
-                                next[5] = value
-                                return { ...prev, threatWeights: next }
-                              })
-                            }}
-                          />
-                        </label>
-                        <label>
-                          <span className="tuning-label-text">
-                            Threat vs diversity mix{' '}
-                            <HintPill text="0.00 = threat severity only, 1.00 = diversity only. Middle values blend both normalized signals." />
-                          </span>
-                          <div>
-                            <input
-                              type="range"
-                              min={0}
-                              max={1}
-                              step={0.01}
-                              value={botTuning.threatDiversityBlend}
-                              onChange={(e) =>
-                                setBotTuning((prev) => ({
-                                  ...prev,
-                                  threatDiversityBlend: clampValue(Number(e.target.value) || 0, 0, 1),
-                                }))
-                              }
-                            />
-                            <div className="compute-meta">Value: {botTuning.threatDiversityBlend.toFixed(2)}</div>
-                          </div>
-                        </label>
-                        <label>
-                          <span className="tuning-label-text">
-                            Threat normalization scale{' '}
-                            <HintPill text="Saturation scale for raw threat severity before blending with diversity. Higher means slower saturation." />
-                          </span>
-                          <input
-                            type="number"
-                            min={1}
-                            max={50000}
-                            step={50}
-                            value={botTuning.threatSeverityScale}
-                            onChange={(e) =>
-                              setBotTuning((prev) => ({
-                                ...prev,
-                                threatSeverityScale: clampValue(Number(e.target.value) || 0, 1, 50000),
-                              }))
-                            }
-                          />
-                        </label>
-                        <label>
-                          <span className="tuning-label-text">
-                            Defense weight{' '}
-                            <HintPill text="Offense/defense slider. Higher values prioritize suppressing opponent offense; lower values favor pure self-pressure." />
-                          </span>
-                          <div>
-                            <input
-                              type="range"
-                              min={0}
-                              max={2}
-                              step={0.05}
-                              value={botTuning.defenseWeight}
-                              onChange={(e) =>
-                                setBotTuning((prev) => ({
-                                  ...prev,
-                                  defenseWeight: clampValue(Number(e.target.value) || 0, 0, 2),
-                                }))
-                              }
-                            />
-                            <div className="compute-meta">Value: {botTuning.defenseWeight.toFixed(2)}</div>
-                          </div>
-                        </label>
-                    </div>
-                    <div className="button-row">
-                      <button onClick={() => setBotTuning(DEFAULT_BOT_TUNING)} type="button">
-                        Reset to defaults
-                      </button>
-                    </div>
-                  </details>
                     </section>
-                  </section>
-                </details>
+                  </details>
+                ) : (
+                  <>
+                    <details className="dock-panel">
+                      <summary>Connection</summary>
+                      <section className="controls">
+                        <div className="network-panel">
+                          <button onClick={hostGame} type="button">
+                            Host game
+                          </button>
+                          <input
+                            value={gameCodeInput}
+                            onChange={(e) => setGameCodeInput(e.target.value.toUpperCase())}
+                            placeholder="Game code"
+                            maxLength={5}
+                          />
+                          <button onClick={joinGame} type="button">
+                            Join by code
+                          </button>
+                          <button onClick={leaveRoom} type="button" disabled={!joinedRoom}>
+                            Leave
+                          </button>
+                        </div>
+                      </section>
+                    </details>
+
+                    <details className="dock-panel">
+                      <summary>Play</summary>
+                      <section className="controls">
+                        <div className="button-row">
+                          <label className="play-as">
+                            Play as
+                            <select value={playAs} onChange={(event) => setPlayAs(event.target.value as PlayAs)}>
+                              <option value="any">Any</option>
+                              <option value="X">X</option>
+                              <option value="O">O</option>
+                            </select>
+                          </label>
+                          <button className={mode === 'live' ? 'active' : ''} onClick={() => setMode('live')} type="button">
+                            Game mode
+                          </button>
+                          <button className={mode === 'plan' ? 'active' : ''} onClick={() => setMode('plan')} type="button">
+                            Plan mode
+                          </button>
+                          {mode === 'plan' ? (
+                            <button className={planBrush === 'X' ? 'active plan-x' : 'plan-x'} onClick={() => setPlanBrush('X')} type="button">
+                              Plan X
+                            </button>
+                          ) : null}
+                          {mode === 'plan' ? (
+                            <button className={planBrush === 'O' ? 'active plan-o' : 'plan-o'} onClick={() => setPlanBrush('O')} type="button">
+                              Plan O
+                            </button>
+                          ) : null}
+                          {mode === 'plan' ? (
+                            <button onClick={clearPlan} type="button">
+                              Clear plan
+                            </button>
+                          ) : null}
+                          <button onClick={undoMove} type="button" disabled={!canUndo}>
+                            Undo last
+                          </button>
+                          <button onClick={clearAll} type="button">
+                            {joinedRoom ? 'Sync room' : 'Clear local'}
+                          </button>
+                          <button onClick={saveTrackedSnapshot} type="button">
+                            Save Game Snapshot
+                          </button>
+                          <button onClick={resetView} type="button">
+                            Recenter view
+                          </button>
+                          <div className="zoom-readout">Zoom: {(camera.zoom * 100).toFixed(0)}%</div>
+                          <div className="drag-readout">
+                            {mode === 'plan' ? `Plan marks: ${totalPlanMoves}` : `Moves played: ${totalLiveMoves}`}
+                          </div>
+                        </div>
+                      </section>
+                    </details>
+
+                    <details className="dock-panel">
+                      <summary>Bot</summary>
+                      <section className="controls">
+                        <section className="bot-panel">
+                      <div className="button-row">
+                        <div className="auto-bot-group" role="group" aria-label="Bot autoplay mode">
+                          <button
+                            type="button"
+                            className={!autoBotEnabled ? 'active' : ''}
+                            onClick={() => setAutoBotMode('off')}
+                          >
+                            Auto off
+                          </button>
+                          <button
+                            type="button"
+                            className={autoBotEnabled && autoBotSide === 'O' ? 'active auto-easy' : 'auto-easy'}
+                            onClick={() => setAutoBotMode('O')}
+                          >
+                            Auto O
+                          </button>
+                          <button
+                            type="button"
+                            className={autoBotEnabled && autoBotSide === 'X' ? 'active' : ''}
+                            onClick={() => setAutoBotMode('X')}
+                          >
+                            Auto X
+                          </button>
+                          <button
+                            type="button"
+                            className={autoBotEnabled && autoBotSide === 'both' ? 'active auto-easy' : 'auto-easy'}
+                            onClick={() => setAutoBotMode('both')}
+                          >
+                            Auto both
+                          </button>
+                        </div>
+                        <div className="drag-readout">
+                          {mode === 'live'
+                            ? `Bot will place ${liveState.placementsLeft} mark${liveState.placementsLeft === 1 ? '' : 's'}`
+                            : 'Switch to Live mode for bot play'}
+                        </div>
+                      </div>
+                      <div className="bot-metrics">
+                        <div className="stat">
+                          <span>X Threats</span>
+                          <strong className="threat-line-x">
+                            1:{liveEvaluation.xThreats[1]} 2:{liveEvaluation.xThreats[2]} 3:{liveEvaluation.xThreats[3]} 4:
+                            {liveEvaluation.xThreats[4]} 5:{liveEvaluation.xThreats[5]}
+                          </strong>
+                        </div>
+                        <div className="stat">
+                          <span>O Threats</span>
+                          <strong className="threat-line-o">
+                            1:{liveEvaluation.oThreats[1]} 2:{liveEvaluation.oThreats[2]} 3:{liveEvaluation.oThreats[3]} 4:
+                            {liveEvaluation.oThreats[4]} 5:{liveEvaluation.oThreats[5]}
+                          </strong>
+                        </div>
+                        <div className="stat">
+                          <span>X One-turn wins</span>
+                          <strong>{liveEvaluation.xOneTurnWins}</strong>
+                        </div>
+                        <div className="stat">
+                          <span>O One-turn wins</span>
+                          <strong>{liveEvaluation.oOneTurnWins}</strong>
+                        </div>
+                      </div>
+                      <div className="button-row">
+                        <button onClick={() => void runBotTurn()} type="button" disabled={mode !== 'live' || !!liveState.winner || isBotThinking}>
+                          {isBotThinking ? 'Bot thinking…' : `Play bot turn (${liveState.turn})`}
+                        </button>
+                      </div>
+                      <div className="compute-panel">
+                        <label className="compute-label" htmlFor="bot-compute-slider">
+                          Search time limit: {botThinkSeconds.toFixed(1)}s
+                          <HintPill text="0.0s uses greedy only. Higher values run budgeted MCTS with guided (non-random) simulation and larger node caps." />
+                        </label>
+                        <input
+                          id="bot-compute-slider"
+                          type="range"
+                          min={0}
+                          max={12}
+                          step={0.1}
+                          value={botThinkSeconds}
+                          onChange={(event) => setBotThinkSeconds(Math.max(0, Math.min(12, Number(event.target.value) || 0)))}
+                        />
+                        <div className="compute-meta">
+                          {botThinkSeconds <= 0
+                            ? 'Mode: Greedy (no search)'
+                            : `Mode: MCTS | Budget: ${botSearchOptions.budget.maxTimeMs}ms or ${botSearchOptions.budget.maxNodes.toLocaleString()} nodes`}
+                        </div>
+                        {lastBotStats ? (
+                          <div className="compute-meta">
+                            Last run: {lastBotStats.mode.toUpperCase()} | {(lastBotStats.elapsedMs / 1000).toFixed(3)}s | board evals{' '}
+                            {lastBotStats.boardEvaluations.toLocaleString()} | nodes {lastBotStats.nodesExpanded.toLocaleString()} | playouts{' '}
+                            {lastBotStats.playouts.toLocaleString()} | tree depth {lastBotStats.maxDepthTurns} turns | root lines{' '}
+                            {lastBotStats.rootCandidates} | stop {lastBotStats.stopReason}
+                          </div>
+                        ) : null}
+                        {isBotThinking ? (
+                          <div className="compute-meta">
+                            Thinking now: {(liveBotElapsedMs / 1000).toFixed(2)}s | board evals {liveBotBoardEvals.toLocaleString()} | nodes{' '}
+                            {liveBotNodes.toLocaleString()} | playouts {liveBotPlayouts.toLocaleString()}
+                          </div>
+                        ) : null}
+                      </div>
+                      <details className="tuning-panel">
+                        <summary>Advanced tuning (threat + diversity model)</summary>
+                        <div className="tuning-grid">
+                            <label>
+                              <span className="tuning-label-text">
+                                Threat-2 base <HintPill text="Small value for uncontested 2-threat windows and preemptive control pressure." />
+                              </span>
+                              <input
+                                type="number"
+                                min={0}
+                                max={20000}
+                                step={1}
+                                value={botTuning.threatWeights[2]}
+                                onChange={(e) => setThreatWeight(2, Number(e.target.value))}
+                              />
+                            </label>
+                            <label>
+                              <span className="tuning-label-text">
+                                Threat-3 base <HintPill text="Base value of each uncontested 3-in-a-row threat window." />
+                              </span>
+                              <input
+                                type="number"
+                                min={0}
+                                max={20000}
+                                step={1}
+                                value={botTuning.threatWeights[3]}
+                                onChange={(e) => setThreatWeight(3, Number(e.target.value))}
+                              />
+                            </label>
+                            <label>
+                              <span className="tuning-label-text">
+                                Threat-4/5 base <HintPill text="Shared base value for uncontested 4-threats and 5-threats." />
+                              </span>
+                              <input
+                                type="number"
+                                min={0}
+                                max={20000}
+                                step={1}
+                                value={botTuning.threatWeights[4]}
+                                onChange={(e) => {
+                                  const value = clampValue(Number(e.target.value) || 0, 0, 20000)
+                                  setBotTuning((prev) => {
+                                    const next = [...prev.threatWeights]
+                                    next[4] = value
+                                    next[5] = value
+                                    return { ...prev, threatWeights: next }
+                                  })
+                                }}
+                              />
+                            </label>
+                            <label>
+                              <span className="tuning-label-text">
+                                Threat vs diversity mix{' '}
+                                <HintPill text="0.00 = threat severity only, 1.00 = diversity only. Middle values blend both normalized signals." />
+                              </span>
+                              <div>
+                                <input
+                                  type="range"
+                                  min={0}
+                                  max={1}
+                                  step={0.01}
+                                  value={botTuning.threatDiversityBlend}
+                                  onChange={(e) =>
+                                    setBotTuning((prev) => ({
+                                      ...prev,
+                                      threatDiversityBlend: clampValue(Number(e.target.value) || 0, 0, 1),
+                                    }))
+                                  }
+                                />
+                                <div className="compute-meta">Value: {botTuning.threatDiversityBlend.toFixed(2)}</div>
+                              </div>
+                            </label>
+                            <label>
+                              <span className="tuning-label-text">
+                                Threat normalization scale{' '}
+                                <HintPill text="Saturation scale for raw threat severity before blending with diversity. Higher means slower saturation." />
+                              </span>
+                              <input
+                                type="number"
+                                min={1}
+                                max={50000}
+                                step={50}
+                                value={botTuning.threatSeverityScale}
+                                onChange={(e) =>
+                                  setBotTuning((prev) => ({
+                                    ...prev,
+                                    threatSeverityScale: clampValue(Number(e.target.value) || 0, 1, 50000),
+                                  }))
+                                }
+                              />
+                            </label>
+                            <label>
+                              <span className="tuning-label-text">
+                                Defense weight{' '}
+                                <HintPill text="Offense/defense slider. Higher values prioritize suppressing opponent offense; lower values favor pure self-pressure." />
+                              </span>
+                              <div>
+                                <input
+                                  type="range"
+                                  min={0}
+                                  max={2}
+                                  step={0.05}
+                                  value={botTuning.defenseWeight}
+                                  onChange={(e) =>
+                                    setBotTuning((prev) => ({
+                                      ...prev,
+                                      defenseWeight: clampValue(Number(e.target.value) || 0, 0, 2),
+                                    }))
+                                  }
+                                />
+                                <div className="compute-meta">Value: {botTuning.defenseWeight.toFixed(2)}</div>
+                              </div>
+                            </label>
+                        </div>
+                        <div className="button-row">
+                          <button onClick={() => setBotTuning(DEFAULT_BOT_TUNING)} type="button">
+                            Reset to defaults
+                          </button>
+                        </div>
+                      </details>
+                        </section>
+                      </section>
+                    </details>
+                  </>
+                )}
 
                 <details className="dock-panel">
                   <summary>Appearance</summary>
