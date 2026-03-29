@@ -17,6 +17,7 @@ type PlayAs = 'any' | Player
 type PieceStyle = 'glyph' | 'fill'
 type PaletteId = 'spruce' | 'sunset' | 'graphite' | 'midnight' | 'volcanic' | 'cobalt' | 'amber-night' | 'arena'
 type SandboxBrush = Player | 'erase'
+type PlanningDragMode = 'pan' | 'annotate'
 
 type Camera = {
   x: number
@@ -73,6 +74,11 @@ type LiveGameState = {
   winner: Player | null
 }
 
+type PlanningState = {
+  marks: Map<string, Player>
+  segments: Set<string>
+}
+
 type LiveAction =
   | {
       type: 'place'
@@ -112,6 +118,24 @@ type SandboxAction =
   | {
       type: 'load'
       state: LiveGameState
+    }
+
+type PlanningAction =
+  | {
+      type: 'cycleMark'
+      q: number
+      r: number
+    }
+  | {
+      type: 'removeSegments'
+      segmentKeys: string[]
+    }
+  | {
+      type: 'toggleSegments'
+      segmentKeys: string[]
+    }
+  | {
+      type: 'clear'
     }
 
 type WsStatus = 'disconnected' | 'connecting' | 'connected'
@@ -515,6 +539,131 @@ function createSandboxState(moveHistory: MoveRecord[]): LiveGameState {
   return deriveLiveState(moveHistory)
 }
 
+function createInitialPlanningState(): PlanningState {
+  return {
+    marks: new Map(),
+    segments: new Set(),
+  }
+}
+
+function planningSegmentKey(a: HoverHex, b: HoverHex): string {
+  const first = toKey(a.q, a.r)
+  const second = toKey(b.q, b.r)
+  return first < second ? `${first}|${second}` : `${second}|${first}`
+}
+
+function parsePlanningSegmentKey(segmentKey: string): { start: HoverHex; end: HoverHex } | null {
+  const [startKey, endKey] = segmentKey.split('|')
+  if (!startKey || !endKey) return null
+  return {
+    start: fromKey(startKey),
+    end: fromKey(endKey),
+  }
+}
+
+function normalizeSegmentDirection(a: HoverHex, b: HoverHex): string {
+  const dq = b.q - a.q
+  const dr = b.r - a.r
+  if (dq === 0 && dr === 0) return '0,0'
+  if (dq < 0 || (dq === 0 && dr < 0)) {
+    return `${-dq},${-dr}`
+  }
+  return `${dq},${dr}`
+}
+
+function collectPlanningLineSegmentKeys(segments: Set<string>, seedSegmentKey: string): string[] {
+  if (!segments.has(seedSegmentKey)) return []
+
+  const parsedSeed = parsePlanningSegmentKey(seedSegmentKey)
+  if (!parsedSeed) return []
+
+  const direction = normalizeSegmentDirection(parsedSeed.start, parsedSeed.end)
+  const endpointMap = new Map<string, string[]>()
+
+  for (const segmentKey of segments) {
+    const parsed = parsePlanningSegmentKey(segmentKey)
+    if (!parsed) continue
+    if (normalizeSegmentDirection(parsed.start, parsed.end) !== direction) continue
+
+    const startKey = toKey(parsed.start.q, parsed.start.r)
+    const endKey = toKey(parsed.end.q, parsed.end.r)
+    const startSegments = endpointMap.get(startKey) ?? []
+    startSegments.push(segmentKey)
+    endpointMap.set(startKey, startSegments)
+    const endSegments = endpointMap.get(endKey) ?? []
+    endSegments.push(segmentKey)
+    endpointMap.set(endKey, endSegments)
+  }
+
+  const queue = [seedSegmentKey]
+  const visited = new Set<string>()
+
+  while (queue.length > 0) {
+    const segmentKey = queue.pop()
+    if (!segmentKey || visited.has(segmentKey)) continue
+    visited.add(segmentKey)
+
+    const parsed = parsePlanningSegmentKey(segmentKey)
+    if (!parsed) continue
+
+    for (const endpoint of [parsed.start, parsed.end]) {
+      const adjacent = endpointMap.get(toKey(endpoint.q, endpoint.r)) ?? []
+      for (const adjacentSegment of adjacent) {
+        if (!visited.has(adjacentSegment)) {
+          queue.push(adjacentSegment)
+        }
+      }
+    }
+  }
+
+  return [...visited]
+}
+
+function planningReducer(state: PlanningState, action: PlanningAction): PlanningState {
+  if (action.type === 'clear') {
+    return createInitialPlanningState()
+  }
+
+  if (action.type === 'removeSegments') {
+    if (action.segmentKeys.length === 0) return state
+    const segments = new Set(state.segments)
+    let changed = false
+    for (const segmentKey of action.segmentKeys) {
+      if (!segments.has(segmentKey)) continue
+      segments.delete(segmentKey)
+      changed = true
+    }
+    if (!changed) return state
+    return { ...state, segments }
+  }
+
+  if (action.type === 'toggleSegments') {
+    if (action.segmentKeys.length === 0) return state
+    const segments = new Set(state.segments)
+    for (const segmentKey of action.segmentKeys) {
+      if (segments.has(segmentKey)) {
+        segments.delete(segmentKey)
+      } else {
+        segments.add(segmentKey)
+      }
+    }
+    return { ...state, segments }
+  }
+
+  const key = toKey(action.q, action.r)
+  const current = state.marks.get(key)
+  const marks = new Map(state.marks)
+  if (current === 'X') {
+    marks.set(key, 'O')
+  } else if (current === 'O') {
+    marks.delete(key)
+  } else {
+    marks.set(key, 'X')
+  }
+
+  return { ...state, marks }
+}
+
 function sandboxReducer(state: LiveGameState, action: SandboxAction): LiveGameState {
   if (action.type === 'clear') {
     return createInitialSandboxState()
@@ -608,6 +757,88 @@ function roundAxial(q: number, r: number): { q: number; r: number } {
   }
 
   return { q: rx, r: rz }
+}
+
+function axialDistance(a: HoverHex, b: HoverHex): number {
+  const dq = a.q - b.q
+  const dr = a.r - b.r
+  const ds = -a.q - a.r - (-b.q - b.r)
+  return Math.max(Math.abs(dq), Math.abs(dr), Math.abs(ds))
+}
+
+function lerp(start: number, end: number, t: number): number {
+  return start + (end - start) * t
+}
+
+function hexLinePath(a: HoverHex, b: HoverHex): HoverHex[] {
+  const distance = axialDistance(a, b)
+  if (distance === 0) return [a]
+
+  const result: HoverHex[] = []
+  for (let step = 0; step <= distance; step += 1) {
+    const t = step / distance
+    const point = roundAxial(lerp(a.q, b.q, t), lerp(a.r, b.r, t))
+    const last = result[result.length - 1]
+    if (!last || last.q !== point.q || last.r !== point.r) {
+      result.push(point)
+    }
+  }
+
+  return result
+}
+
+function planningPathSegmentKeys(a: HoverHex, b: HoverHex): string[] {
+  const path = hexLinePath(a, b)
+  const segmentKeys: string[] = []
+  for (let index = 1; index < path.length; index += 1) {
+    segmentKeys.push(planningSegmentKey(path[index - 1], path[index]))
+  }
+  return segmentKeys
+}
+
+function snapHexToPlanningAxis(anchor: HoverHex, target: HoverHex): HoverHex {
+  const dq = target.q - anchor.q
+  const dr = target.r - anchor.r
+  const diagonalStep = Math.round((dq - dr) / 2)
+  const candidates: HoverHex[] = [
+    { q: target.q, r: anchor.r },
+    { q: anchor.q, r: target.r },
+    { q: anchor.q + diagonalStep, r: anchor.r - diagonalStep },
+  ]
+
+  let best = candidates[0]
+  let bestDistance = axialDistance(best, target)
+
+  for (let index = 1; index < candidates.length; index += 1) {
+    const candidate = candidates[index]
+    const distance = axialDistance(candidate, target)
+    if (distance < bestDistance) {
+      best = candidate
+      bestDistance = distance
+    }
+  }
+
+  return best
+}
+
+function distanceToSegment(
+  px: number,
+  py: number,
+  ax: number,
+  ay: number,
+  bx: number,
+  by: number,
+): number {
+  const dx = bx - ax
+  const dy = by - ay
+  if (dx === 0 && dy === 0) {
+    return Math.hypot(px - ax, py - ay)
+  }
+
+  const t = clampValue(((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy), 0, 1)
+  const cx = ax + dx * t
+  const cy = ay + dy * t
+  return Math.hypot(px - cx, py - cy)
 }
 
 function boardObjectToMap(value: unknown): Map<string, Player> {
@@ -804,6 +1035,8 @@ function App() {
 
   const [liveState, dispatchLive] = useReducer(liveReducer, undefined, createInitialLiveState)
   const [sandboxState, dispatchSandbox] = useReducer(sandboxReducer, undefined, createInitialSandboxState)
+  const [planningState, dispatchPlanning] = useReducer(planningReducer, undefined, createInitialPlanningState)
+  const [planningPreviewSegments, setPlanningPreviewSegments] = useState<string[]>([])
   const [sandboxBrush, setSandboxBrush] = useState<SandboxBrush>('X')
 
   const [gameCodeInput, setGameCodeInput] = useState('')
@@ -842,9 +1075,11 @@ function App() {
 
   const dragRef = useRef<{
     pointerId: number
+    mode: PlanningDragMode
     lastX: number
     lastY: number
     started: boolean
+    anchorHex: HoverHex | null
   } | null>(null)
   const lastAutoBotSignatureRef = useRef('')
   const lastLightPaletteRef = useRef<PaletteId>(isDarkPalette(paletteId) ? 'spruce' : paletteId)
@@ -1032,8 +1267,36 @@ function App() {
     if (!currentGameId || typeof window === 'undefined') return null
     return `${window.location.origin}/games/${currentGameId}`
   }, [currentGameId])
+  const hasPlanningAnnotations = planningState.marks.size > 0 || planningState.segments.size > 0
   const liveEvaluation = useMemo(() => evaluateBoardState(displayState.moves, botTuning), [botTuning, displayState.moves])
   const threatTargets = useMemo(() => collectThreatTargets(displayState.moves), [displayState.moves])
+  const planningSegmentAtScreen = useCallback(
+    (screenX: number, screenY: number) => {
+      let closestSegment: string | null = null
+      let closestDistance = Number.POSITIVE_INFINITY
+      const hitThreshold = Math.max(8, BASE_HEX_SIZE * camera.zoom * 0.18)
+
+      for (const segmentKey of planningState.segments) {
+        const [startKey, endKey] = segmentKey.split('|')
+        if (!startKey || !endKey) continue
+
+        const start = fromKey(startKey)
+        const end = fromKey(endKey)
+        const startWorld = axialToWorld(start.q, start.r, BASE_HEX_SIZE)
+        const endWorld = axialToWorld(end.q, end.r, BASE_HEX_SIZE)
+        const startScreen = worldToScreen(startWorld.x, startWorld.y)
+        const endScreen = worldToScreen(endWorld.x, endWorld.y)
+        const distance = distanceToSegment(screenX, screenY, startScreen.x, startScreen.y, endScreen.x, endScreen.y)
+        if (distance <= hitThreshold && distance < closestDistance) {
+          closestDistance = distance
+          closestSegment = segmentKey
+        }
+      }
+
+      return closestSegment
+    },
+    [camera.zoom, planningState.segments, worldToScreen],
+  )
   const hoverTrainingLabel = useMemo(() => {
     if (!hoverHex || (!hideDeadHexes && !showThreatHighlights)) return null
 
@@ -1654,6 +1917,51 @@ function App() {
       }
     }
 
+    const drawPlanningSegments = (segmentKeys: Iterable<string>, dashedAlpha: number) => {
+      ctx.save()
+      ctx.lineCap = 'round'
+      ctx.lineJoin = 'round'
+
+      for (const segmentKey of segmentKeys) {
+        const [startKey, endKey] = segmentKey.split('|')
+        if (!startKey || !endKey) continue
+
+        const start = fromKey(startKey)
+        const end = fromKey(endKey)
+        const startWorld = axialToWorld(start.q, start.r, BASE_HEX_SIZE)
+        const endWorld = axialToWorld(end.q, end.r, BASE_HEX_SIZE)
+        const startScreen = worldToScreen(startWorld.x, startWorld.y)
+        const endScreen = worldToScreen(endWorld.x, endWorld.y)
+
+        ctx.beginPath()
+        ctx.moveTo(startScreen.x, startScreen.y)
+        ctx.lineTo(endScreen.x, endScreen.y)
+        ctx.strokeStyle = theme.boardBackground
+        ctx.lineWidth = Math.max(4, camera.zoom * 5.5)
+        ctx.stroke()
+
+        ctx.beginPath()
+        ctx.moveTo(startScreen.x, startScreen.y)
+        ctx.lineTo(endScreen.x, endScreen.y)
+        ctx.strokeStyle = theme.hoverPlan
+        ctx.globalAlpha = dashedAlpha
+        ctx.lineWidth = Math.max(2.4, camera.zoom * 3.2)
+        ctx.setLineDash([Math.max(6, camera.zoom * 7), Math.max(4, camera.zoom * 5)])
+        ctx.stroke()
+        ctx.setLineDash([])
+      }
+
+      ctx.restore()
+    }
+
+    if (planningPreviewSegments.length > 0) {
+      drawPlanningSegments(planningPreviewSegments, 0.46)
+    }
+
+    if (planningState.segments.size > 0) {
+      drawPlanningSegments(planningState.segments, 0.8)
+    }
+
     if (hoverHex) {
       const key = toKey(hoverHex.q, hoverHex.r)
       const showHover = mode === 'sandbox' || (!displayState.moves.has(key) && !displayState.winner)
@@ -1759,6 +2067,53 @@ function App() {
       ctx.restore()
     }
 
+    for (const [key, player] of planningState.marks.entries()) {
+      if (displayState.moves.has(key)) continue
+
+      const { q, r } = fromKey(key)
+      const world = axialToWorld(q, r, BASE_HEX_SIZE)
+      const screen = worldToScreen(world.x, world.y)
+      const overlaySize = BASE_HEX_SIZE * camera.zoom * 0.72
+      const overlayRadius = BASE_HEX_SIZE * camera.zoom * 0.42
+      const strokeColor = player === 'X' ? theme.xColor : theme.oColor
+      const fillColor = player === 'X' ? theme.xFill : theme.oFill
+
+      ctx.save()
+      ctx.globalAlpha = 0.28
+      ctx.beginPath()
+      for (let i = 0; i < 6; i += 1) {
+        const angle = (Math.PI / 180) * (60 * i - 30)
+        const px = screen.x + overlaySize * Math.cos(angle)
+        const py = screen.y + overlaySize * Math.sin(angle)
+        if (i === 0) ctx.moveTo(px, py)
+        else ctx.lineTo(px, py)
+      }
+      ctx.closePath()
+      ctx.fillStyle = fillColor
+      ctx.fill()
+
+      ctx.globalAlpha = 0.82
+      ctx.strokeStyle = strokeColor
+      ctx.lineWidth = Math.max(1.8, camera.zoom * 2.1)
+      ctx.setLineDash([Math.max(5, camera.zoom * 5), Math.max(4, camera.zoom * 4)])
+
+      if (player === 'X') {
+        ctx.beginPath()
+        ctx.moveTo(screen.x - overlayRadius, screen.y - overlayRadius)
+        ctx.lineTo(screen.x + overlayRadius, screen.y + overlayRadius)
+        ctx.moveTo(screen.x + overlayRadius, screen.y - overlayRadius)
+        ctx.lineTo(screen.x - overlayRadius, screen.y + overlayRadius)
+        ctx.stroke()
+      } else {
+        ctx.beginPath()
+        ctx.arc(screen.x, screen.y, overlayRadius, 0, Math.PI * 2)
+        ctx.stroke()
+      }
+
+      ctx.setLineDash([])
+      ctx.restore()
+    }
+
     if (showThreatHighlights) {
       const drawThreatDot = (key: string, fill: string, line: string, radiusScale: number) => {
         if (displayState.moves.has(key)) return
@@ -1837,19 +2192,32 @@ function App() {
     showThreatHighlights,
     threatTargets,
     theme,
+    planningState.marks,
+    planningState.segments,
+    planningPreviewSegments,
     worldToScreen,
   ])
 
   const onPointerDown = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    if (event.button === 2) {
+      event.preventDefault()
+    }
+
     const rect = event.currentTarget.getBoundingClientRect()
     const x = event.clientX - rect.left
     const y = event.clientY - rect.top
 
     dragRef.current = {
       pointerId: event.pointerId,
+      mode: event.button === 2 ? 'annotate' : 'pan',
       lastX: x,
       lastY: y,
       started: false,
+      anchorHex: getHexAtScreen(x, y),
+    }
+
+    if (event.button === 2) {
+      setPlanningPreviewSegments([])
     }
 
     event.currentTarget.setPointerCapture(event.pointerId)
@@ -1869,12 +2237,25 @@ function App() {
     const dx = x - drag.lastX
     const dy = y - drag.lastY
 
-    if (!drag.started && Math.hypot(dx, dy) > 3) {
+    if (drag.mode === 'pan' && !drag.started && Math.hypot(dx, dy) > 3) {
       drag.started = true
     }
 
-    if (drag.started) {
+    if (drag.mode === 'pan' && drag.started) {
       setCamera((prev) => ({ ...prev, x: prev.x + dx, y: prev.y + dy }))
+    }
+
+    if (drag.mode === 'annotate') {
+      const hex = getHexAtScreen(x, y)
+      if (drag.anchorHex) {
+        const snappedHex = snapHexToPlanningAxis(drag.anchorHex, hex)
+        const previewSegments =
+          snappedHex.q === drag.anchorHex.q && snappedHex.r === drag.anchorHex.r
+            ? []
+            : planningPathSegmentKeys(drag.anchorHex, snappedHex)
+        drag.started = previewSegments.length > 0
+        setPlanningPreviewSegments(previewSegments)
+      }
     }
 
     drag.lastX = x
@@ -1889,14 +2270,49 @@ function App() {
     const drag = dragRef.current
 
     if (drag && drag.pointerId === event.pointerId) {
-      if (!drag.started) {
+      if (drag.mode === 'annotate') {
+        event.preventDefault()
+      }
+
+      const annotatePreviewSegments =
+        drag.mode === 'annotate' && drag.anchorHex
+          ? (() => {
+              const hex = getHexAtScreen(x, y)
+              const snappedHex = snapHexToPlanningAxis(drag.anchorHex as HoverHex, hex)
+              if (snappedHex.q === drag.anchorHex.q && snappedHex.r === drag.anchorHex.r) {
+                return []
+              }
+              return planningPathSegmentKeys(drag.anchorHex, snappedHex)
+            })()
+          : []
+
+      if (!drag.started && drag.mode === 'pan') {
         const hex = getHexAtScreen(x, y)
         placeMove(hex.q, hex.r)
       }
+
+      if (!drag.started && drag.mode === 'annotate') {
+        const segmentKey = planningSegmentAtScreen(x, y)
+        if (segmentKey) {
+          dispatchPlanning({
+            type: 'removeSegments',
+            segmentKeys: collectPlanningLineSegmentKeys(planningState.segments, segmentKey),
+          })
+        } else {
+          const hex = getHexAtScreen(x, y)
+          dispatchPlanning({ type: 'cycleMark', q: hex.q, r: hex.r })
+        }
+      }
+
+      if (drag.mode === 'annotate' && annotatePreviewSegments.length > 0) {
+        dispatchPlanning({ type: 'toggleSegments', segmentKeys: annotatePreviewSegments })
+      }
+
       event.currentTarget.releasePointerCapture(event.pointerId)
     }
 
     dragRef.current = null
+    setPlanningPreviewSegments([])
   }
 
   const onPointerLeave = () => {
@@ -2069,12 +2485,20 @@ function App() {
       ) : null}
 
       <main className="board-wrapper" ref={wrapperRef}>
-        <button className="toggle-hud board-theme-toggle" onClick={toggleThemeTone} type="button">
-          {theme.dark ? 'Light mode' : 'Dark mode'}
-        </button>
+        <div className="board-floating-controls">
+          {hasPlanningAnnotations ? (
+            <button className="toggle-hud" onClick={() => dispatchPlanning({ type: 'clear' })} type="button">
+              Clear planning
+            </button>
+          ) : null}
+          <button className="toggle-hud board-theme-toggle" onClick={toggleThemeTone} type="button">
+            {theme.dark ? 'Light mode' : 'Dark mode'}
+          </button>
+        </div>
         <canvas
           ref={canvasRef}
           className={`board ${(isReplayMode || (mode === 'live' && displayState.winner)) ? 'board-locked' : ''}`}
+          onContextMenu={(event) => event.preventDefault()}
           onPointerDown={onPointerDown}
           onPointerMove={onPointerMove}
           onPointerUp={onPointerUp}
@@ -2191,6 +2615,9 @@ function App() {
                           <button onClick={clearAll} type="button">
                             {mode === 'sandbox' ? 'Clear sandbox' : joinedRoom ? 'Sync room' : 'Clear local'}
                           </button>
+                          <button onClick={() => dispatchPlanning({ type: 'clear' })} type="button">
+                            Clear notes
+                          </button>
                           {mode === 'sandbox' ? (
                             <button className={sandboxBrush === 'X' ? 'active sandbox-x' : 'sandbox-x'} onClick={() => setSandboxBrush('X')} type="button">
                               Place X
@@ -2217,6 +2644,7 @@ function App() {
                           <div className="drag-readout">
                             {mode === 'sandbox' ? `Sandbox pieces: ${totalSandboxMoves}` : `Moves played: ${totalLiveMoves}`}
                           </div>
+                          <div className="drag-readout">Right-click: ghost X/O, drag links</div>
                         </div>
                       </section>
                     </details>
