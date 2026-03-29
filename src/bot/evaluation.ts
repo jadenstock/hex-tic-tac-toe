@@ -15,8 +15,41 @@ function pressureDiversity(total: number, entropySum: number, size: number): num
   return Math.max(0, Math.min(1, entropy / denom))
 }
 
+function minimumBlockersRequired(threatGroups: Map<string, number>): number {
+  const groups = [...threatGroups.keys()]
+    .filter((key) => key.length > 0)
+    .map((key) => key.split('|'))
+  if (groups.length === 0) return 0
+
+  const uniqueCells = [...new Set(groups.flat())]
+  const coversAll = (blockers: string[]): boolean => {
+    const blockerSet = new Set(blockers)
+    return groups.every((group) => group.some((cell) => blockerSet.has(cell)))
+  }
+
+  for (const cell of uniqueCells) {
+    if (coversAll([cell])) return 1
+  }
+
+  for (let i = 0; i < uniqueCells.length; i += 1) {
+    for (let j = i + 1; j < uniqueCells.length; j += 1) {
+      if (coversAll([uniqueCells[i], uniqueCells[j]])) return 2
+    }
+  }
+
+  return 3
+}
+
+function oneTurnThreatScore(threatGroups: Map<string, number>): number {
+  const blockers = minimumBlockersRequired(threatGroups)
+  if (blockers <= 0) return 0
+  if (blockers === 1) return 0.88
+  if (blockers === 2) return 0.96
+  return 0.995
+}
+
 function scoreOffense(counts: number[], diversity: number, tuning: BotTuning): number {
-  const severity = tuning.threatWeights[2] * counts[2] + tuning.threatWeights[3] * counts[3] + tuning.threatWeights[4] * (counts[4] + counts[5])
+  const severity = tuning.threatWeights[2] * counts[2] + tuning.threatWeights[3] * counts[3]
   if (severity <= 0) return 0
   const scale = Math.max(1, tuning.threatSeverityScale)
   const severityNorm = severity / (severity + scale)
@@ -41,8 +74,8 @@ export function evaluateBoardSummary(board: SearchBoard, tuning: BotTuning = DEF
   const oDiversity = pressureDiversity(board.oPressureTotal, board.oPressureEntropySum, board.oPressureMap.size)
   const xOffense = scoreOffense(board.xThreats, xDiversity, tuning)
   const oOffense = scoreOffense(board.oThreats, oDiversity, tuning)
-  const xScore = Math.max(0, xOffense)
-  const oScore = Math.max(0, oOffense)
+  const xScore = Math.max(0, xOffense, oneTurnThreatScore(board.xOneTurnThreatGroupCounts))
+  const oScore = Math.max(0, oOffense, oneTurnThreatScore(board.oOneTurnThreatGroupCounts))
   const total = xScore + oScore
   const xShare = total > 0 ? xScore / total : 0.5
 
