@@ -48,6 +48,11 @@ type CandidateGenerationPolicy = {
   secondExplorationSamples: number
 }
 
+type CandidatePool = {
+  candidates: Axial[]
+  priorityKeys: Set<string>
+}
+
 type SearchNode = {
   parent: SearchNode | null
   actionFromParent: Axial[] | null
@@ -138,6 +143,9 @@ const ADJACENT_DIRECTIONS: Array<[number, number]> = [
   [1, -1],
 ]
 
+const DEFENSIVE_RESPONSE_RADIUS = 1
+const LEAF_OBJECTIVE_GAIN = 3
+
 function localConnectivityScore(board: SearchBoard, player: Player, cell: Axial): number {
   let friendly = 0
   let occupied = 0
@@ -154,13 +162,22 @@ function localConnectivityScore(board: SearchBoard, player: Player, cell: Axial)
   return friendly * 3 + occupied
 }
 
-function trimCandidatesForRanking(board: SearchBoard, candidates: Axial[], player: Player, maxCount: number): Axial[] {
+function trimCandidatesForRanking(
+  board: SearchBoard,
+  candidates: Axial[],
+  player: Player,
+  maxCount: number,
+  priorityKeys: Set<string> = new Set(),
+): Axial[] {
   if (candidates.length <= maxCount) return candidates
   const scored = candidates.map((cell) => ({
     cell,
     score: localConnectivityScore(board, player, cell),
   }))
   scored.sort((a, b) => {
+    const aPriority = priorityKeys.has(toKey(a.cell.q, a.cell.r))
+    const bPriority = priorityKeys.has(toKey(b.cell.q, b.cell.r))
+    if (aPriority !== bPriority) return aPriority ? -1 : 1
     if (a.score !== b.score) return b.score - a.score
     if (a.cell.q !== b.cell.q) return a.cell.q - b.cell.q
     return a.cell.r - b.cell.r
@@ -243,24 +260,64 @@ function collectThreatConnectedCandidates(board: SearchBoard, player: Player): A
   return sortAxials([...candidates].map(fromKey))
 }
 
-function collectLegalCandidates(board: SearchBoard, player: Player, tuning: BotTuning): Axial[] {
+function collectDefensiveResponseCandidateKeys(board: SearchBoard, player: Player, radius: number): Set<string> {
+  const opponent: Player = player === 'X' ? 'O' : 'X'
+  const candidates = new Set<string>()
+
+  for (const window of board.activeWindows.values()) {
+    const counts = playerWindowCounts(window, opponent)
+    if (counts.opp > 0 || counts.own < 2) continue
+    const empties = windowEmpties(board, window)
+    for (const emptyKey of empties) {
+      candidates.add(emptyKey)
+      const { q, r } = fromKey(emptyKey)
+      for (let dq = -radius; dq <= radius; dq += 1) {
+        for (let dr = -radius; dr <= radius; dr += 1) {
+          const ds = -dq - dr
+          const distance = Math.max(Math.abs(dq), Math.abs(dr), Math.abs(ds))
+          if (distance > radius) continue
+          const cellKey = toKey(q + dq, r + dr)
+          if (!board.moves.has(cellKey)) candidates.add(cellKey)
+        }
+      }
+    }
+  }
+
+  return candidates
+}
+
+function collectLegalCandidates(board: SearchBoard, player: Player, tuning: BotTuning): CandidatePool {
   const opponent: Player = player === 'X' ? 'O' : 'X'
   const ownFinishes = collectOneTurnFinishCells(board, player)
   if (ownFinishes.size > 0) {
-    return sortAxials([...ownFinishes].map(fromKey))
+    return {
+      candidates: sortAxials([...ownFinishes].map(fromKey)),
+      priorityKeys: new Set(),
+    }
   }
 
   const forcedBlocks = collectOneTurnFinishCells(board, opponent)
   if (forcedBlocks.size > 0) {
-    return sortAxials([...forcedBlocks].map(fromKey))
+    return {
+      candidates: sortAxials([...forcedBlocks].map(fromKey)),
+      priorityKeys: forcedBlocks,
+    }
   }
 
   const connected = collectThreatConnectedCandidates(board, player)
-  if (connected.length > 0) {
-    return connected
+  const defensiveKeys = collectDefensiveResponseCandidateKeys(board, player, DEFENSIVE_RESPONSE_RADIUS)
+  const combined = uniqueAxials([...connected, ...sortAxials([...defensiveKeys].map(fromKey))])
+  if (combined.length > 0) {
+    return {
+      candidates: combined,
+      priorityKeys: defensiveKeys,
+    }
   }
 
-  return sortAxials(candidateCells(board, tuning.candidateRadius))
+  return {
+    candidates: sortAxials(candidateCells(board, tuning.candidateRadius)),
+    priorityKeys: defensiveKeys,
+  }
 }
 
 function objectiveForPlayer(result: EvaluationSummary, player: Player, tuning: BotTuning): number {
@@ -329,7 +386,7 @@ function candidatePolicyKey(policy: CandidateGenerationPolicy, tuning: BotTuning
 function collectWinningTurnLines(board: SearchBoard, player: Player, tuning: BotTuning): Axial[][] {
   if (board.placementsLeft <= 0) return []
 
-  const firstOptions = collectLegalCandidates(board, player, tuning)
+  const { candidates: firstOptions } = collectLegalCandidates(board, player, tuning)
   if (firstOptions.length === 0) return []
 
   const winners: Axial[][] = []
@@ -354,7 +411,7 @@ function collectWinningTurnLines(board: SearchBoard, player: Player, tuning: Bot
       continue
     }
 
-    const secondOptions = collectLegalCandidates(board, player, tuning)
+    const { candidates: secondOptions } = collectLegalCandidates(board, player, tuning)
     for (const second of secondOptions) {
       const key = canonicalLineKey([first, second])
       if (seen.has(key)) continue
@@ -403,14 +460,15 @@ function enumerateTurnCandidates(
   const ownFinishNow = collectOneTurnFinishCells(board, player)
   const tacticalMode = ownFinishNow.size > 0 || baselineOppWins > 0
 
-  const firstOptions = collectLegalCandidates(board, player, tuning)
+  const firstPool = collectLegalCandidates(board, player, tuning)
+  const firstOptions = firstPool.candidates
   const cappedFirstPoolSize = tacticalMode
     ? Math.max(policy.maxCandidates, policy.firstMoveBeam * 2)
     : policy.firstMoveBeam
   const trimmedFirstOptions = tacticalMode
-    ? trimCandidatesForRanking(board, firstOptions, player, cappedFirstPoolSize)
+    ? trimCandidatesForRanking(board, firstOptions, player, cappedFirstPoolSize, firstPool.priorityKeys)
     : addExplorationCandidates(
-        trimCandidatesForRanking(board, firstOptions, player, Math.max(1, policy.firstMoveBeam)),
+        trimCandidatesForRanking(board, firstOptions, player, Math.max(1, policy.firstMoveBeam), firstPool.priorityKeys),
         candidateCells(board, tuning.candidateRadius),
         board,
         player,
@@ -483,11 +541,12 @@ function enumerateTurnCandidates(
     const firstUndo = makeBoardMove(board, first.option, player)
     if (!firstUndo) continue
 
-    const secondOptions = collectLegalCandidates(board, player, tuning)
+    const secondPool = collectLegalCandidates(board, player, tuning)
+    const secondOptions = secondPool.candidates
     const trimmedSecondOptions = tacticalMode
-      ? trimCandidatesForRanking(board, secondOptions, player, Math.max(1, policy.secondMoveBeam))
+      ? trimCandidatesForRanking(board, secondOptions, player, Math.max(1, policy.secondMoveBeam), secondPool.priorityKeys)
       : addExplorationCandidates(
-          trimCandidatesForRanking(board, secondOptions, player, Math.max(1, policy.secondMoveBeam)),
+          trimCandidatesForRanking(board, secondOptions, player, Math.max(1, policy.secondMoveBeam), secondPool.priorityKeys),
           candidateCells(board, tuning.candidateRadius),
           board,
           player,
@@ -570,8 +629,8 @@ function nowMs(): number {
 function evaluateNodeForRoot(board: SearchBoard, winner: Player | null, rootPlayer: Player, tuning: BotTuning, context: SearchContext): number {
   if (winner) return winner === rootPlayer ? 1 : -1
   const result = evaluateBoardStateTracked(board, tuning, context)
-  const objective = rootPlayer === 'X' ? result.objectiveForX : result.objectiveForO
-  return Math.tanh(objective / 12000)
+  const objective = objectiveForPlayer(result, rootPlayer, tuning)
+  return Math.tanh(objective * LEAF_OBJECTIVE_GAIN)
 }
 
 function selectUctChild(node: SearchNode, explorationC: number): SearchNode {
