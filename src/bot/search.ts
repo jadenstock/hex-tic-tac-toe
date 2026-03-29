@@ -10,7 +10,6 @@ import {
   undoAppliedTurn,
   undoBoardMove,
   windowEmpties,
-  windowEmptyCount,
   type ActiveWindow,
   type AppliedBoardTurn,
   type SearchBoard,
@@ -38,15 +37,11 @@ type RankedPlacement = {
   immediateWin: boolean
   objective: number
   ownScore: number
+  oppOneTurnWins: number
 }
 
 type CandidateGenerationPolicy = {
   topCellCount: number
-}
-
-type CandidatePool = {
-  candidates: Axial[]
-  priorityKeys: Set<string>
 }
 
 type SearchNode = {
@@ -98,29 +93,28 @@ function evaluateBoardStateTracked(board: SearchBoard, tuning: BotTuning, contex
 }
 
 function candidateCells(board: SearchBoard, radius: number): Axial[] {
-  if (board.moves.size === 0) {
+  if (board.moveHistory.length === 0) {
     return [{ q: 0, r: 0 }]
   }
 
-  const occupied = new Set(board.moves.keys())
-  const candidates = new Set<string>()
-
-  for (const key of occupied) {
-    const { q, r } = fromKey(key)
+  const candidates = new Map<string, Axial>()
+  for (const move of board.moveHistory) {
+    const { q, r } = move
     for (let dq = -radius; dq <= radius; dq += 1) {
       for (let dr = -radius; dr <= radius; dr += 1) {
         const ds = -dq - dr
         const distance = Math.max(Math.abs(dq), Math.abs(dr), Math.abs(ds))
         if (distance > radius) continue
-        const cellKey = toKey(q + dq, r + dr)
-        if (!occupied.has(cellKey)) {
-          candidates.add(cellKey)
-        }
+        const candidateQ = q + dq
+        const candidateR = r + dr
+        const cellKey = toKey(candidateQ, candidateR)
+        if (board.moves.has(cellKey) || candidates.has(cellKey)) continue
+        candidates.set(cellKey, { q: candidateQ, r: candidateR })
       }
     }
   }
 
-  return [...candidates].map(fromKey)
+  return [...candidates.values()]
 }
 
 function sortAxials(cells: Axial[]): Axial[] {
@@ -149,20 +143,33 @@ function playerWindowCounts(window: ActiveWindow, player: Player): { own: number
     : { own: window.oCount, opp: window.xCount }
 }
 
+function oneTurnThreatGroups(board: SearchBoard, player: Player): Map<string, number> {
+  return player === 'X' ? board.xOneTurnThreatGroupCounts : board.oOneTurnThreatGroupCounts
+}
+
 function collectOneTurnFinishCells(board: SearchBoard, player: Player): Set<string> {
   const finishCells = new Set<string>()
-  for (const window of board.activeWindows.values()) {
-    const counts = playerWindowCounts(window, player)
-    if (counts.opp > 0) continue
-    if (counts.own >= 4 && windowEmptyCount(window) <= 2) {
-      for (const cell of windowEmpties(board, window)) finishCells.add(cell)
+  for (const groupKey of oneTurnThreatGroups(board, player).keys()) {
+    if (groupKey.length === 0) continue
+    const splitIndex = groupKey.indexOf('|')
+    if (splitIndex < 0) {
+      finishCells.add(groupKey)
+      continue
     }
+    finishCells.add(groupKey.slice(0, splitIndex))
+    finishCells.add(groupKey.slice(splitIndex + 1))
   }
   return finishCells
 }
 
 function hasImmediateThreats(board: SearchBoard): boolean {
-  return collectOneTurnFinishCells(board, 'X').size > 0 || collectOneTurnFinishCells(board, 'O').size > 0
+  for (const groupKey of board.xOneTurnThreatGroupCounts.keys()) {
+    if (groupKey.length > 0) return true
+  }
+  for (const groupKey of board.oOneTurnThreatGroupCounts.keys()) {
+    if (groupKey.length > 0) return true
+  }
+  return false
 }
 
 function shouldForceTacticalSearch(board: SearchBoard, candidateCount?: number): boolean {
@@ -196,22 +203,16 @@ function collectDefensiveResponseCandidateKeys(board: SearchBoard, player: Playe
   return candidates
 }
 
-function collectLegalCandidates(board: SearchBoard, player: Player, tuning: BotTuning, targetCount = 0): CandidatePool {
+function collectLegalCandidates(board: SearchBoard, player: Player, tuning: BotTuning, targetCount = 0): Axial[] {
   const opponent: Player = player === 'X' ? 'O' : 'X'
   const ownFinishes = collectOneTurnFinishCells(board, player)
   if (ownFinishes.size > 0) {
-    return {
-      candidates: sortAxials([...ownFinishes].map(fromKey)),
-      priorityKeys: new Set(),
-    }
+    return sortAxials([...ownFinishes].map(fromKey))
   }
 
   const forcedBlocks = collectOneTurnFinishCells(board, opponent)
   if (forcedBlocks.size > 0) {
-    return {
-      candidates: sortAxials([...forcedBlocks].map(fromKey)),
-      priorityKeys: forcedBlocks,
-    }
+    return sortAxials([...forcedBlocks].map(fromKey))
   }
 
   const connected = collectThreatConnectedCandidates(board, player)
@@ -220,25 +221,16 @@ function collectLegalCandidates(board: SearchBoard, player: Player, tuning: BotT
   const fallback = sortAxials(candidateCells(board, tuning.candidateRadius))
   if (primary.length > 0) {
     if (primary.length >= targetCount || fallback.length === 0) {
-      return {
-        candidates: primary,
-        priorityKeys: new Set([...forcedBlocks, ...defensiveKeys]),
-      }
+      return primary
     }
 
     const primaryKeys = new Set(primary.map((cell) => toKey(cell.q, cell.r)))
     const needed = Math.max(0, targetCount - primary.length)
     const fallbackSupplement = fallback.filter((cell) => !primaryKeys.has(toKey(cell.q, cell.r))).slice(0, needed)
-    return {
-      candidates: uniqueAxials([...primary, ...fallbackSupplement]),
-      priorityKeys: new Set([...forcedBlocks, ...defensiveKeys]),
-    }
+    return uniqueAxials([...primary, ...fallbackSupplement])
   }
 
-  return {
-    candidates: fallback,
-    priorityKeys: new Set([...forcedBlocks, ...defensiveKeys]),
-  }
+  return fallback
 }
 
 function objectiveForPlayer(result: EvaluationSummary, player: Player, tuning: BotTuning): number {
@@ -267,7 +259,8 @@ function rankPlacements(
     const evalResult = evaluateBoardStateTracked(board, tuning, context)
     const objective = immediateWin ? Number.POSITIVE_INFINITY : objectiveForPlayer(evalResult, player, tuning)
     const ownScore = player === 'X' ? evalResult.xScore : evalResult.oScore
-    ranked.push({ option, immediateWin, objective, ownScore })
+    const oppOneTurnWins = opponentOneTurnWins(evalResult, player)
+    ranked.push({ option, immediateWin, objective, ownScore, oppOneTurnWins })
     undoBoardMove(board, undo)
   }
 
@@ -311,7 +304,7 @@ function widenedTopCellCount(baseTopK: number, maxCount: number, maxBonus: numbe
 function collectWinningTurnLines(board: SearchBoard, player: Player, tuning: BotTuning): Axial[][] {
   if (board.placementsLeft <= 0) return []
 
-  const { candidates: firstOptions } = collectLegalCandidates(board, player, tuning)
+  const firstOptions = collectLegalCandidates(board, player, tuning)
   if (firstOptions.length === 0) return []
 
   const winners: Axial[][] = []
@@ -336,7 +329,7 @@ function collectWinningTurnLines(board: SearchBoard, player: Player, tuning: Bot
       continue
     }
 
-    const { candidates: secondOptions } = collectLegalCandidates(board, player, tuning)
+    const secondOptions = collectLegalCandidates(board, player, tuning)
     for (const second of secondOptions) {
       const key = canonicalLineKey([first, second])
       if (seen.has(key)) continue
@@ -384,7 +377,7 @@ function enumerateTurnCandidates(
 
   const topCellCount = Math.max(1, Math.floor(policy.topCellCount))
   const firstPool = collectLegalCandidates(board, player, tuning, topCellCount)
-  const firstRanked = rankPlacements(board, player, tuning, firstPool.candidates, context)
+  const firstRanked = rankPlacements(board, player, tuning, firstPool, context)
   if (firstRanked.length === 0) {
     context.candidateCache.set(cacheKey, [])
     return []
@@ -411,28 +404,13 @@ function enumerateTurnCandidates(
         ? topCellPlacements.filter((entry) => forcedBlocks.has(toKey(entry.option.q, entry.option.r)))
         : topCellPlacements
     const fallbackPool = singleMovePool.length > 0 ? singleMovePool : topCellPlacements
-    const lines = fallbackPool.map((entry) => {
-      const undo = makeBoardMove(board, entry.option, player)
-      if (!undo) {
-        return {
-          line: [entry.option],
-          objective: Number.NEGATIVE_INFINITY,
-          ownScore: Number.NEGATIVE_INFINITY,
-          immediateWin: false,
-          oppOneTurnWins: Number.POSITIVE_INFINITY,
-        }
-      }
-      const evalResult = evaluateBoardStateTracked(board, tuning, context)
-      const result = {
-        line: [entry.option],
-        objective: objectiveForPlayer(evalResult, player, tuning),
-        ownScore: player === 'X' ? evalResult.xScore : evalResult.oScore,
-        immediateWin: entry.immediateWin,
-        oppOneTurnWins: opponentOneTurnWins(evalResult, player),
-      }
-      undoBoardMove(board, undo)
-      return result
-    })
+    const lines = fallbackPool.map((entry) => ({
+      line: [entry.option],
+      objective: entry.objective,
+      ownScore: entry.ownScore,
+      immediateWin: entry.immediateWin,
+      oppOneTurnWins: entry.oppOneTurnWins,
+    }))
     const pruned = maybeApplyDefensivePruning(lines)
     pruned.sort((a, b) => {
       if (a.immediateWin !== b.immediateWin) return a.immediateWin ? -1 : 1
@@ -455,7 +433,7 @@ function enumerateTurnCandidates(
       if (!firstUndo) continue
 
       const secondPool = collectLegalCandidates(board, player, tuning, topCellCount)
-      const secondRanked = rankPlacements(board, player, tuning, secondPool.candidates, context).slice(0, topCellCount)
+      const secondRanked = rankPlacements(board, player, tuning, secondPool, context).slice(0, topCellCount)
 
       if (secondRanked.length === 0) {
         const evalResult = evaluateBoardStateTracked(board, tuning, context)
@@ -476,17 +454,13 @@ function enumerateTurnCandidates(
         if (seenPairKeys.has(pairKey)) continue
         seenPairKeys.add(pairKey)
 
-        const secondUndo = makeBoardMove(board, second, player)
-        if (!secondUndo) continue
-        const evalResult = evaluateBoardStateTracked(board, tuning, context)
         lines.push({
           line: [first, second],
-          objective: objectiveForPlayer(evalResult, player, tuning),
-          ownScore: player === 'X' ? evalResult.xScore : evalResult.oScore,
-          immediateWin: secondUndo.winner === player,
-          oppOneTurnWins: opponentOneTurnWins(evalResult, player),
+          objective: secondEntry.objective,
+          ownScore: secondEntry.ownScore,
+          immediateWin: secondEntry.immediateWin,
+          oppOneTurnWins: secondEntry.oppOneTurnWins,
         })
-        undoBoardMove(board, secondUndo)
       }
 
       undoBoardMove(board, firstUndo)
@@ -827,12 +801,12 @@ export function inspectBotCandidates(
 
   const policy = rootSearchPolicy(tuning, options)
   const firstPool = collectLegalCandidates(board, board.turn, tuning, Math.max(1, Math.floor(policy.topCellCount)))
-  const ranked = rankPlacements(board, board.turn, tuning, firstPool.candidates, context)
+  const ranked = rankPlacements(board, board.turn, tuning, firstPool, context)
   const topCells = ranked.slice(0, Math.max(1, Math.floor(policy.topCellCount))).map((entry) => entry.option)
   const candidateLines = enumerateTurnCandidates(board, tuning, policy, context)
 
   return {
-    legalCells: firstPool.candidates,
+    legalCells: firstPool,
     topCells,
     candidateLines,
   }

@@ -19,6 +19,7 @@ export type SearchBoard = {
   turn: Player
   placementsLeft: number
   hash: bigint
+  stateKey: string
   activeWindows: Map<string, ActiveWindow>
   xThreats: number[]
   oThreats: number[]
@@ -40,6 +41,7 @@ export type BoardMoveUndo = {
   prevTurn: Player
   prevPlacementsLeft: number
   prevHash: bigint
+  prevStateKey: string
   prevHistoryLength: number
   winner: Player | null
 }
@@ -132,6 +134,27 @@ function windowCellIsOccupied(board: SearchBoard, cellKey: string, changedKey?: 
   return board.moves.has(cellKey)
 }
 
+function windowThreatGroupKey(
+  board: SearchBoard,
+  window: ActiveWindow,
+  changedKey?: string,
+  changedOccupied?: boolean,
+): string {
+  let first = ''
+  let second = ''
+  for (const cellKey of window.cellKeys) {
+    if (windowCellIsOccupied(board, cellKey, changedKey, changedOccupied)) continue
+    if (first.length === 0) {
+      first = cellKey
+      continue
+    }
+    second = cellKey
+    break
+  }
+  if (second.length === 0) return first
+  return first < second ? `${first}|${second}` : `${second}|${first}`
+}
+
 function applyWindowContribution(
   board: SearchBoard,
   window: ActiveWindow,
@@ -151,9 +174,7 @@ function applyWindowContribution(
       }
     }
     if (window.xCount >= 4 && emptyCount <= 2) {
-      const empties = window.cellKeys.filter((cellKey) => !windowCellIsOccupied(board, cellKey, changedKey, changedOccupied))
-      const groupKey = empties.slice().sort().join('|')
-      adjustThreatGroup(board, 'X', groupKey, delta)
+      adjustThreatGroup(board, 'X', windowThreatGroupKey(board, window, changedKey, changedOccupied), delta)
     }
   } else if (window.oCount > 0 && window.xCount === 0) {
     board.oThreats[window.oCount] += delta
@@ -167,9 +188,7 @@ function applyWindowContribution(
       }
     }
     if (window.oCount >= 4 && emptyCount <= 2) {
-      const empties = window.cellKeys.filter((cellKey) => !windowCellIsOccupied(board, cellKey, changedKey, changedOccupied))
-      const groupKey = empties.slice().sort().join('|')
-      adjustThreatGroup(board, 'O', groupKey, delta)
+      adjustThreatGroup(board, 'O', windowThreatGroupKey(board, window, changedKey, changedOccupied), delta)
     }
   }
 }
@@ -223,6 +242,14 @@ function turnStateFromMoveCount(totalMoves: number): { turn: Player; placementsL
   }
 }
 
+function buildBoardStateKey(hash: bigint, turn: Player, placementsLeft: number): string {
+  return `${hash.toString(16)}|${turn}|${placementsLeft}`
+}
+
+function refreshBoardStateKey(board: SearchBoard): void {
+  board.stateKey = buildBoardStateKey(board.hash, board.turn, board.placementsLeft)
+}
+
 function countDirectional(board: SearchBoard, q: number, r: number, dq: number, dr: number, player: Player): number {
   let count = 0
   let cq = q + dq
@@ -253,6 +280,7 @@ export function createSearchBoard(state: LiveLikeState): SearchBoard {
     turn: state.turn,
     placementsLeft: state.placementsLeft,
     hash: 0n,
+    stateKey: '',
     activeWindows: new Map(),
     xThreats: Array<number>(WIN_LENGTH + 1).fill(0),
     oThreats: Array<number>(WIN_LENGTH + 1).fill(0),
@@ -271,6 +299,7 @@ export function createSearchBoard(state: LiveLikeState): SearchBoard {
     board.moves.set(key, mark)
     board.hash ^= pieceHash(q, r, mark)
   }
+  refreshBoardStateKey(board)
   return board
 }
 
@@ -284,7 +313,7 @@ export function boardToLiveState(board: SearchBoard): LiveLikeState {
 }
 
 export function boardStateKey(board: SearchBoard): string {
-  return `${board.hash.toString(16)}|${board.turn}|${board.placementsLeft}`
+  return board.stateKey
 }
 
 export function windowEmptyCount(window: ActiveWindow): number {
@@ -312,6 +341,7 @@ export function makeBoardMove(board: SearchBoard, move: Axial, mark: Player = bo
     prevTurn: board.turn,
     prevPlacementsLeft: board.placementsLeft,
     prevHash: board.hash,
+    prevStateKey: board.stateKey,
     prevHistoryLength: board.moveHistory.length,
     winner: null,
   }
@@ -323,6 +353,7 @@ export function makeBoardMove(board: SearchBoard, move: Axial, mark: Player = bo
 
   if (isWinningPlacement(board, move.q, move.r, mark)) {
     board.placementsLeft = 0
+    refreshBoardStateKey(board)
     undo.winner = mark
     return undo
   }
@@ -333,6 +364,7 @@ export function makeBoardMove(board: SearchBoard, move: Axial, mark: Player = bo
     board.turn = nextTurn.turn
     board.placementsLeft = nextTurn.placementsLeft
   }
+  refreshBoardStateKey(board)
   return undo
 }
 
@@ -341,6 +373,7 @@ export function undoBoardMove(board: SearchBoard, undo: BoardMoveUndo): void {
   board.moves.delete(undo.key)
   board.moveHistory.length = undo.prevHistoryLength
   board.hash = undo.prevHash
+  board.stateKey = undo.prevStateKey
   board.turn = undo.prevTurn
   board.placementsLeft = undo.prevPlacementsLeft
 }

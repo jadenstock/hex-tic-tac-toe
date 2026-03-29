@@ -16,24 +16,50 @@ function pressureDiversity(total: number, entropySum: number, size: number): num
 }
 
 function minimumBlockersRequired(threatGroups: Map<string, number>): number {
-  const groups = [...threatGroups.keys()]
-    .filter((key) => key.length > 0)
-    .map((key) => key.split('|'))
+  const groups: Array<{ first: string; second: string }> = []
+  const uniqueCells: string[] = []
+  const seenCells = new Set<string>()
+
+  for (const groupKey of threatGroups.keys()) {
+    if (groupKey.length === 0) continue
+    const splitIndex = groupKey.indexOf('|')
+    const first = splitIndex < 0 ? groupKey : groupKey.slice(0, splitIndex)
+    const second = splitIndex < 0 ? '' : groupKey.slice(splitIndex + 1)
+    groups.push({ first, second })
+    if (!seenCells.has(first)) {
+      seenCells.add(first)
+      uniqueCells.push(first)
+    }
+    if (second.length > 0 && !seenCells.has(second)) {
+      seenCells.add(second)
+      uniqueCells.push(second)
+    }
+  }
   if (groups.length === 0) return 0
 
-  const uniqueCells = [...new Set(groups.flat())]
-  const coversAll = (blockers: string[]): boolean => {
-    const blockerSet = new Set(blockers)
-    return groups.every((group) => group.some((cell) => blockerSet.has(cell)))
-  }
-
   for (const cell of uniqueCells) {
-    if (coversAll([cell])) return 1
+    let coversAll = true
+    for (const group of groups) {
+      if (group.first !== cell && group.second !== cell) {
+        coversAll = false
+        break
+      }
+    }
+    if (coversAll) return 1
   }
 
   for (let i = 0; i < uniqueCells.length; i += 1) {
+    const first = uniqueCells[i]
     for (let j = i + 1; j < uniqueCells.length; j += 1) {
-      if (coversAll([uniqueCells[i], uniqueCells[j]])) return 2
+      const second = uniqueCells[j]
+      let coversAll = true
+      for (const group of groups) {
+        if (group.first !== first && group.second !== first && group.first !== second && group.second !== second) {
+          coversAll = false
+          break
+        }
+      }
+      if (coversAll) return 2
     }
   }
 
@@ -65,11 +91,9 @@ function pressureMax(pressure: Map<string, number>): number {
   return max
 }
 
-export function evaluateBoardSummary(board: SearchBoard, tuning: BotTuning = DEFAULT_BOT_TUNING): EvaluationSummary {
+function analyzeBoard(board: SearchBoard, tuning: BotTuning) {
   const xOneTurnWins = board.xOneTurnThreatGroupCounts.size
   const oOneTurnWins = board.oOneTurnThreatGroupCounts.size
-  const xWillWinNextTurn = xOneTurnWins > 0
-  const oWillWinNextTurn = oOneTurnWins > 0
   const xDiversity = pressureDiversity(board.xPressureTotal, board.xPressureEntropySum, board.xPressureMap.size)
   const oDiversity = pressureDiversity(board.oPressureTotal, board.oPressureEntropySum, board.oPressureMap.size)
   const xOffense = scoreOffense(board.xThreats, xDiversity, tuning)
@@ -77,18 +101,35 @@ export function evaluateBoardSummary(board: SearchBoard, tuning: BotTuning = DEF
   const xScore = Math.max(0, xOffense, oneTurnThreatScore(board.xOneTurnThreatGroupCounts))
   const oScore = Math.max(0, oOffense, oneTurnThreatScore(board.oOneTurnThreatGroupCounts))
   const total = xScore + oScore
-  const xShare = total > 0 ? xScore / total : 0.5
 
   return {
-    xScore,
-    oScore,
-    xShare,
-    objectiveForX: xScore - oScore,
-    objectiveForO: oScore - xScore,
     xOneTurnWins,
     oOneTurnWins,
-    xWillWinNextTurn,
-    oWillWinNextTurn,
+    xWillWinNextTurn: xOneTurnWins > 0,
+    oWillWinNextTurn: oOneTurnWins > 0,
+    xDiversity,
+    oDiversity,
+    xOffense,
+    oOffense,
+    xScore,
+    oScore,
+    xShare: total > 0 ? xScore / total : 0.5,
+  }
+}
+
+export function evaluateBoardSummary(board: SearchBoard, tuning: BotTuning = DEFAULT_BOT_TUNING): EvaluationSummary {
+  const analysis = analyzeBoard(board, tuning)
+
+  return {
+    xScore: analysis.xScore,
+    oScore: analysis.oScore,
+    xShare: analysis.xShare,
+    objectiveForX: analysis.xScore - analysis.oScore,
+    objectiveForO: analysis.oScore - analysis.xScore,
+    xOneTurnWins: analysis.xOneTurnWins,
+    oOneTurnWins: analysis.oOneTurnWins,
+    xWillWinNextTurn: analysis.xWillWinNextTurn,
+    oWillWinNextTurn: analysis.oWillWinNextTurn,
   }
 }
 
@@ -105,20 +146,24 @@ export function evaluateBoardState(
       })
     : boardOrMoves
 
-  const summary = evaluateBoardSummary(board, tuning)
-  const xDiversity = pressureDiversity(board.xPressureTotal, board.xPressureEntropySum, board.xPressureMap.size)
-  const oDiversity = pressureDiversity(board.oPressureTotal, board.oPressureEntropySum, board.oPressureMap.size)
-  const xOffense = scoreOffense(board.xThreats, xDiversity, tuning)
-  const oOffense = scoreOffense(board.oThreats, oDiversity, tuning)
+  const analysis = analyzeBoard(board, tuning)
 
   return {
-    ...summary,
+    xScore: analysis.xScore,
+    oScore: analysis.oScore,
+    xShare: analysis.xShare,
+    objectiveForX: analysis.xScore - analysis.oScore,
+    objectiveForO: analysis.oScore - analysis.xScore,
+    xOneTurnWins: analysis.xOneTurnWins,
+    oOneTurnWins: analysis.oOneTurnWins,
+    xWillWinNextTurn: analysis.xWillWinNextTurn,
+    oWillWinNextTurn: analysis.oWillWinNextTurn,
     xThreats: [...board.xThreats],
     oThreats: [...board.oThreats],
-    xOffense,
-    oOffense,
-    xDiversity,
-    oDiversity,
+    xOffense: analysis.xOffense,
+    oOffense: analysis.oOffense,
+    xDiversity: analysis.xDiversity,
+    oDiversity: analysis.oDiversity,
     xPressureMap: new Map(board.xPressureMap),
     oPressureMap: new Map(board.oPressureMap),
     xPressureMax: pressureMax(board.xPressureMap),
