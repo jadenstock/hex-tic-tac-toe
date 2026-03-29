@@ -128,6 +128,8 @@ function sortAxials(cells: Axial[]): Axial[] {
 }
 
 const LEAF_OBJECTIVE_GAIN = 3
+const TACTICAL_EXPANSION_THRESHOLD = 6
+const TACTICAL_EXTENSION_DEPTH = 6
 
 function uniqueAxials(cells: Axial[]): Axial[] {
   const seen = new Set<string>()
@@ -157,6 +159,16 @@ function collectOneTurnFinishCells(board: SearchBoard, player: Player): Set<stri
     }
   }
   return finishCells
+}
+
+function hasImmediateThreats(board: SearchBoard): boolean {
+  return collectOneTurnFinishCells(board, 'X').size > 0 || collectOneTurnFinishCells(board, 'O').size > 0
+}
+
+function shouldForceTacticalSearch(board: SearchBoard, candidateCount?: number): boolean {
+  if (!hasImmediateThreats(board)) return false
+  if (candidateCount == null) return true
+  return candidateCount <= TACTICAL_EXPANSION_THRESHOLD
 }
 
 function collectThreatConnectedCandidates(board: SearchBoard, player: Player): Axial[] {
@@ -564,6 +576,61 @@ function evaluateNodeForRoot(board: SearchBoard, winner: Player | null, rootPlay
   return Math.tanh(objective * LEAF_OBJECTIVE_GAIN)
 }
 
+function tacticalValue(
+  board: SearchBoard,
+  winner: Player | null,
+  rootPlayer: Player,
+  tuning: BotTuning,
+  options: BotSearchOptions,
+  context: SearchContext,
+  depthRemaining: number,
+  candidateLines?: Axial[][],
+  alpha = -1,
+  beta = 1,
+): number {
+  if (winner) return winner === rootPlayer ? 1 : -1
+  if (depthRemaining <= 0) return evaluateNodeForRoot(board, null, rootPlayer, tuning, context)
+
+  const lines = candidateLines ?? enumerateTurnCandidates(board, tuning, childSearchPolicy(tuning, options), context)
+  if (lines.length === 0 || !shouldForceTacticalSearch(board, lines.length)) {
+    return evaluateNodeForRoot(board, null, rootPlayer, tuning, context)
+  }
+
+  const maximizing = board.turn === rootPlayer
+  let best = maximizing ? Number.NEGATIVE_INFINITY : Number.POSITIVE_INFINITY
+  let localAlpha = alpha
+  let localBeta = beta
+
+  for (const line of lines) {
+    const applied = applyTurnLineToBoard(board, line)
+    const value = tacticalValue(
+      board,
+      applied.winner,
+      rootPlayer,
+      tuning,
+      options,
+      context,
+      depthRemaining - 1,
+      undefined,
+      localAlpha,
+      localBeta,
+    )
+    undoAppliedTurn(board, applied)
+
+    if (maximizing) {
+      if (value > best) best = value
+      if (best > localAlpha) localAlpha = best
+    } else {
+      if (value < best) best = value
+      if (best < localBeta) localBeta = best
+    }
+
+    if (localAlpha >= localBeta || best === 1 || best === -1) break
+  }
+
+  return best
+}
+
 function selectUctChild(node: SearchNode, explorationC: number): SearchNode {
   const logParent = Math.log(Math.max(1, node.visits))
   let best = node.children[0]
@@ -694,6 +761,20 @@ function rolloutValue(
   context: SearchContext,
 ): number {
   if (nodeWinner) return nodeWinner === rootPlayer ? 1 : -1
+
+  const tacticalLines = enumerateTurnCandidates(board, tuning, childSearchPolicy(tuning, options), context)
+  if (shouldForceTacticalSearch(board, tacticalLines.length)) {
+    return tacticalValue(
+      board,
+      null,
+      rootPlayer,
+      tuning,
+      options,
+      context,
+      TACTICAL_EXTENSION_DEPTH,
+      tacticalLines,
+    )
+  }
 
   const rolloutTuning: BotTuning = {
     ...tuning,
@@ -891,7 +972,9 @@ export function chooseBotTurnDetailed(
     const appliedPath: AppliedBoardTurn[] = []
 
     while (!node.winner) {
-      const widenLimit = progressiveWideningLimit(node, options)
+      const widenLimit = shouldForceTacticalSearch(board, node.candidateActions.length)
+        ? node.candidateActions.length
+        : progressiveWideningLimit(node, options)
       const canExpand = node.nextActionIndex < widenLimit
 
       if (canExpand) {
@@ -1144,7 +1227,9 @@ export async function chooseBotTurnDetailedAsync(
     const appliedPath: AppliedBoardTurn[] = []
 
     while (!node.winner) {
-      const widenLimit = progressiveWideningLimit(node, options)
+      const widenLimit = shouldForceTacticalSearch(board, node.candidateActions.length)
+        ? node.candidateActions.length
+        : progressiveWideningLimit(node, options)
       const canExpand = node.nextActionIndex < widenLimit
 
       if (canExpand) {
