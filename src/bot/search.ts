@@ -68,6 +68,12 @@ export type BotSearchProgress = {
   maxDepthTurns: number
 }
 
+export type BotCandidateSnapshot = {
+  legalCells: Axial[]
+  topCells: Axial[]
+  candidateLines: Axial[][]
+}
+
 type SearchProgressOptions = {
   onProgress?: (progress: BotSearchProgress) => void
   yieldEveryMs?: number
@@ -121,7 +127,7 @@ function sortAxials(cells: Axial[]): Axial[] {
   return cells.sort((a, b) => (a.q !== b.q ? a.q - b.q : a.r - b.r))
 }
 
-const DEFENSIVE_RESPONSE_RADIUS = 1
+const DEFENSIVE_RESPONSE_RADIUS = 2
 const LEAF_OBJECTIVE_GAIN = 3
 
 function uniqueAxials(cells: Axial[]): Axial[] {
@@ -170,21 +176,16 @@ function collectDefensiveResponseCandidateKeys(board: SearchBoard, player: Playe
   const opponent: Player = player === 'X' ? 'O' : 'X'
   const candidates = new Set<string>()
 
-  for (const window of board.activeWindows.values()) {
-    const counts = playerWindowCounts(window, opponent)
-    if (counts.opp > 0 || counts.own < 2) continue
-    const empties = windowEmpties(board, window)
-    for (const emptyKey of empties) {
-      candidates.add(emptyKey)
-      const { q, r } = fromKey(emptyKey)
-      for (let dq = -radius; dq <= radius; dq += 1) {
-        for (let dr = -radius; dr <= radius; dr += 1) {
-          const ds = -dq - dr
-          const distance = Math.max(Math.abs(dq), Math.abs(dr), Math.abs(ds))
-          if (distance > radius) continue
-          const cellKey = toKey(q + dq, r + dr)
-          if (!board.moves.has(cellKey)) candidates.add(cellKey)
-        }
+  for (const [key, mark] of board.moves.entries()) {
+    if (mark !== opponent) continue
+    const { q, r } = fromKey(key)
+    for (let dq = -radius; dq <= radius; dq += 1) {
+      for (let dr = -radius; dr <= radius; dr += 1) {
+        const ds = -dq - dr
+        const distance = Math.max(Math.abs(dq), Math.abs(dr), Math.abs(ds))
+        if (distance > radius) continue
+        const cellKey = toKey(q + dq, r + dr)
+        if (!board.moves.has(cellKey)) candidates.add(cellKey)
       }
     }
   }
@@ -192,7 +193,7 @@ function collectDefensiveResponseCandidateKeys(board: SearchBoard, player: Playe
   return candidates
 }
 
-function collectLegalCandidates(board: SearchBoard, player: Player, tuning: BotTuning): CandidatePool {
+function collectLegalCandidates(board: SearchBoard, player: Player, tuning: BotTuning, targetCount = 0): CandidatePool {
   const opponent: Player = player === 'X' ? 'O' : 'X'
   const ownFinishes = collectOneTurnFinishCells(board, player)
   if (ownFinishes.size > 0) {
@@ -212,15 +213,21 @@ function collectLegalCandidates(board: SearchBoard, player: Player, tuning: BotT
 
   const connected = collectThreatConnectedCandidates(board, player)
   const defensiveKeys = collectDefensiveResponseCandidateKeys(board, player, DEFENSIVE_RESPONSE_RADIUS)
+  const primary = uniqueAxials([...connected, ...sortAxials([...defensiveKeys].map(fromKey))])
   const fallback = sortAxials(candidateCells(board, tuning.candidateRadius))
-  const combined = uniqueAxials([
-    ...connected,
-    ...sortAxials([...defensiveKeys].map(fromKey)),
-    ...fallback,
-  ])
-  if (combined.length > 0) {
+  if (primary.length > 0) {
+    if (primary.length >= targetCount || fallback.length === 0) {
+      return {
+        candidates: primary,
+        priorityKeys: new Set([...forcedBlocks, ...defensiveKeys]),
+      }
+    }
+
+    const primaryKeys = new Set(primary.map((cell) => toKey(cell.q, cell.r)))
+    const needed = Math.max(0, targetCount - primary.length)
+    const fallbackSupplement = fallback.filter((cell) => !primaryKeys.has(toKey(cell.q, cell.r))).slice(0, needed)
     return {
-      candidates: combined,
+      candidates: uniqueAxials([...primary, ...fallbackSupplement]),
       priorityKeys: new Set([...forcedBlocks, ...defensiveKeys]),
     }
   }
@@ -288,6 +295,14 @@ function candidatePolicyKey(policy: CandidateGenerationPolicy, tuning: BotTuning
     tuning.candidateRadius,
     tuning.topKFirstMoves,
   ].join('|')
+}
+
+function widenedTopCellCount(baseTopK: number, maxCount: number, maxBonus: number): number {
+  const cappedMax = Math.max(1, Math.floor(maxCount))
+  const base = Math.max(1, Math.min(cappedMax, Math.floor(baseTopK)))
+  const spare = Math.max(0, cappedMax - base)
+  const bonus = Math.min(maxBonus, Math.ceil(spare / 2))
+  return Math.min(cappedMax, base + bonus)
 }
 
 function collectWinningTurnLines(board: SearchBoard, player: Player, tuning: BotTuning): Axial[][] {
@@ -364,14 +379,13 @@ function enumerateTurnCandidates(
   const baseEval = evaluateBoardStateTracked(board, tuning, context)
   const baselineOppWins = opponentOneTurnWins(baseEval, player)
 
-  const firstPool = collectLegalCandidates(board, player, tuning)
+  const topCellCount = Math.max(1, Math.floor(policy.topCellCount))
+  const firstPool = collectLegalCandidates(board, player, tuning, topCellCount)
   const firstRanked = rankPlacements(board, player, tuning, firstPool.candidates, context)
   if (firstRanked.length === 0) {
     context.candidateCache.set(cacheKey, [])
     return []
   }
-
-  const topCellCount = Math.max(1, Math.floor(policy.topCellCount))
   const topCellPlacements = firstRanked.slice(0, topCellCount)
 
   const baselineOppFinish = collectOneTurnFinishCells(board, player === 'X' ? 'O' : 'X')
@@ -437,7 +451,7 @@ function enumerateTurnCandidates(
       const firstUndo = makeBoardMove(board, first, player)
       if (!firstUndo) continue
 
-      const secondPool = collectLegalCandidates(board, player, tuning)
+      const secondPool = collectLegalCandidates(board, player, tuning, topCellCount)
       const secondRanked = rankPlacements(board, player, tuning, secondPool.candidates, context).slice(0, topCellCount)
 
       if (secondRanked.length === 0) {
@@ -609,19 +623,19 @@ function findWinner(board: SearchBoard): Player | null {
 
 function greedyCandidatePolicy(tuning: BotTuning, candidateCount: number): CandidateGenerationPolicy {
   return {
-    topCellCount: Math.max(1, Math.min(Math.floor(candidateCount), Math.floor(tuning.topKFirstMoves))),
+    topCellCount: widenedTopCellCount(tuning.topKFirstMoves, candidateCount, 3),
   }
 }
 
 function rootSearchPolicy(tuning: BotTuning, options: BotSearchOptions): CandidateGenerationPolicy {
   return {
-    topCellCount: Math.max(1, Math.min(Math.floor(options.turnCandidateCount), Math.floor(tuning.topKFirstMoves))),
+    topCellCount: widenedTopCellCount(tuning.topKFirstMoves, options.turnCandidateCount, 3),
   }
 }
 
 function childSearchPolicy(tuning: BotTuning, options: BotSearchOptions): CandidateGenerationPolicy {
   return {
-    topCellCount: Math.max(1, Math.min(Math.floor(options.childTurnCandidateCount), Math.floor(tuning.topKFirstMoves))),
+    topCellCount: widenedTopCellCount(tuning.topKFirstMoves, options.childTurnCandidateCount, 2),
   }
 }
 
@@ -714,6 +728,42 @@ function rolloutValue(
     undoAppliedTurn(board, rolloutTurns[i])
   }
   return value
+}
+
+export function inspectBotCandidates(
+  state: LiveLikeState,
+  tuning: BotTuning = DEFAULT_BOT_TUNING,
+  partialOptions: Partial<BotSearchOptions> = {},
+): BotCandidateSnapshot {
+  const options: BotSearchOptions = {
+    ...DEFAULT_BOT_SEARCH_OPTIONS,
+    ...partialOptions,
+    budget: {
+      ...DEFAULT_BOT_SEARCH_OPTIONS.budget,
+      ...partialOptions.budget,
+    },
+  }
+  const context = createSearchContext()
+  const board = createSearchBoard(state)
+  if (board.placementsLeft <= 0) {
+    return {
+      legalCells: [],
+      topCells: [],
+      candidateLines: [],
+    }
+  }
+
+  const policy = rootSearchPolicy(tuning, options)
+  const firstPool = collectLegalCandidates(board, board.turn, tuning, Math.max(1, Math.floor(policy.topCellCount)))
+  const ranked = rankPlacements(board, board.turn, tuning, firstPool.candidates, context)
+  const topCells = ranked.slice(0, Math.max(1, Math.floor(policy.topCellCount))).map((entry) => entry.option)
+  const candidateLines = enumerateTurnCandidates(board, tuning, policy, context)
+
+  return {
+    legalCells: firstPool.candidates,
+    topCells,
+    candidateLines,
+  }
 }
 
 function chooseGreedyDecision(state: LiveLikeState, tuning: BotTuning, context: SearchContext): BotTurnDecision {

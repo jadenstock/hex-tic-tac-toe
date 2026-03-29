@@ -11,7 +11,8 @@ export type {
   MoveRecord,
   Player,
 } from './types.ts'
+export type { BotCandidateSnapshot } from './search.ts'
 
 export { DEFAULT_BOT_SEARCH_OPTIONS, DEFAULT_BOT_TUNING, WIN_DIRECTIONS, WIN_LENGTH } from './types.ts'
 export { evaluateBoardState } from './evaluation.ts'
-export { chooseBotTurn, chooseBotTurnDetailed, chooseBotTurnDetailedAsync, chooseGreedyTurn } from './search.ts'
+export { chooseBotTurn, chooseBotTurnDetailed, chooseBotTurnDetailedAsync, chooseGreedyTurn, inspectBotCandidates } from './search.ts'

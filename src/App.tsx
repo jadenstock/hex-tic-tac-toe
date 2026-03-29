@@ -6,6 +6,8 @@ import {
   chooseBotTurnDetailedAsync,
   chooseBotTurnDetailed,
   evaluateBoardState,
+  inspectBotCandidates,
+  type BotCandidateSnapshot,
   type BotSearchStats,
   type BotSearchOptions,
   type BotTuning,
@@ -1056,6 +1058,7 @@ function App() {
   const [hideDeadHexes, setHideDeadHexes] = useState(false)
   const [showThreatHighlights, setShowThreatHighlights] = useState(false)
   const [showPressureMap, setShowPressureMap] = useState(false)
+  const [showBotCandidateCells, setShowBotCandidateCells] = useState(false)
   const [autoBotEnabled, setAutoBotEnabled] = useState(false)
   const [autoBotSide, setAutoBotSide] = useState<'X' | 'O' | 'both'>('both')
   const [botThinkSeconds, setBotThinkSeconds] = useState(2)
@@ -1337,6 +1340,29 @@ function App() {
       simulationTopKFirstMoves: Math.max(1, Math.min(4, 1 + Math.floor(normalized * 3))),
     }
   }, [botThinkSeconds])
+  const botCandidateSnapshot = useMemo<BotCandidateSnapshot | null>(() => {
+    if (displayState.winner) return null
+    return inspectBotCandidates(
+      {
+        moves: displayState.moves,
+        moveHistory: displayState.moveHistory,
+        turn: displayState.turn,
+        placementsLeft: displayState.placementsLeft,
+      },
+      botTuning,
+      botSearchOptions,
+    )
+  }, [botSearchOptions, botTuning, displayState.moveHistory, displayState.moves, displayState.placementsLeft, displayState.turn, displayState.winner])
+  const botLegalCandidateKeys = useMemo(() => {
+    const keys = new Set<string>()
+    for (const cell of botCandidateSnapshot?.legalCells ?? []) keys.add(toKey(cell.q, cell.r))
+    return keys
+  }, [botCandidateSnapshot])
+  const botTopCandidateKeys = useMemo(() => {
+    const keys = new Set<string>()
+    for (const cell of botCandidateSnapshot?.topCells ?? []) keys.add(toKey(cell.q, cell.r))
+    return keys
+  }, [botCandidateSnapshot])
 
   const liveStatus = useMemo(() => {
     if (replayRecord) {
@@ -1896,6 +1922,23 @@ function App() {
 
         ctx.fillStyle = deadCell ? theme.deadHexFill : fillGrid
         ctx.fill()
+        if (showBotCandidateCells && !occupied) {
+          const isLegalCandidate = botLegalCandidateKeys.has(key)
+          const isTopCandidate = botTopCandidateKeys.has(key)
+          if (isLegalCandidate || isTopCandidate) {
+            ctx.save()
+            ctx.globalAlpha = isTopCandidate ? 0.22 : 0.1
+            ctx.fillStyle = displayState.turn === 'X' ? theme.xFill : theme.oFill
+            ctx.fill()
+            if (isTopCandidate) {
+              ctx.globalAlpha = 1
+              ctx.strokeStyle = displayState.turn === 'X' ? theme.xColor : theme.oColor
+              ctx.lineWidth = 2
+              ctx.stroke()
+            }
+            ctx.restore()
+          }
+        }
         if (showPressureMap && !occupied) {
           const xPressure = liveEvaluation.xPressureMap.get(key) ?? 0
           const oPressure = liveEvaluation.oPressureMap.get(key) ?? 0
@@ -2184,9 +2227,12 @@ function App() {
     size.height,
     size.width,
     highlightedKeys,
+    botLegalCandidateKeys,
+    botTopCandidateKeys,
     hideDeadHexes,
     moveNumberByKey,
     pieceStyle,
+    showBotCandidateCells,
     showMoveNumbers,
     showPressureMap,
     showThreatHighlights,
@@ -2924,6 +2970,14 @@ function App() {
                           onChange={(event) => setShowPressureMap(event.target.checked)}
                         />
                       </label>
+                      <label className="play-as">
+                        Show bot candidates
+                        <input
+                          type="checkbox"
+                          checked={showBotCandidateCells}
+                          onChange={(event) => setShowBotCandidateCells(event.target.checked)}
+                        />
+                      </label>
                       <div className="auto-bot-group" role="group" aria-label="Color palette options">
                         <button
                           type="button"
@@ -2982,6 +3036,11 @@ function App() {
                           Arena
                         </button>
                       </div>
+                      {showBotCandidateCells ? (
+                        <div className="drag-readout">
+                          {`Bot candidates: ${botLegalCandidateKeys.size} legal, ${botTopCandidateKeys.size} top-K`}
+                        </div>
+                      ) : null}
                       {hoverTrainingLabel ? <div className="drag-readout">{hoverTrainingLabel}</div> : null}
                     </div>
                   </section>
