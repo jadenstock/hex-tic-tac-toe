@@ -127,7 +127,6 @@ function sortAxials(cells: Axial[]): Axial[] {
   return cells.sort((a, b) => (a.q !== b.q ? a.q - b.q : a.r - b.r))
 }
 
-const DEFENSIVE_RESPONSE_RADIUS = 2
 const LEAF_OBJECTIVE_GAIN = 3
 
 function uniqueAxials(cells: Axial[]): Axial[] {
@@ -172,22 +171,14 @@ function collectThreatConnectedCandidates(board: SearchBoard, player: Player): A
   return sortAxials([...candidates].map(fromKey))
 }
 
-function collectDefensiveResponseCandidateKeys(board: SearchBoard, player: Player, radius: number): Set<string> {
+function collectDefensiveResponseCandidateKeys(board: SearchBoard, player: Player): Set<string> {
   const opponent: Player = player === 'X' ? 'O' : 'X'
   const candidates = new Set<string>()
 
-  for (const [key, mark] of board.moves.entries()) {
-    if (mark !== opponent) continue
-    const { q, r } = fromKey(key)
-    for (let dq = -radius; dq <= radius; dq += 1) {
-      for (let dr = -radius; dr <= radius; dr += 1) {
-        const ds = -dq - dr
-        const distance = Math.max(Math.abs(dq), Math.abs(dr), Math.abs(ds))
-        if (distance > radius) continue
-        const cellKey = toKey(q + dq, r + dr)
-        if (!board.moves.has(cellKey)) candidates.add(cellKey)
-      }
-    }
+  for (const window of board.activeWindows.values()) {
+    const counts = playerWindowCounts(window, opponent)
+    if (counts.opp > 0 || counts.own <= 0) continue
+    for (const emptyKey of windowEmpties(board, window)) candidates.add(emptyKey)
   }
 
   return candidates
@@ -212,7 +203,7 @@ function collectLegalCandidates(board: SearchBoard, player: Player, tuning: BotT
   }
 
   const connected = collectThreatConnectedCandidates(board, player)
-  const defensiveKeys = collectDefensiveResponseCandidateKeys(board, player, DEFENSIVE_RESPONSE_RADIUS)
+  const defensiveKeys = collectDefensiveResponseCandidateKeys(board, player)
   const primary = uniqueAxials([...connected, ...sortAxials([...defensiveKeys].map(fromKey))])
   const fallback = sortAxials(candidateCells(board, tuning.candidateRadius))
   if (primary.length > 0) {

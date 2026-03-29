@@ -103,8 +103,8 @@ export type BotTurnDecision = {
 
 export const DEFAULT_BOT_TUNING: BotTuning = {
   threatWeights: [0, 0, 6, 36, 860, 860, 20000],
-  defenseWeight: 1.2,
-  threatDiversityBlend: 0.5,
+  defenseWeight: 1,
+  threatDiversityBlend: 0.25,
   threatSeverityScale: 1200,
   immediateDangerPenalty: 150000,
   oneTurnWinBonus: 3500,
@@ -115,7 +115,7 @@ export const DEFAULT_BOT_TUNING: BotTuning = {
   threat4ForkBonus: 17400,
   threat5ForkBonus: 15000,
   candidateRadius: 4,
-  topKFirstMoves: 5,
+  topKFirstMoves: 12,
 }
 
 export const DEFAULT_BOT_SEARCH_OPTIONS: BotSearchOptions = {
