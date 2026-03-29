@@ -41,11 +41,7 @@ type RankedPlacement = {
 }
 
 type CandidateGenerationPolicy = {
-  maxCandidates: number
-  firstMoveBeam: number
-  secondMoveBeam: number
-  firstExplorationSamples: number
-  secondExplorationSamples: number
+  topCellCount: number
 }
 
 type CandidatePool = {
@@ -125,79 +121,8 @@ function sortAxials(cells: Axial[]): Axial[] {
   return cells.sort((a, b) => (a.q !== b.q ? a.q - b.q : a.r - b.r))
 }
 
-function hashString(input: string): number {
-  let hash = 2166136261
-  for (let i = 0; i < input.length; i += 1) {
-    hash ^= input.charCodeAt(i)
-    hash = Math.imul(hash, 16777619)
-  }
-  return hash >>> 0
-}
-
-const ADJACENT_DIRECTIONS: Array<[number, number]> = [
-  [1, 0],
-  [0, 1],
-  [-1, 1],
-  [-1, 0],
-  [0, -1],
-  [1, -1],
-]
-
 const DEFENSIVE_RESPONSE_RADIUS = 1
 const LEAF_OBJECTIVE_GAIN = 3
-
-function localConnectivityScore(board: SearchBoard, player: Player, cell: Axial): number {
-  let friendly = 0
-  let occupied = 0
-  const opponent: Player = player === 'X' ? 'O' : 'X'
-
-  for (const [dq, dr] of ADJACENT_DIRECTIONS) {
-    const mark = board.moves.get(toKey(cell.q + dq, cell.r + dr))
-    if (!mark) continue
-    occupied += 1
-    if (mark === player) friendly += 1
-    if (mark === opponent) occupied += 0.5
-  }
-
-  return friendly * 3 + occupied
-}
-
-function trimCandidatesForRanking(
-  board: SearchBoard,
-  candidates: Axial[],
-  player: Player,
-  maxCount: number,
-  priorityKeys: Set<string> = new Set(),
-): Axial[] {
-  if (candidates.length <= maxCount) return candidates
-  const scored = candidates.map((cell) => ({
-    cell,
-    score: localConnectivityScore(board, player, cell),
-  }))
-  scored.sort((a, b) => {
-    const aPriority = priorityKeys.has(toKey(a.cell.q, a.cell.r))
-    const bPriority = priorityKeys.has(toKey(b.cell.q, b.cell.r))
-    if (aPriority !== bPriority) return aPriority ? -1 : 1
-    if (a.score !== b.score) return b.score - a.score
-    if (a.cell.q !== b.cell.q) return a.cell.q - b.cell.q
-    return a.cell.r - b.cell.r
-  })
-  return scored.slice(0, maxCount).map((entry) => entry.cell)
-}
-
-function pickDeterministicSample(cells: Axial[], count: number, seed: string): Axial[] {
-  if (count <= 0 || cells.length === 0) return []
-  const scored = cells.map((cell) => ({
-    cell,
-    score: hashString(`${seed}|${toKey(cell.q, cell.r)}`),
-  }))
-  scored.sort((a, b) => {
-    if (a.score !== b.score) return a.score - b.score
-    if (a.cell.q !== b.cell.q) return a.cell.q - b.cell.q
-    return a.cell.r - b.cell.r
-  })
-  return scored.slice(0, count).map((entry) => entry.cell)
-}
 
 function uniqueAxials(cells: Axial[]): Axial[] {
   const seen = new Set<string>()
@@ -209,25 +134,6 @@ function uniqueAxials(cells: Axial[]): Axial[] {
     unique.push(cell)
   }
   return unique
-}
-
-function addExplorationCandidates(
-  primary: Axial[],
-  fallbackPool: Axial[],
-  board: SearchBoard,
-  player: Player,
-  sampleCount: number,
-  seed: string,
-): Axial[] {
-  if (sampleCount <= 0) return primary
-  const present = new Set(primary.map((cell) => toKey(cell.q, cell.r)))
-  const unexplored = fallbackPool.filter((cell) => !present.has(toKey(cell.q, cell.r)))
-  if (unexplored.length === 0) return primary
-
-  const sparse = unexplored.filter((cell) => localConnectivityScore(board, player, cell) <= 2)
-  const source = sparse.length > 0 ? sparse : unexplored
-  const sampled = pickDeterministicSample(source, sampleCount, seed)
-  return uniqueAxials([...primary, ...sampled])
 }
 
 function playerWindowCounts(window: ActiveWindow, player: Player): { own: number; opp: number } {
@@ -306,17 +212,22 @@ function collectLegalCandidates(board: SearchBoard, player: Player, tuning: BotT
 
   const connected = collectThreatConnectedCandidates(board, player)
   const defensiveKeys = collectDefensiveResponseCandidateKeys(board, player, DEFENSIVE_RESPONSE_RADIUS)
-  const combined = uniqueAxials([...connected, ...sortAxials([...defensiveKeys].map(fromKey))])
+  const fallback = sortAxials(candidateCells(board, tuning.candidateRadius))
+  const combined = uniqueAxials([
+    ...connected,
+    ...sortAxials([...defensiveKeys].map(fromKey)),
+    ...fallback,
+  ])
   if (combined.length > 0) {
     return {
       candidates: combined,
-      priorityKeys: defensiveKeys,
+      priorityKeys: new Set([...forcedBlocks, ...defensiveKeys]),
     }
   }
 
   return {
-    candidates: sortAxials(candidateCells(board, tuning.candidateRadius)),
-    priorityKeys: defensiveKeys,
+    candidates: fallback,
+    priorityKeys: new Set([...forcedBlocks, ...defensiveKeys]),
   }
 }
 
@@ -373,11 +284,7 @@ function cloneCandidateLines(lines: Axial[][]): Axial[][] {
 
 function candidatePolicyKey(policy: CandidateGenerationPolicy, tuning: BotTuning): string {
   return [
-    policy.maxCandidates,
-    policy.firstMoveBeam,
-    policy.secondMoveBeam,
-    policy.firstExplorationSamples,
-    policy.secondExplorationSamples,
+    policy.topCellCount,
     tuning.candidateRadius,
     tuning.topKFirstMoves,
   ].join('|')
@@ -450,36 +357,22 @@ function enumerateTurnCandidates(
 
   const winningLines = collectWinningTurnLines(board, player, tuning)
   if (winningLines.length > 0) {
-    const winners = winningLines.slice(0, policy.maxCandidates)
-    context.candidateCache.set(cacheKey, cloneCandidateLines(winners))
-    return winners
+    context.candidateCache.set(cacheKey, cloneCandidateLines(winningLines))
+    return winningLines
   }
 
   const baseEval = evaluateBoardStateTracked(board, tuning, context)
   const baselineOppWins = opponentOneTurnWins(baseEval, player)
-  const ownFinishNow = collectOneTurnFinishCells(board, player)
-  const tacticalMode = ownFinishNow.size > 0 || baselineOppWins > 0
 
   const firstPool = collectLegalCandidates(board, player, tuning)
-  const firstOptions = firstPool.candidates
-  const cappedFirstPoolSize = tacticalMode
-    ? Math.max(policy.maxCandidates, policy.firstMoveBeam * 2)
-    : policy.firstMoveBeam
-  const trimmedFirstOptions = tacticalMode
-    ? trimCandidatesForRanking(board, firstOptions, player, cappedFirstPoolSize, firstPool.priorityKeys)
-    : addExplorationCandidates(
-        trimCandidatesForRanking(board, firstOptions, player, Math.max(1, policy.firstMoveBeam), firstPool.priorityKeys),
-        candidateCells(board, tuning.candidateRadius),
-        board,
-        player,
-        policy.firstExplorationSamples,
-        `first|${board.moveHistory.length}|${player}|${policy.maxCandidates}`,
-      )
-  const firstRanked = rankPlacements(board, player, tuning, trimmedFirstOptions, context)
+  const firstRanked = rankPlacements(board, player, tuning, firstPool.candidates, context)
   if (firstRanked.length === 0) {
     context.candidateCache.set(cacheKey, [])
     return []
   }
+
+  const topCellCount = Math.max(1, Math.floor(policy.topCellCount))
+  const topCellPlacements = firstRanked.slice(0, topCellCount)
 
   const baselineOppFinish = collectOneTurnFinishCells(board, player === 'X' ? 'O' : 'X')
   const maybeApplyDefensivePruning = (
@@ -498,9 +391,10 @@ function enumerateTurnCandidates(
     const forcedBlocks = baselineOppFinish
     const singleMovePool =
       forcedBlocks.size > 0
-        ? firstRanked.filter((entry) => forcedBlocks.has(toKey(entry.option.q, entry.option.r)))
-        : firstRanked
-    const lines = singleMovePool.slice(0, policy.maxCandidates).map((entry) => {
+        ? topCellPlacements.filter((entry) => forcedBlocks.has(toKey(entry.option.q, entry.option.r)))
+        : topCellPlacements
+    const fallbackPool = singleMovePool.length > 0 ? singleMovePool : topCellPlacements
+    const lines = fallbackPool.map((entry) => {
       const undo = makeBoardMove(board, entry.option, player)
       if (!undo) {
         return {
@@ -533,63 +427,96 @@ function enumerateTurnCandidates(
     return picks
   }
 
-  const firstCandidates = firstRanked.slice(0, Math.max(1, policy.firstMoveBeam))
   const lines: Array<{ line: Axial[]; objective: number; ownScore: number; immediateWin: boolean; oppOneTurnWins: number }> = []
   const seenPairKeys = new Set<string>()
+  const topCells = topCellPlacements.map((entry) => entry.option)
 
-  for (const first of firstCandidates) {
-    const firstUndo = makeBoardMove(board, first.option, player)
-    if (!firstUndo) continue
+  if (baselineOppFinish.size > 0) {
+    for (const firstEntry of topCellPlacements) {
+      const first = firstEntry.option
+      const firstUndo = makeBoardMove(board, first, player)
+      if (!firstUndo) continue
 
-    const secondPool = collectLegalCandidates(board, player, tuning)
-    const secondOptions = secondPool.candidates
-    const trimmedSecondOptions = tacticalMode
-      ? trimCandidatesForRanking(board, secondOptions, player, Math.max(1, policy.secondMoveBeam), secondPool.priorityKeys)
-      : addExplorationCandidates(
-          trimCandidatesForRanking(board, secondOptions, player, Math.max(1, policy.secondMoveBeam), secondPool.priorityKeys),
-          candidateCells(board, tuning.candidateRadius),
-          board,
-          player,
-          policy.secondExplorationSamples,
-          `second|${board.moveHistory.length}|${player}|${toKey(first.option.q, first.option.r)}`,
-        )
-    const secondRanked = rankPlacements(board, player, tuning, trimmedSecondOptions, context).slice(0, Math.max(1, policy.secondMoveBeam))
+      const secondPool = collectLegalCandidates(board, player, tuning)
+      const secondRanked = rankPlacements(board, player, tuning, secondPool.candidates, context).slice(0, topCellCount)
 
-    if (secondRanked.length === 0) {
-      const evalResult = evaluateBoardStateTracked(board, tuning, context)
-      lines.push({
-        line: [first.option],
-        objective: objectiveForPlayer(evalResult, player, tuning),
-        ownScore: player === 'X' ? evalResult.xScore : evalResult.oScore,
-        immediateWin: first.immediateWin,
-        oppOneTurnWins: opponentOneTurnWins(evalResult, player),
-      })
+      if (secondRanked.length === 0) {
+        const evalResult = evaluateBoardStateTracked(board, tuning, context)
+        lines.push({
+          line: [first],
+          objective: objectiveForPlayer(evalResult, player, tuning),
+          ownScore: player === 'X' ? evalResult.xScore : evalResult.oScore,
+          immediateWin: firstUndo.winner === player,
+          oppOneTurnWins: opponentOneTurnWins(evalResult, player),
+        })
+        undoBoardMove(board, firstUndo)
+        continue
+      }
+
+      for (const secondEntry of secondRanked) {
+        const second = secondEntry.option
+        const pairKey = canonicalLineKey([first, second])
+        if (seenPairKeys.has(pairKey)) continue
+        seenPairKeys.add(pairKey)
+
+        const secondUndo = makeBoardMove(board, second, player)
+        if (!secondUndo) continue
+        const evalResult = evaluateBoardStateTracked(board, tuning, context)
+        lines.push({
+          line: [first, second],
+          objective: objectiveForPlayer(evalResult, player, tuning),
+          ownScore: player === 'X' ? evalResult.xScore : evalResult.oScore,
+          immediateWin: secondUndo.winner === player,
+          oppOneTurnWins: opponentOneTurnWins(evalResult, player),
+        })
+        undoBoardMove(board, secondUndo)
+      }
+
       undoBoardMove(board, firstUndo)
-      continue
     }
 
-    for (const second of secondRanked) {
-      const pairKey = canonicalLineKey([first.option, second.option])
+    const pruned = maybeApplyDefensivePruning(lines)
+    pruned.sort((a, b) => {
+      if (a.immediateWin !== b.immediateWin) return a.immediateWin ? -1 : 1
+      if (a.objective !== b.objective) return b.objective - a.objective
+      return b.ownScore - a.ownScore
+    })
+    const picks = pruned.map((entry) => entry.line)
+    context.candidateCache.set(cacheKey, cloneCandidateLines(picks))
+    return picks
+  }
+
+  for (let firstIdx = 0; firstIdx < topCells.length; firstIdx += 1) {
+    for (let secondIdx = firstIdx + 1; secondIdx < topCells.length; secondIdx += 1) {
+      const first = topCells[firstIdx]
+      const second = topCells[secondIdx]
+      const pairKey = canonicalLineKey([first, second])
       if (seenPairKeys.has(pairKey)) continue
       seenPairKeys.add(pairKey)
-      const secondUndo = makeBoardMove(board, second.option, player)
-      if (!secondUndo) continue
+
+      const firstUndo = makeBoardMove(board, first, player)
+      if (!firstUndo) continue
+      const secondUndo = makeBoardMove(board, second, player)
+      if (!secondUndo) {
+        undoBoardMove(board, firstUndo)
+        continue
+      }
+
       const evalResult = evaluateBoardStateTracked(board, tuning, context)
       lines.push({
-        line: [first.option, second.option],
+        line: [first, second],
         objective: objectiveForPlayer(evalResult, player, tuning),
         ownScore: player === 'X' ? evalResult.xScore : evalResult.oScore,
-        immediateWin: second.immediateWin,
+        immediateWin: secondUndo.winner === player,
         oppOneTurnWins: opponentOneTurnWins(evalResult, player),
       })
       undoBoardMove(board, secondUndo)
+      undoBoardMove(board, firstUndo)
     }
-
-    undoBoardMove(board, firstUndo)
   }
 
   if (lines.length === 0) {
-    const fallback = [[firstCandidates[0].option]]
+    const fallback = topCells.length > 0 ? [[topCells[0]]] : []
     context.candidateCache.set(cacheKey, cloneCandidateLines(fallback))
     return fallback
   }
@@ -608,7 +535,6 @@ function enumerateTurnCandidates(
     if (unique.has(key)) continue
     unique.add(key)
     picks.push(candidate.line)
-    if (picks.length >= policy.maxCandidates) break
   }
 
   context.candidateCache.set(cacheKey, cloneCandidateLines(picks))
@@ -682,50 +608,26 @@ function findWinner(board: SearchBoard): Player | null {
 }
 
 function greedyCandidatePolicy(tuning: BotTuning, candidateCount: number): CandidateGenerationPolicy {
-  const maxCandidates = Math.max(1, Math.floor(candidateCount))
-  const firstMoveBeam = Math.max(1, Math.min(maxCandidates, Math.floor(tuning.topKFirstMoves)))
   return {
-    maxCandidates,
-    firstMoveBeam,
-    secondMoveBeam: Math.max(1, Math.min(maxCandidates, firstMoveBeam * 3)),
-    firstExplorationSamples: 2,
-    secondExplorationSamples: 1,
+    topCellCount: Math.max(1, Math.min(Math.floor(candidateCount), Math.floor(tuning.topKFirstMoves))),
   }
 }
 
 function rootSearchPolicy(tuning: BotTuning, options: BotSearchOptions): CandidateGenerationPolicy {
-  const maxCandidates = Math.max(1, Math.floor(options.turnCandidateCount))
-  const firstMoveBeam = Math.max(1, Math.min(maxCandidates, Math.floor(tuning.topKFirstMoves)))
   return {
-    maxCandidates,
-    firstMoveBeam,
-    secondMoveBeam: Math.max(1, Math.min(maxCandidates, firstMoveBeam * 2)),
-    firstExplorationSamples: 2,
-    secondExplorationSamples: 1,
+    topCellCount: Math.max(1, Math.min(Math.floor(options.turnCandidateCount), Math.floor(tuning.topKFirstMoves))),
   }
 }
 
 function childSearchPolicy(tuning: BotTuning, options: BotSearchOptions): CandidateGenerationPolicy {
-  const maxCandidates = Math.max(1, Math.floor(options.childTurnCandidateCount))
-  const firstMoveBeam = Math.max(1, Math.min(maxCandidates, Math.floor(tuning.topKFirstMoves)))
   return {
-    maxCandidates,
-    firstMoveBeam,
-    secondMoveBeam: Math.max(1, Math.min(maxCandidates, firstMoveBeam * 2)),
-    firstExplorationSamples: 1,
-    secondExplorationSamples: 1,
+    topCellCount: Math.max(1, Math.min(Math.floor(options.childTurnCandidateCount), Math.floor(tuning.topKFirstMoves))),
   }
 }
 
 function rolloutSearchPolicy(options: BotSearchOptions): CandidateGenerationPolicy {
-  const maxCandidates = Math.max(1, Math.floor(options.simulationTurnCandidateCount))
-  const firstMoveBeam = Math.max(1, Math.min(maxCandidates, Math.floor(options.simulationTopKFirstMoves)))
   return {
-    maxCandidates,
-    firstMoveBeam,
-    secondMoveBeam: Math.max(1, Math.min(maxCandidates, firstMoveBeam * 2)),
-    firstExplorationSamples: 0,
-    secondExplorationSamples: 0,
+    topCellCount: Math.max(1, Math.min(Math.floor(options.simulationTurnCandidateCount), Math.floor(options.simulationTopKFirstMoves))),
   }
 }
 

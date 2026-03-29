@@ -24,6 +24,7 @@ npm run dev
 ```
 
 If using multiplayer locally, create `.env` from `.env.example` and set `VITE_WS_URL`.
+If you want replay loading and "Save snapshot" to work locally against the deployed archive API, also set `VITE_API_URL` to the stack output `TrackedGamesApiUrl`. In dev, Vite will proxy `/api` to that URL.
 
 ## AWS stack (minimal prototype)
 

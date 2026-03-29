@@ -1086,7 +1086,9 @@ function App() {
   const lastDarkPaletteRef = useRef<PaletteId>(isDarkPalette(paletteId) ? paletteId : 'midnight')
 
   const wsUrl = import.meta.env.VITE_WS_URL as string | undefined
-  const apiBaseUrl = (import.meta.env.VITE_API_URL as string | undefined) ?? '/api'
+  const apiBaseUrl = import.meta.env.DEV
+    ? '/api'
+    : ((import.meta.env.VITE_API_URL as string | undefined) ?? '/api')
   const replayGameId = typeof window === 'undefined' ? null : parseReplayGameId(window.location.pathname)
   const isReplayMode = replayGameId !== null
 
