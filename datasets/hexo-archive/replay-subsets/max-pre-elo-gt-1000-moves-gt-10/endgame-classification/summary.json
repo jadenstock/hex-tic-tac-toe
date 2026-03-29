@@ -1,0 +1,12 @@
+{
+  "totalGames": 237,
+  "forced": 37,
+  "blunder": 194,
+  "other": 6,
+  "byResultReason": {
+    "surrender": 23,
+    "timeout": 9,
+    "six-in-a-row": 203,
+    "disconnect": 2
+  }
+}

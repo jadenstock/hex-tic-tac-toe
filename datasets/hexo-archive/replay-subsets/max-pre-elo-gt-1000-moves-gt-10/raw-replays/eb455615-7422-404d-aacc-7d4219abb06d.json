@@ -1,0 +1,236 @@
+{
+  "id": "eb455615-7422-404d-aacc-7d4219abb06d",
+  "sessionId": "r911kb",
+  "startedAt": 1774818669446,
+  "finishedAt": 1774818826117,
+  "players": [
+    {
+      "playerId": "o2dz9d",
+      "displayName": "pain6905",
+      "profileId": "69c82e35ce17850d91a6e279",
+      "elo": 1106,
+      "eloChange": -10
+    },
+    {
+      "playerId": "89dvdx",
+      "displayName": "krapou.",
+      "profileId": "69c69f24e8e0723d8d8965b1",
+      "elo": 974,
+      "eloChange": 20
+    }
+  ],
+  "playerTiles": {
+    "o2dz9d": {
+      "color": "#fbbf24"
+    },
+    "89dvdx": {
+      "color": "#38bdf8"
+    }
+  },
+  "gameOptions": {
+    "visibility": "public",
+    "timeControl": {
+      "mode": "match",
+      "mainTimeMs": 300000,
+      "incrementMs": 10000
+    },
+    "rated": true
+  },
+  "moveCount": 27,
+  "gameResult": {
+    "winningPlayerId": "89dvdx",
+    "durationMs": 156651,
+    "reason": "six-in-a-row"
+  },
+  "moves": [
+    {
+      "moveNumber": 2,
+      "playerId": "o2dz9d",
+      "x": 0,
+      "y": 0,
+      "timestamp": 1774818671837
+    },
+    {
+      "moveNumber": 3,
+      "playerId": "89dvdx",
+      "x": 2,
+      "y": 0,
+      "timestamp": 1774818674973
+    },
+    {
+      "moveNumber": 4,
+      "playerId": "89dvdx",
+      "x": 2,
+      "y": -2,
+      "timestamp": 1774818677157
+    },
+    {
+      "moveNumber": 5,
+      "playerId": "o2dz9d",
+      "x": 2,
+      "y": -1,
+      "timestamp": 1774818681311
+    },
+    {
+      "moveNumber": 6,
+      "playerId": "o2dz9d",
+      "x": 1,
+      "y": 0,
+      "timestamp": 1774818686090
+    },
+    {
+      "moveNumber": 7,
+      "playerId": "89dvdx",
+      "x": 4,
+      "y": -3,
+      "timestamp": 1774818707528
+    },
+    {
+      "moveNumber": 8,
+      "playerId": "89dvdx",
+      "x": 4,
+      "y": -2,
+      "timestamp": 1774818711146
+    },
+    {
+      "moveNumber": 9,
+      "playerId": "o2dz9d",
+      "x": 3,
+      "y": -1,
+      "timestamp": 1774818719135
+    },
+    {
+      "moveNumber": 10,
+      "playerId": "o2dz9d",
+      "x": 4,
+      "y": -1,
+      "timestamp": 1774818719496
+    },
+    {
+      "moveNumber": 11,
+      "playerId": "89dvdx",
+      "x": 1,
+      "y": -1,
+      "timestamp": 1774818729926
+    },
+    {
+      "moveNumber": 12,
+      "playerId": "89dvdx",
+      "x": 3,
+      "y": -3,
+      "timestamp": 1774818733720
+    },
+    {
+      "moveNumber": 13,
+      "playerId": "o2dz9d",
+      "x": 4,
+      "y": -4,
+      "timestamp": 1774818736006
+    },
+    {
+      "moveNumber": 14,
+      "playerId": "o2dz9d",
+      "x": -2,
+      "y": 6,
+      "timestamp": 1774818746008
+    },
+    {
+      "moveNumber": 15,
+      "playerId": "89dvdx",
+      "x": 2,
+      "y": -3,
+      "timestamp": 1774818758530
+    },
+    {
+      "moveNumber": 16,
+      "playerId": "89dvdx",
+      "x": 3,
+      "y": -4,
+      "timestamp": 1774818766354
+    },
+    {
+      "moveNumber": 17,
+      "playerId": "o2dz9d",
+      "x": 1,
+      "y": -3,
+      "timestamp": 1774818772190
+    },
+    {
+      "moveNumber": 18,
+      "playerId": "o2dz9d",
+      "x": 3,
+      "y": -5,
+      "timestamp": 1774818777206
+    },
+    {
+      "moveNumber": 19,
+      "playerId": "89dvdx",
+      "x": 1,
+      "y": -2,
+      "timestamp": 1774818793815
+    },
+    {
+      "moveNumber": 20,
+      "playerId": "89dvdx",
+      "x": 4,
+      "y": -5,
+      "timestamp": 1774818794719
+    },
+    {
+      "moveNumber": 21,
+      "playerId": "o2dz9d",
+      "x": 5,
+      "y": -6,
+      "timestamp": 1774818796386
+    },
+    {
+      "moveNumber": 22,
+      "playerId": "o2dz9d",
+      "x": 0,
+      "y": -1,
+      "timestamp": 1774818798870
+    },
+    {
+      "moveNumber": 23,
+      "playerId": "89dvdx",
+      "x": 3,
+      "y": -2,
+      "timestamp": 1774818806615
+    },
+    {
+      "moveNumber": 24,
+      "playerId": "89dvdx",
+      "x": 5,
+      "y": -3,
+      "timestamp": 1774818807095
+    },
+    {
+      "moveNumber": 25,
+      "playerId": "o2dz9d",
+      "x": 0,
+      "y": -2,
+      "timestamp": 1774818823060
+    },
+    {
+      "moveNumber": 26,
+      "playerId": "o2dz9d",
+      "x": 5,
+      "y": -2,
+      "timestamp": 1774818824014
+    },
+    {
+      "moveNumber": 27,
+      "playerId": "89dvdx",
+      "x": 6,
+      "y": -3,
+      "timestamp": 1774818825512
+    },
+    {
+      "moveNumber": 28,
+      "playerId": "89dvdx",
+      "x": 7,
+      "y": -3,
+      "timestamp": 1774818826096
+    }
+  ]
+}

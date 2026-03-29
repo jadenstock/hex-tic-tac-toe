@@ -1,0 +1,249 @@
+{
+  "id": "1843cfc4-3c7e-498c-9afb-6d273f0b130a",
+  "sessionId": "hdulrs",
+  "startedAt": 1774818686007,
+  "finishedAt": 1774818919295,
+  "players": [
+    {
+      "playerId": "oxtnrg",
+      "displayName": "joruscz",
+      "profileId": "69c58f544bbe4a9ff9a8c182",
+      "elo": 1192,
+      "eloChange": 2
+    },
+    {
+      "playerId": "foihup",
+      "displayName": "matemiste",
+      "profileId": "69c88907ce17850d91a73239",
+      "elo": 857,
+      "eloChange": -2
+    }
+  ],
+  "playerTiles": {
+    "oxtnrg": {
+      "color": "#fbbf24"
+    },
+    "foihup": {
+      "color": "#38bdf8"
+    }
+  },
+  "gameOptions": {
+    "visibility": "public",
+    "timeControl": {
+      "mode": "turn",
+      "turnTimeMs": 45000
+    },
+    "rated": true
+  },
+  "moveCount": 29,
+  "gameResult": {
+    "winningPlayerId": "oxtnrg",
+    "durationMs": 233268,
+    "reason": "six-in-a-row"
+  },
+  "moves": [
+    {
+      "moveNumber": 2,
+      "playerId": "oxtnrg",
+      "x": 0,
+      "y": 0,
+      "timestamp": 1774818687883
+    },
+    {
+      "moveNumber": 3,
+      "playerId": "foihup",
+      "x": 2,
+      "y": -1,
+      "timestamp": 1774818690046
+    },
+    {
+      "moveNumber": 4,
+      "playerId": "foihup",
+      "x": 2,
+      "y": 0,
+      "timestamp": 1774818690412
+    },
+    {
+      "moveNumber": 5,
+      "playerId": "oxtnrg",
+      "x": 2,
+      "y": -2,
+      "timestamp": 1774818709381
+    },
+    {
+      "moveNumber": 6,
+      "playerId": "oxtnrg",
+      "x": 3,
+      "y": -1,
+      "timestamp": 1774818720216
+    },
+    {
+      "moveNumber": 7,
+      "playerId": "foihup",
+      "x": 1,
+      "y": 0,
+      "timestamp": 1774818728322
+    },
+    {
+      "moveNumber": 8,
+      "playerId": "foihup",
+      "x": 3,
+      "y": -2,
+      "timestamp": 1774818728804
+    },
+    {
+      "moveNumber": 9,
+      "playerId": "oxtnrg",
+      "x": 0,
+      "y": 1,
+      "timestamp": 1774818750334
+    },
+    {
+      "moveNumber": 10,
+      "playerId": "oxtnrg",
+      "x": 1,
+      "y": 1,
+      "timestamp": 1774818752832
+    },
+    {
+      "moveNumber": 11,
+      "playerId": "foihup",
+      "x": 2,
+      "y": 1,
+      "timestamp": 1774818761345
+    },
+    {
+      "moveNumber": 12,
+      "playerId": "foihup",
+      "x": 3,
+      "y": 0,
+      "timestamp": 1774818765798
+    },
+    {
+      "moveNumber": 13,
+      "playerId": "oxtnrg",
+      "x": -1,
+      "y": 1,
+      "timestamp": 1774818790665
+    },
+    {
+      "moveNumber": 14,
+      "playerId": "oxtnrg",
+      "x": 1,
+      "y": -1,
+      "timestamp": 1774818791314
+    },
+    {
+      "moveNumber": 15,
+      "playerId": "foihup",
+      "x": -2,
+      "y": 2,
+      "timestamp": 1774818794193
+    },
+    {
+      "moveNumber": 16,
+      "playerId": "foihup",
+      "x": 3,
+      "y": -3,
+      "timestamp": 1774818795163
+    },
+    {
+      "moveNumber": 17,
+      "playerId": "oxtnrg",
+      "x": -2,
+      "y": 1,
+      "timestamp": 1774818822544
+    },
+    {
+      "moveNumber": 18,
+      "playerId": "oxtnrg",
+      "x": 0,
+      "y": -1,
+      "timestamp": 1774818834533
+    },
+    {
+      "moveNumber": 19,
+      "playerId": "foihup",
+      "x": -3,
+      "y": 1,
+      "timestamp": 1774818837381
+    },
+    {
+      "moveNumber": 20,
+      "playerId": "foihup",
+      "x": 0,
+      "y": 2,
+      "timestamp": 1774818838498
+    },
+    {
+      "moveNumber": 21,
+      "playerId": "oxtnrg",
+      "x": -1,
+      "y": 0,
+      "timestamp": 1774818871245
+    },
+    {
+      "moveNumber": 22,
+      "playerId": "oxtnrg",
+      "x": 1,
+      "y": -2,
+      "timestamp": 1774818871967
+    },
+    {
+      "moveNumber": 23,
+      "playerId": "foihup",
+      "x": -3,
+      "y": 2,
+      "timestamp": 1774818875076
+    },
+    {
+      "moveNumber": 24,
+      "playerId": "foihup",
+      "x": 2,
+      "y": -3,
+      "timestamp": 1774818876039
+    },
+    {
+      "moveNumber": 25,
+      "playerId": "oxtnrg",
+      "x": 0,
+      "y": -2,
+      "timestamp": 1774818902447
+    },
+    {
+      "moveNumber": 26,
+      "playerId": "oxtnrg",
+      "x": -1,
+      "y": -2,
+      "timestamp": 1774818902879
+    },
+    {
+      "moveNumber": 27,
+      "playerId": "foihup",
+      "x": -2,
+      "y": -2,
+      "timestamp": 1774818907809
+    },
+    {
+      "moveNumber": 28,
+      "playerId": "foihup",
+      "x": 4,
+      "y": -3,
+      "timestamp": 1774818914504
+    },
+    {
+      "moveNumber": 29,
+      "playerId": "oxtnrg",
+      "x": 0,
+      "y": -3,
+      "timestamp": 1774818918382
+    },
+    {
+      "moveNumber": 30,
+      "playerId": "oxtnrg",
+      "x": 0,
+      "y": -4,
+      "timestamp": 1774818919274
+    }
+  ]
+}

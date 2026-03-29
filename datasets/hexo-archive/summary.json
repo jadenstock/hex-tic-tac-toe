@@ -1,0 +1,44 @@
+{
+  "snapshot": {
+    "totalPages": 2518,
+    "totalGames": 50344,
+    "totalMoves": 2211121,
+    "pageLimit": 24,
+    "baseTimestamp": 1774823733072
+  },
+  "collected": {
+    "storedPages": 24,
+    "normalizedGames": 480
+  },
+  "visibility": {
+    "public": 403,
+    "private": 77
+  },
+  "rated": {
+    "rated": 287,
+    "unrated": 193
+  },
+  "moveCount": {
+    "min": 0,
+    "p25": 29,
+    "median": 41,
+    "p75": 63,
+    "p90": 87,
+    "max": 453
+  },
+  "knownPreGameElo": {
+    "gamesWithAnyKnownPreGameElo": 287,
+    "gamesWithBothKnownPreGameElos": 287
+  },
+  "candidateSubsets": {
+    "publicOnly": 403,
+    "moveCountAtLeast20": 439,
+    "moveCountAtLeast25": 412,
+    "ratedOnly": 287,
+    "publicRatedMoveCount20": 247,
+    "publicRatedMoveCount25": 240,
+    "publicRatedMoveCount20MinPreGame900": 217,
+    "publicRatedMoveCount25MinPreGame1000": 103,
+    "publicMoveCount20MaxPreGame1100": 98
+  }
+}

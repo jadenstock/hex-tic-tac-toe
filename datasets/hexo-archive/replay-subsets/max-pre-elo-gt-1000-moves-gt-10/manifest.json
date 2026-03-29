@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "subsetName": "max-pre-elo-gt-1000-moves-gt-10",
+  "baseUrl": "https://hexo.did.science",
+  "metadataPath": "/home/jaden/hex-ttt/datasets/hexo-archive/games.jsonl",
+  "outputDir": "/home/jaden/hex-ttt/datasets/hexo-archive/replay-subsets/max-pre-elo-gt-1000-moves-gt-10",
+  "startedAt": "2026-03-29T22:42:57.700Z",
+  "updatedAt": "2026-03-29T22:45:02.372Z",
+  "selection": {
+    "minMoveCountExclusive": 10,
+    "anyPlayerPreGameEloGreaterThan": 1000
+  },
+  "totals": {
+    "candidateGames": 237,
+    "exportedGames": 237
+  },
+  "failedGameIds": []
+}

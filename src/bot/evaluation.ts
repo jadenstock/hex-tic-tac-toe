@@ -66,6 +66,12 @@ function minimumBlockersRequired(threatGroups: Map<string, number>): number {
   return 3
 }
 
+export function oneTurnBlockersRequired(board: SearchBoard, player: Player): number {
+  return minimumBlockersRequired(
+    player === 'X' ? board.xOneTurnThreatGroupCounts : board.oOneTurnThreatGroupCounts,
+  )
+}
+
 function oneTurnThreatScore(threatGroups: Map<string, number>): number {
   const blockers = minimumBlockersRequired(threatGroups)
   if (blockers <= 0) return 0

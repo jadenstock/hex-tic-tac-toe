@@ -1,0 +1,124 @@
+{
+  "id": "a4dbfb8e-82fb-4ce1-a401-bbad3d8eafcd",
+  "sessionId": "qwk3gb",
+  "startedAt": 1774820156007,
+  "finishedAt": 1774820196885,
+  "players": [
+    {
+      "playerId": "1vs7hr",
+      "displayName": "lean_crafter",
+      "profileId": "69c6f012e8e0723d8d89d050",
+      "elo": 968,
+      "eloChange": -4
+    },
+    {
+      "playerId": "rtc0y8",
+      "displayName": "ravinother",
+      "profileId": "69c4f063dc4623cc434633f1",
+      "elo": 1145,
+      "eloChange": 4
+    }
+  ],
+  "playerTiles": {
+    "1vs7hr": {
+      "color": "#fbbf24"
+    },
+    "rtc0y8": {
+      "color": "#38bdf8"
+    }
+  },
+  "gameOptions": {
+    "visibility": "public",
+    "timeControl": {
+      "mode": "match",
+      "mainTimeMs": 120000,
+      "incrementMs": 0
+    },
+    "rated": true
+  },
+  "moveCount": 11,
+  "gameResult": {
+    "winningPlayerId": "rtc0y8",
+    "durationMs": 40866,
+    "reason": "surrender"
+  },
+  "moves": [
+    {
+      "moveNumber": 2,
+      "playerId": "1vs7hr",
+      "x": 0,
+      "y": 0,
+      "timestamp": 1774820156054
+    },
+    {
+      "moveNumber": 3,
+      "playerId": "rtc0y8",
+      "x": -1,
+      "y": 2,
+      "timestamp": 1774820157999
+    },
+    {
+      "moveNumber": 4,
+      "playerId": "rtc0y8",
+      "x": 1,
+      "y": 0,
+      "timestamp": 1774820158370
+    },
+    {
+      "moveNumber": 5,
+      "playerId": "1vs7hr",
+      "x": 0,
+      "y": -1,
+      "timestamp": 1774820174627
+    },
+    {
+      "moveNumber": 6,
+      "playerId": "1vs7hr",
+      "x": -1,
+      "y": 0,
+      "timestamp": 1774820174840
+    },
+    {
+      "moveNumber": 7,
+      "playerId": "rtc0y8",
+      "x": 0,
+      "y": 1,
+      "timestamp": 1774820180987
+    },
+    {
+      "moveNumber": 8,
+      "playerId": "rtc0y8",
+      "x": 2,
+      "y": -1,
+      "timestamp": 1774820181471
+    },
+    {
+      "moveNumber": 9,
+      "playerId": "1vs7hr",
+      "x": -2,
+      "y": 3,
+      "timestamp": 1774820184739
+    },
+    {
+      "moveNumber": 10,
+      "playerId": "1vs7hr",
+      "x": 4,
+      "y": -2,
+      "timestamp": 1774820185273
+    },
+    {
+      "moveNumber": 11,
+      "playerId": "rtc0y8",
+      "x": 1,
+      "y": -2,
+      "timestamp": 1774820188943
+    },
+    {
+      "moveNumber": 12,
+      "playerId": "rtc0y8",
+      "x": -3,
+      "y": 1,
+      "timestamp": 1774820196850
+    }
+  ]
+}
