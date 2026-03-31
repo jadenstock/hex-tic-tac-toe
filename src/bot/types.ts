@@ -52,6 +52,7 @@ export type BotTuning = {
   threatWeights: number[]
   defenseWeight: number
   threatDiversityBlend: number
+  tempoDiscountPerStone: number
   threatSeverityScale: number
   immediateDangerPenalty: number
   oneTurnWinBonus: number
@@ -133,8 +134,9 @@ export type BotTurnDecision = {
 
 export const DEFAULT_BOT_TUNING: BotTuning = {
   threatWeights: [0, 0, 6, 36, 860, 860, 20000],
-  defenseWeight: 1,
+  defenseWeight: 1.75,
   threatDiversityBlend: 0.25,
+  tempoDiscountPerStone: 0.08,
   threatSeverityScale: 1200,
   immediateDangerPenalty: 150000,
   oneTurnWinBonus: 3500,

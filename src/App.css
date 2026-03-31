@@ -230,6 +230,67 @@
   cursor: grab;
 }
 
+.floating-undo {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+  align-self: flex-end;
+  min-width: 44px;
+  height: 44px;
+  padding: 0 14px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--panel), white 18%);
+  color: var(--ink);
+  cursor: pointer;
+  pointer-events: auto;
+  box-shadow: 0 8px 18px rgba(12, 34, 24, 0.16);
+  overflow: hidden;
+  transition:
+    width 160ms ease,
+    gap 160ms ease,
+    transform 160ms ease,
+    opacity 160ms ease,
+    background 160ms ease;
+}
+
+.floating-undo:hover:not(:disabled),
+.floating-undo:focus-visible:not(:disabled) {
+  gap: 8px;
+  transform: translateY(-1px);
+  background: color-mix(in oklab, var(--panel), white 8%);
+}
+
+.floating-undo:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.floating-undo-icon {
+  font-size: 1.05rem;
+  line-height: 1;
+  font-weight: 700;
+}
+
+.floating-undo-label {
+  max-width: 0;
+  opacity: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  font-size: 0.84rem;
+  font-weight: 700;
+  transition:
+    max-width 160ms ease,
+    opacity 120ms ease;
+}
+
+.floating-undo:hover:not(:disabled) .floating-undo-label,
+.floating-undo:focus-visible:not(:disabled) .floating-undo-label {
+  max-width: 96px;
+  opacity: 1;
+}
+
 .board:active {
   cursor: grabbing;
 }

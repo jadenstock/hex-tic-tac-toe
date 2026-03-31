@@ -2668,6 +2668,21 @@ function App() {
               Clear planning
             </button>
           ) : null}
+          {!isReplayMode ? (
+            <button
+              className="floating-undo"
+              onClick={undoMove}
+              type="button"
+              disabled={!canUndo}
+              aria-label={mode === 'sandbox' ? 'Undo edit' : 'Undo last move'}
+              title={mode === 'sandbox' ? 'Undo edit' : 'Undo last move'}
+            >
+              <span className="floating-undo-icon" aria-hidden="true">
+                ↶
+              </span>
+              <span className="floating-undo-label">{mode === 'sandbox' ? 'Undo edit' : 'Take back'}</span>
+            </button>
+          ) : null}
           <button className="toggle-hud board-theme-toggle" onClick={toggleThemeTone} type="button">
             {theme.dark ? 'Light mode' : 'Dark mode'}
           </button>

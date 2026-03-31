@@ -5,6 +5,8 @@ type BotTuning = {
   threatWeights: number[]
   threatBreadthWeights: number[]
   defenseWeight: number
+  threatDiversityBlend: number
+  tempoDiscountPerStone: number
   immediateDangerPenalty: number
   oneTurnWinBonus: number
   oneTurnForkBonus: number
@@ -68,7 +70,7 @@ function formatArray(values: number[]): string {
 }
 
 function formatDefaultBlock(tuning: BotTuning): string {
-  return `export const DEFAULT_BOT_TUNING: BotTuning = {\n  threatWeights: ${formatArray(tuning.threatWeights)},\n  threatBreadthWeights: ${formatArray(tuning.threatBreadthWeights)},\n  defenseWeight: ${formatNumber(tuning.defenseWeight)},\n  immediateDangerPenalty: ${formatNumber(tuning.immediateDangerPenalty)},\n  oneTurnWinBonus: ${formatNumber(tuning.oneTurnWinBonus)},\n  oneTurnForkBonus: ${formatNumber(tuning.oneTurnForkBonus)},\n  oneTurnOverlapPenalty: ${formatNumber(tuning.oneTurnOverlapPenalty)},\n  threat3ClusterBonus: ${formatNumber(tuning.threat3ClusterBonus)},\n  threat4ForkBonus: ${formatNumber(tuning.threat4ForkBonus)},\n  threat5ForkBonus: ${formatNumber(tuning.threat5ForkBonus)},\n  candidateRadius: ${Math.round(tuning.candidateRadius)},\n  topKFirstMoves: ${Math.round(tuning.topKFirstMoves)},\n}`
+  return `export const DEFAULT_BOT_TUNING: BotTuning = {\n  threatWeights: ${formatArray(tuning.threatWeights)},\n  threatBreadthWeights: ${formatArray(tuning.threatBreadthWeights)},\n  defenseWeight: ${formatNumber(tuning.defenseWeight)},\n  threatDiversityBlend: ${formatNumber(tuning.threatDiversityBlend)},\n  tempoDiscountPerStone: ${formatNumber(tuning.tempoDiscountPerStone)},\n  immediateDangerPenalty: ${formatNumber(tuning.immediateDangerPenalty)},\n  oneTurnWinBonus: ${formatNumber(tuning.oneTurnWinBonus)},\n  oneTurnForkBonus: ${formatNumber(tuning.oneTurnForkBonus)},\n  oneTurnOverlapPenalty: ${formatNumber(tuning.oneTurnOverlapPenalty)},\n  threat3ClusterBonus: ${formatNumber(tuning.threat3ClusterBonus)},\n  threat4ForkBonus: ${formatNumber(tuning.threat4ForkBonus)},\n  threat5ForkBonus: ${formatNumber(tuning.threat5ForkBonus)},\n  candidateRadius: ${Math.round(tuning.candidateRadius)},\n  topKFirstMoves: ${Math.round(tuning.topKFirstMoves)},\n}`
 }
 
 function main(): void {

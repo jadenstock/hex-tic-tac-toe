@@ -15,6 +15,26 @@ function pressureDiversity(total: number, entropySum: number, size: number): num
   return Math.max(0, Math.min(1, entropy / denom))
 }
 
+function clamp01(value: number): number {
+  return Math.max(0, Math.min(1, value))
+}
+
+function countStones(board: SearchBoard, player: Player): number {
+  let count = 0
+  for (const mark of board.moves.values()) {
+    if (mark === player) count += 1
+  }
+  return count
+}
+
+function applyTempoDiscount(score: number, ownStones: number, oppStones: number, tuning: BotTuning): number {
+  if (score <= 0) return 0
+  const delta = Math.max(0, ownStones - oppStones)
+  if (delta <= 0) return score
+  const k = Math.max(0, tuning.tempoDiscountPerStone)
+  return score / (1 + k * delta)
+}
+
 function minimumBlockersRequired(threatGroups: Map<string, number>): number {
   const groups: Array<{ first: string; second: string }> = []
   const uniqueCells: string[] = []
@@ -75,8 +95,8 @@ export function oneTurnBlockersRequired(board: SearchBoard, player: Player): num
 function oneTurnThreatScore(threatGroups: Map<string, number>): number {
   const blockers = minimumBlockersRequired(threatGroups)
   if (blockers <= 0) return 0
-  if (blockers === 1) return 0.88
-  if (blockers === 2) return 0.96
+  if (blockers === 1) return 0.12
+  if (blockers === 2) return 0.4
   return 0.995
 }
 
@@ -100,12 +120,14 @@ function pressureMax(pressure: Map<string, number>): number {
 function analyzeBoard(board: SearchBoard, tuning: BotTuning) {
   const xOneTurnWins = board.xOneTurnThreatGroupCounts.size
   const oOneTurnWins = board.oOneTurnThreatGroupCounts.size
+  const xStones = countStones(board, 'X')
+  const oStones = countStones(board, 'O')
   const xDiversity = pressureDiversity(board.xPressureTotal, board.xPressureEntropySum, board.xPressureMap.size)
   const oDiversity = pressureDiversity(board.oPressureTotal, board.oPressureEntropySum, board.oPressureMap.size)
   const xOffense = scoreOffense(board.xThreats, xDiversity, tuning)
   const oOffense = scoreOffense(board.oThreats, oDiversity, tuning)
-  const xScore = Math.max(0, xOffense, oneTurnThreatScore(board.xOneTurnThreatGroupCounts))
-  const oScore = Math.max(0, oOffense, oneTurnThreatScore(board.oOneTurnThreatGroupCounts))
+  const xScore = clamp01(applyTempoDiscount(xOffense + oneTurnThreatScore(board.xOneTurnThreatGroupCounts), xStones, oStones, tuning))
+  const oScore = clamp01(applyTempoDiscount(oOffense + oneTurnThreatScore(board.oOneTurnThreatGroupCounts), oStones, xStones, tuning))
   const total = xScore + oScore
 
   return {
