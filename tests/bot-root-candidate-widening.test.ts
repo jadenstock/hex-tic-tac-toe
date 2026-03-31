@@ -3,9 +3,27 @@ import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
 import { createSearchBoard, boardToLiveState, makeBoardMove } from '../src/bot/board.ts'
-import { buildTimedSearchOptions, inspectBotCandidates } from '../src/bot/engine.ts'
+import { buildTimedSearchOptions, chooseBotTurnDetailed, inspectBotCandidates } from '../src/bot/engine.ts'
 
-test('root candidate widening unions extra lines from offense/defense variants before MCTS', () => {
+test('single root candidate stops before spending the full search budget', () => {
+  const decision = chooseBotTurnDetailed(
+    {
+      moves: new Map(),
+      moveHistory: [],
+      turn: 'X',
+      placementsLeft: 1,
+    },
+    undefined,
+    buildTimedSearchOptions(2),
+  )
+
+  assert.equal(decision.moves.length, 1)
+  assert.equal(decision.stats.rootCandidates, 1)
+  assert.equal(decision.stats.playouts, 0)
+  assert.equal(decision.stats.stopReason, 'single_candidate')
+})
+
+test('root widening keeps the key variant line while the narrowed root gets one opponent reply per child', () => {
   const targetGameId = 'b0a50d0a-f8e5-4f39-84b7-2030ec70ab05'
   const replay = JSON.parse(
     readFileSync(
@@ -48,7 +66,12 @@ test('root candidate widening unions extra lines from offense/defense variants b
       .map((cell) => `${cell.q},${cell.r}`)
       .join('|'),
   )
+  const decision = chooseBotTurnDetailed(boardToLiveState(board), undefined, buildTimedSearchOptions(2))
 
-  assert.ok(snapshot.candidateLines.length > 12)
+  assert.equal(snapshot.candidateLines.length, 6)
   assert.ok(lineKeys.includes('-3,1|-1,-1'))
+  assert.equal(decision.stats.rootCandidates, 6)
+  assert.equal(decision.stats.debug?.rootVisitedChildren, 6)
+  assert.equal(decision.stats.debug?.rootChildrenWithOpponentReplies, 6)
+  assert.equal(decision.stats.debug?.rootAvgOpponentRepliesExplored, 1)
 })

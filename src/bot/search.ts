@@ -17,6 +17,7 @@ import {
 import { evaluateBoardSummary, oneTurnBlockersRequired, type EvaluationSummary } from './evaluation.ts'
 import type {
   Axial,
+  BotSearchDebugStats,
   BotSearchMode,
   BotSearchOptions,
   BotSearchSessionStats,
@@ -39,6 +40,7 @@ type SearchContext = {
   candidateCacheMisses: number
   forcingCacheHits: number
   forcingCacheMisses: number
+  debug: BotSearchDebugStats
 }
 
 type RankedPlacement = {
@@ -130,10 +132,49 @@ type SearchProgressOptions = {
   yieldEveryMs?: number
 }
 
+type SearchRunCounters = {
+  nodesExpanded: number
+  playouts: number
+  maxDepthTurns: number
+}
+
 type ForcingProofBudget = {
   deadlineMs: number
   maxNodes: number
   nodesVisited: number
+}
+
+function createSearchDebugStats(): BotSearchDebugStats {
+  return {
+    rolloutCalls: 0,
+    tacticalExtensionCalls: 0,
+    staticLeafEvals: 0,
+    tacticalLeafEvals: 0,
+    terminalLeafHits: 0,
+    leafEvalOwnTurnCount: 0,
+    leafEvalOpponentTurnCount: 0,
+    rootSetupMs: 0,
+    rootImmediateWinScanMs: 0,
+    mctsLoopMs: 0,
+    selectionExpansionMs: 0,
+    rolloutEvalMs: 0,
+    backpropUndoMs: 0,
+    averagePlayoutMs: 0,
+    forcingAttempted: false,
+    forcingSolvedWin: false,
+    forcingStatus: 'not_attempted',
+    rootVisitedChildren: 0,
+    rootUnvisitedChildren: 0,
+    rootChildrenWithOpponentReplies: 0,
+    rootChildrenWithoutOpponentReplies: 0,
+    rootAvgOpponentRepliesExplored: 0,
+    rootMaxOpponentRepliesExplored: 0,
+    rootBestChildVisits: 0,
+    rootSecondChildVisits: 0,
+    rootBestChildValue: 0,
+    rootSecondChildValue: 0,
+    rootBestChildVisitShare: 0,
+  }
 }
 
 function createSearchContext(): SearchContext {
@@ -148,6 +189,7 @@ function createSearchContext(): SearchContext {
     candidateCacheMisses: 0,
     forcingCacheHits: 0,
     forcingCacheMisses: 0,
+    debug: createSearchDebugStats(),
   }
 }
 
@@ -235,7 +277,6 @@ const FORCING_SOLVER_DEPTH = 8
 const MAX_EVALUATION_CACHE_ENTRIES = 2_000
 const MAX_CANDIDATE_CACHE_ENTRIES = 256
 const ROOT_CANDIDATE_DEFENSE_MULTIPLIERS = [0.65, 1, 1.5]
-const ROOT_CANDIDATE_MAX_LINE_CAP = 48
 const COLONY_DIRECTIONS: ReadonlyArray<Axial> = [
   { q: 1, r: 0 },
   { q: 0, r: 1 },
@@ -839,14 +880,28 @@ function enumerateRootTurnCandidates(
   context: SearchContext,
 ): Axial[][] {
   const policy = rootSearchPolicy(tuning, options)
+  const lineLimit = rootCandidateLineLimit(options)
   const variants = rootCandidateTunings(tuning)
   if (variants.length <= 1) {
-    return enumerateTurnCandidatesBase(board, tuning, policy, context)
+    return enumerateTurnCandidatesBase(board, tuning, policy, context).slice(0, lineLimit)
   }
 
+  const seedQuota = rootCandidateSeedQuota(lineLimit)
+  const variantLines = variants.map((variant) => enumerateTurnCandidatesBase(board, variant, policy, context))
   const unique = new Map<string, Axial[]>()
-  for (const variant of variants) {
-    const lines = enumerateTurnCandidatesBase(board, variant, policy, context)
+  const seededKeys = new Set<string>()
+
+  for (let depth = 0; depth < seedQuota; depth += 1) {
+    for (const lines of variantLines) {
+      const line = lines[depth]
+      if (!line) continue
+      const key = canonicalLineKey(line)
+      if (!unique.has(key)) unique.set(key, line)
+      seededKeys.add(key)
+    }
+  }
+
+  for (const lines of variantLines) {
     for (const line of lines) {
       const key = canonicalLineKey(line)
       if (unique.has(key)) continue
@@ -871,8 +926,26 @@ function enumerateRootTurnCandidates(
   const pruned = pruneDefensivelyCriticalLines(rescored, baselineOppWins)
   sortRankedLines(pruned)
 
-  const lineLimit = Math.max(policy.maxLineCount, Math.min(policy.maxLineCount * 2, ROOT_CANDIDATE_MAX_LINE_CAP))
-  return pruned.slice(0, lineLimit).map((entry) => entry.line)
+  const picks: Axial[][] = []
+  const pickedKeys = new Set<string>()
+
+  for (const entry of pruned) {
+    const key = canonicalLineKey(entry.line)
+    if (!seededKeys.has(key) || pickedKeys.has(key)) continue
+    picks.push(entry.line)
+    pickedKeys.add(key)
+    if (picks.length >= lineLimit) return picks
+  }
+
+  for (const entry of pruned) {
+    const key = canonicalLineKey(entry.line)
+    if (pickedKeys.has(key)) continue
+    picks.push(entry.line)
+    pickedKeys.add(key)
+    if (picks.length >= lineLimit) break
+  }
+
+  return picks
 }
 
 function enumerateTurnCandidates(
@@ -932,6 +1005,7 @@ function resetRunSearchStats(context: SearchContext): void {
   context.candidateCacheMisses = 0
   context.forcingCacheHits = 0
   context.forcingCacheMisses = 0
+  context.debug = createSearchDebugStats()
 }
 
 function prepareRunSearchContext(context: SearchContext): void {
@@ -1069,11 +1143,68 @@ function ensureSessionStructure(session: BotSearchSession, tuning: BotTuning, op
   session.structureSignature = structureSignature
 }
 
-function evaluateNodeForRoot(board: SearchBoard, winner: Player | null, rootPlayer: Player, tuning: BotTuning, context: SearchContext): number {
-  if (winner) return winner === rootPlayer ? 1 : -1
+function evaluateNodeForRoot(
+  board: SearchBoard,
+  winner: Player | null,
+  rootPlayer: Player,
+  tuning: BotTuning,
+  context: SearchContext,
+  leafType: 'static' | 'tactical',
+): number {
+  if (winner) {
+    context.debug.terminalLeafHits += 1
+    return winner === rootPlayer ? 1 : -1
+  }
+  if (leafType === 'static') {
+    context.debug.staticLeafEvals += 1
+  } else {
+    context.debug.tacticalLeafEvals += 1
+  }
+  if (board.turn === rootPlayer) {
+    context.debug.leafEvalOwnTurnCount += 1
+  } else {
+    context.debug.leafEvalOpponentTurnCount += 1
+  }
   const result = evaluateBoardStateTracked(board, tuning, context)
   const objective = objectiveForPlayer(result, rootPlayer, tuning)
   return Math.tanh(objective * LEAF_OBJECTIVE_GAIN)
+}
+
+function meanChildValue(node: SearchNode): number {
+  if (node.visits <= 0) return 0
+  return node.totalValue / node.visits
+}
+
+function summarizeRootDebug(root: SearchNode | null, rootCandidateCount: number, base: BotSearchDebugStats): BotSearchDebugStats {
+  if (!root) return { ...base }
+
+  const children = [...root.children]
+  const visitedChildren = children.length
+  const unvisitedChildren = Math.max(0, rootCandidateCount - visitedChildren)
+  const opponentReplyCounts = children.map((child) => child.children.length)
+  const childrenWithOpponentReplies = opponentReplyCounts.filter((count) => count > 0).length
+  const childrenWithoutOpponentReplies = visitedChildren - childrenWithOpponentReplies
+  const totalOpponentReplies = opponentReplyCounts.reduce((sum, count) => sum + count, 0)
+  const sortedByVisits = [...children].sort((a, b) => b.visits - a.visits)
+  const bestChild = sortedByVisits[0] ?? null
+  const secondChild = sortedByVisits[1] ?? null
+  const totalChildVisits = children.reduce((sum, child) => sum + child.visits, 0)
+
+  return {
+    ...base,
+    averagePlayoutMs: base.rolloutCalls > 0 ? base.mctsLoopMs / base.rolloutCalls : 0,
+    rootVisitedChildren: visitedChildren,
+    rootUnvisitedChildren: unvisitedChildren,
+    rootChildrenWithOpponentReplies: childrenWithOpponentReplies,
+    rootChildrenWithoutOpponentReplies: childrenWithoutOpponentReplies,
+    rootAvgOpponentRepliesExplored: visitedChildren > 0 ? totalOpponentReplies / visitedChildren : 0,
+    rootMaxOpponentRepliesExplored: opponentReplyCounts.length > 0 ? Math.max(...opponentReplyCounts) : 0,
+    rootBestChildVisits: bestChild?.visits ?? 0,
+    rootSecondChildVisits: secondChild?.visits ?? 0,
+    rootBestChildValue: bestChild ? meanChildValue(bestChild) : 0,
+    rootSecondChildValue: secondChild ? meanChildValue(secondChild) : 0,
+    rootBestChildVisitShare: totalChildVisits > 0 && bestChild ? bestChild.visits / totalChildVisits : 0,
+  }
 }
 
 function tacticalValue(
@@ -1088,12 +1219,12 @@ function tacticalValue(
   alpha = -1,
   beta = 1,
 ): number {
-  if (winner) return winner === rootPlayer ? 1 : -1
-  if (depthRemaining <= 0) return evaluateNodeForRoot(board, null, rootPlayer, tuning, context)
+  if (winner) return evaluateNodeForRoot(board, winner, rootPlayer, tuning, context, 'tactical')
+  if (depthRemaining <= 0) return evaluateNodeForRoot(board, null, rootPlayer, tuning, context, 'tactical')
 
   const lines = candidateLines ?? enumerateTurnCandidates(board, tuning, childSearchPolicy(tuning, options), context)
   if (lines.length === 0 || !shouldForceTacticalSearch(board, lines.length)) {
-    return evaluateNodeForRoot(board, null, rootPlayer, tuning, context)
+    return evaluateNodeForRoot(board, null, rootPlayer, tuning, context, 'tactical')
   }
 
   const maximizing = board.turn === rootPlayer
@@ -1242,10 +1373,35 @@ function greedyCandidatePolicy(tuning: BotTuning, candidateCount: number): Candi
   }
 }
 
+function rootCandidateLineLimit(options: BotSearchOptions): number {
+  const requested = Math.max(1, Math.floor(options.turnCandidateCount))
+  const budgetMs = Math.max(0, options.budget.maxTimeMs)
+
+  let budgetCap = 4
+  if (budgetMs >= 4000) {
+    budgetCap = 8
+  } else if (budgetMs >= 2500) {
+    budgetCap = 7
+  } else if (budgetMs >= 1600) {
+    budgetCap = 6
+  } else if (budgetMs >= 900) {
+    budgetCap = 5
+  }
+
+  return Math.max(3, Math.min(requested, budgetCap))
+}
+
+function rootCandidateSeedQuota(lineLimit: number): number {
+  if (lineLimit >= 6) return 2
+  return 1
+}
+
 function rootSearchPolicy(tuning: BotTuning, options: BotSearchOptions): CandidateGenerationPolicy {
+  const lineLimit = rootCandidateLineLimit(options)
+  const topCellBudget = Math.min(Math.max(lineLimit + 2, 6), Math.max(lineLimit + 2, 10))
   return {
-    topCellCount: widenedTopCellCount(tuning.topKFirstMoves, options.turnCandidateCount, 3),
-    maxLineCount: Math.max(8, Math.min(options.turnCandidateCount * 2, 32)),
+    topCellCount: widenedTopCellCount(tuning.topKFirstMoves, topCellBudget, 2),
+    maxLineCount: Math.max(lineLimit, Math.min(lineLimit * 2, 16)),
     colonyProbeCount: 2,
     colonyDistance: 7,
   }
@@ -1280,6 +1436,111 @@ function createRootNode(board: SearchBoard, tuning: BotTuning, options: BotSearc
     winner: null,
     stateKey: boardStateKey(board),
   }
+}
+
+function expandNextChild(
+  parent: SearchNode,
+  board: SearchBoard,
+  tuning: BotTuning,
+  options: BotSearchOptions,
+  context: SearchContext,
+): { child: SearchNode; applied: AppliedBoardTurn } | null {
+  if (parent.nextActionIndex >= parent.candidateActions.length) return null
+
+  const action = parent.candidateActions[parent.nextActionIndex]
+  parent.nextActionIndex += 1
+  const applied = applyTurnLineToBoard(board, action)
+  const child: SearchNode = {
+    parent,
+    actionFromParent: action,
+    children: [],
+    candidateActions: applied.winner ? [] : enumerateTurnCandidates(board, tuning, childSearchPolicy(tuning, options), context),
+    nextActionIndex: 0,
+    visits: 0,
+    totalValue: 0,
+    winner: applied.winner,
+    stateKey: boardStateKey(board),
+  }
+  parent.children.push(child)
+  return { child, applied }
+}
+
+function finishPlayoutFromNode(
+  loopStart: number,
+  node: SearchNode,
+  board: SearchBoard,
+  rootPlayer: Player,
+  tuning: BotTuning,
+  options: BotSearchOptions,
+  context: SearchContext,
+  appliedPath: AppliedBoardTurn[],
+  depthTurns: number,
+  counters: SearchRunCounters,
+): Player | null {
+  if (depthTurns > counters.maxDepthTurns) counters.maxDepthTurns = depthTurns
+
+  const rolloutStart = nowMs()
+  const value = rolloutValue(board, node.winner, rootPlayer, tuning, options, context)
+  context.debug.rolloutEvalMs += nowMs() - rolloutStart
+  counters.playouts += 1
+
+  const backpropStart = nowMs()
+  let current: SearchNode | null = node
+  while (current) {
+    current.visits += 1
+    current.totalValue += value
+    current = current.parent
+  }
+
+  const winner = node.winner
+  for (let i = appliedPath.length - 1; i >= 0; i -= 1) {
+    undoAppliedTurn(board, appliedPath[i])
+  }
+  context.debug.backpropUndoMs += nowMs() - backpropStart
+  context.debug.mctsLoopMs += nowMs() - loopStart
+  return winner
+}
+
+function forceRootReplyCoverage(
+  root: SearchNode,
+  board: SearchBoard,
+  rootPlayer: Player,
+  tuning: BotTuning,
+  options: BotSearchOptions,
+  context: SearchContext,
+  counters: SearchRunCounters,
+): Axial[] | null {
+  while (root.nextActionIndex < root.candidateActions.length) {
+    const loopStart = nowMs()
+    const selectionStart = loopStart
+    const appliedPath: AppliedBoardTurn[] = []
+
+    const expandedRoot = expandNextChild(root, board, tuning, options, context)
+    if (!expandedRoot) break
+    counters.nodesExpanded += 1
+    appliedPath.push(expandedRoot.applied)
+
+    let leaf = expandedRoot.child
+    let depthTurns = 1
+
+    if (!leaf.winner && leaf.candidateActions.length > 0) {
+      const expandedReply = expandNextChild(leaf, board, tuning, options, context)
+      if (expandedReply) {
+        counters.nodesExpanded += 1
+        appliedPath.push(expandedReply.applied)
+        leaf = expandedReply.child
+        depthTurns = 2
+      }
+    }
+
+    context.debug.selectionExpansionMs += nowMs() - selectionStart
+    const winner = finishPlayoutFromNode(loopStart, leaf, board, rootPlayer, tuning, options, context, appliedPath, depthTurns, counters)
+    if (winner === rootPlayer) {
+      return rootActionFor(leaf)
+    }
+  }
+
+  return null
 }
 
 function prepareSearchSession(
@@ -1514,7 +1775,11 @@ function buildForcingProof(
   startMs: number,
 ): ForcingNode | null {
   if (!shouldAttemptForcingSolve(board, attacker)) return null
-  return buildForcingProofNode(board, attacker, tuning, options, context, buildForcingProofBudget(options, startMs), FORCING_SOLVER_DEPTH)
+  context.debug.forcingAttempted = true
+  const node = buildForcingProofNode(board, attacker, tuning, options, context, buildForcingProofBudget(options, startMs), FORCING_SOLVER_DEPTH)
+  context.debug.forcingStatus = node.status
+  context.debug.forcingSolvedWin = node.status === 'win'
+  return node
 }
 
 function buildSessionStats(session: BotSearchSession): BotSearchSessionStats {
@@ -1587,10 +1852,12 @@ function rolloutValue(
   options: BotSearchOptions,
   context: SearchContext,
 ): number {
-  if (nodeWinner) return nodeWinner === rootPlayer ? 1 : -1
+  context.debug.rolloutCalls += 1
+  if (nodeWinner) return evaluateNodeForRoot(board, nodeWinner, rootPlayer, tuning, context, 'static')
 
   const tacticalLines = enumerateTurnCandidates(board, tuning, childSearchPolicy(tuning, options), context)
   if (shouldForceTacticalSearch(board, tacticalLines.length)) {
+    context.debug.tacticalExtensionCalls += 1
     return tacticalValue(
       board,
       null,
@@ -1602,7 +1869,7 @@ function rolloutValue(
       tacticalLines,
     )
   }
-  return evaluateNodeForRoot(board, null, rootPlayer, tuning, context)
+  return evaluateNodeForRoot(board, null, rootPlayer, tuning, context, 'static')
 }
 
 function shouldAttemptForcingSolve(board: SearchBoard, player: Player): boolean {
@@ -1698,9 +1965,11 @@ function enrichDecisionWithSession(
   retainedRoot?: ForcingNode | null,
   attacker?: Player | null,
   predictedOpponentReply?: Axial[],
+  searchRoot?: SearchNode | null,
 ): BotTurnDecision {
   finalizeSessionForDecision(session, retainedRoot ?? null, attacker ?? null)
   decision.stats.session = buildSessionStats(session)
+  decision.stats.debug = summarizeRootDebug(searchRoot ?? null, decision.stats.rootCandidates, session.context.debug)
   if (predictedOpponentReply && predictedOpponentReply.length > 0) {
     decision.stats.predictedOpponentReply = predictedOpponentReply
   }
@@ -1808,7 +2077,9 @@ function chooseBotTurnDetailedWithSessionInternal(
     return enrichDecisionWithSession(chooseGreedyDecision(state, tuning, context), session, stateMoveCount)
   }
 
+  const rootSetupStart = nowMs()
   const root = createRootNode(board, tuning, options, context)
+  context.debug.rootSetupMs += nowMs() - rootSetupStart
   const rootCandidates = root.candidateActions
 
   if (rootCandidates.length === 0) {
@@ -1827,34 +2098,75 @@ function chooseBotTurnDetailedWithSessionInternal(
     }, session, stateMoveCount)
   }
 
-  let nodesExpanded = 1
-  let playouts = 0
-  let maxDepthTurns = 0
+  if (rootCandidates.length === 1) {
+    return enrichDecisionWithSession({
+      moves: rootCandidates[0],
+      stats: {
+        mode: 'mcts',
+        elapsedMs: nowMs() - start,
+        nodesExpanded: 1,
+        playouts: 0,
+        boardEvaluations: context.boardEvalCounter.count,
+        maxDepthTurns: 0,
+        rootCandidates: 1,
+        stopReason: 'single_candidate',
+      },
+    }, session, stateMoveCount, undefined, undefined, undefined, root)
+  }
+
+  const counters: SearchRunCounters = {
+    nodesExpanded: 1,
+    playouts: 0,
+    maxDepthTurns: 0,
+  }
   let stopReason: BotSearchStats['stopReason'] = 'time'
 
+  const rootImmediateWinScanStart = nowMs()
   for (const line of rootCandidates) {
     const applied = applyTurnLineToBoard(board, line)
     const winner = applied.winner
     undoAppliedTurn(board, applied)
     if (winner === rootPlayer) {
+      context.debug.rootImmediateWinScanMs += nowMs() - rootImmediateWinScanStart
       const predictedOpponentReply = bestChildAction(root.children.find((child) => child.actionFromParent === line) ?? null)
       return enrichDecisionWithSession({
         moves: line,
         stats: {
           mode: 'mcts',
           elapsedMs: nowMs() - start,
-          nodesExpanded,
-          playouts,
+          nodesExpanded: counters.nodesExpanded,
+          playouts: counters.playouts,
           boardEvaluations: context.boardEvalCounter.count,
-          maxDepthTurns,
+          maxDepthTurns: counters.maxDepthTurns,
           rootCandidates: rootCandidates.length,
         stopReason: 'early_win',
         },
-      }, session, stateMoveCount, undefined, undefined, predictedOpponentReply)
+      }, session, stateMoveCount, undefined, undefined, predictedOpponentReply, root)
     }
   }
+  context.debug.rootImmediateWinScanMs += nowMs() - rootImmediateWinScanStart
 
-  while (nodesExpanded < options.budget.maxNodes && nowMs() - start < options.budget.maxTimeMs) {
+  const forcedRootWin = forceRootReplyCoverage(root, board, rootPlayer, tuning, options, context, counters)
+  if (forcedRootWin) {
+    const predictedOpponentReply = bestChildAction(root.children.find((child) => child.actionFromParent === forcedRootWin) ?? null)
+    return enrichDecisionWithSession({
+      moves: forcedRootWin,
+      stats: {
+        mode: 'mcts',
+        elapsedMs: nowMs() - start,
+        nodesExpanded: counters.nodesExpanded,
+        playouts: counters.playouts,
+        boardEvaluations: context.boardEvalCounter.count,
+        maxDepthTurns: counters.maxDepthTurns,
+        rootCandidates: rootCandidates.length,
+        stopReason: 'early_win',
+      },
+    }, session, stateMoveCount, undefined, undefined, predictedOpponentReply, root)
+  }
+
+  while (counters.nodesExpanded < options.budget.maxNodes && nowMs() - start < options.budget.maxTimeMs) {
+    const loopStart = nowMs()
+    const selectionStart = loopStart
     let depthTurns = 0
     let node = root
     const appliedPath: AppliedBoardTurn[] = []
@@ -1866,24 +2178,11 @@ function chooseBotTurnDetailedWithSessionInternal(
       const canExpand = node.nextActionIndex < widenLimit
 
       if (canExpand) {
-        const action = node.candidateActions[node.nextActionIndex]
-        node.nextActionIndex += 1
-        const applied = applyTurnLineToBoard(board, action)
-        appliedPath.push(applied)
-        const child: SearchNode = {
-          parent: node,
-          actionFromParent: action,
-          children: [],
-          candidateActions: applied.winner ? [] : enumerateTurnCandidates(board, tuning, childSearchPolicy(tuning, options), context),
-          nextActionIndex: 0,
-          visits: 0,
-          totalValue: 0,
-          winner: applied.winner,
-          stateKey: boardStateKey(board),
-        }
-        node.children.push(child)
-        node = child
-        nodesExpanded += 1
+        const expanded = expandNextChild(node, board, tuning, options, context)
+        if (!expanded) break
+        appliedPath.push(expanded.applied)
+        node = expanded.child
+        counters.nodesExpanded += 1
         depthTurns += 1
         break
       }
@@ -1895,22 +2194,9 @@ function chooseBotTurnDetailedWithSessionInternal(
       node = child
       depthTurns += 1
     }
+    context.debug.selectionExpansionMs += nowMs() - selectionStart
 
-    if (depthTurns > maxDepthTurns) maxDepthTurns = depthTurns
-
-    const value = rolloutValue(board, node.winner, rootPlayer, tuning, options, context)
-    playouts += 1
-    let current: SearchNode | null = node
-    while (current) {
-      current.visits += 1
-      current.totalValue += value
-      current = current.parent
-    }
-
-    const winner = node.winner
-    for (let i = appliedPath.length - 1; i >= 0; i -= 1) {
-      undoAppliedTurn(board, appliedPath[i])
-    }
+    const winner = finishPlayoutFromNode(loopStart, node, board, rootPlayer, tuning, options, context, appliedPath, depthTurns, counters)
 
     if (winner === rootPlayer) {
       const rootAction = rootActionFor(node)
@@ -1921,19 +2207,19 @@ function chooseBotTurnDetailedWithSessionInternal(
           stats: {
             mode: 'mcts',
             elapsedMs: nowMs() - start,
-            nodesExpanded,
-            playouts,
+            nodesExpanded: counters.nodesExpanded,
+            playouts: counters.playouts,
             boardEvaluations: context.boardEvalCounter.count,
-            maxDepthTurns,
+            maxDepthTurns: counters.maxDepthTurns,
             rootCandidates: rootCandidates.length,
             stopReason: 'early_win',
           },
-        }, session, stateMoveCount, undefined, undefined, predictedOpponentReply)
+        }, session, stateMoveCount, undefined, undefined, predictedOpponentReply, root)
       }
     }
   }
 
-  if (nodesExpanded >= options.budget.maxNodes) {
+  if (counters.nodesExpanded >= options.budget.maxNodes) {
     stopReason = 'nodes'
   } else if (nowMs() - start >= options.budget.maxTimeMs) {
     stopReason = 'time'
@@ -1945,14 +2231,14 @@ function chooseBotTurnDetailedWithSessionInternal(
       stats: {
         mode: 'mcts',
         elapsedMs: nowMs() - start,
-        nodesExpanded,
-        playouts,
+        nodesExpanded: counters.nodesExpanded,
+        playouts: counters.playouts,
         boardEvaluations: context.boardEvalCounter.count,
-        maxDepthTurns,
+        maxDepthTurns: counters.maxDepthTurns,
         rootCandidates: rootCandidates.length,
         stopReason: 'fallback',
       },
-    }, session, stateMoveCount)
+    }, session, stateMoveCount, undefined, undefined, undefined, root)
   }
 
   sortRootChildren(root)
@@ -1961,14 +2247,14 @@ function chooseBotTurnDetailedWithSessionInternal(
     stats: {
       mode: 'mcts',
       elapsedMs: nowMs() - start,
-      nodesExpanded,
-      playouts,
+      nodesExpanded: counters.nodesExpanded,
+      playouts: counters.playouts,
       boardEvaluations: context.boardEvalCounter.count,
-      maxDepthTurns,
+      maxDepthTurns: counters.maxDepthTurns,
       rootCandidates: rootCandidates.length,
       stopReason,
     },
-  }, session, stateMoveCount, undefined, undefined, bestChildAction(root.children[0] ?? null))
+  }, session, stateMoveCount, undefined, undefined, bestChildAction(root.children[0] ?? null), root)
 }
 
 export function chooseBotTurnDetailedWithSession(
@@ -2105,7 +2391,9 @@ export async function chooseBotTurnDetailedAsyncWithSession(
     return enrichDecisionWithSession(decision, session, stateMoveCount)
   }
 
+  const rootSetupStart = nowMs()
   const root = createRootNode(board, tuning, options, context)
+  context.debug.rootSetupMs += nowMs() - rootSetupStart
   const rootCandidates = root.candidateActions
 
   if (root.candidateActions.length === 0) {
@@ -2125,36 +2413,115 @@ export async function chooseBotTurnDetailedAsyncWithSession(
     }, session, stateMoveCount)
   }
 
-  let nodesExpanded = 1
-  let playouts = 0
-  let maxDepthTurns = 0
+  if (rootCandidates.length === 1) {
+    reportProgress(1, 0, 0)
+    return enrichDecisionWithSession({
+      moves: rootCandidates[0],
+      stats: {
+        mode: 'mcts',
+        elapsedMs: nowMs() - start,
+        nodesExpanded: 1,
+        playouts: 0,
+        boardEvaluations: context.boardEvalCounter.count,
+        maxDepthTurns: 0,
+        rootCandidates: 1,
+        stopReason: 'single_candidate',
+      },
+    }, session, stateMoveCount, undefined, undefined, undefined, root)
+  }
+
+  const counters: SearchRunCounters = {
+    nodesExpanded: 1,
+    playouts: 0,
+    maxDepthTurns: 0,
+  }
   let stopReason: BotSearchStats['stopReason'] = 'time'
   let lastYieldAt = nowMs()
 
+  const rootImmediateWinScanStart = nowMs()
   for (const line of rootCandidates) {
     const applied = applyTurnLineToBoard(board, line)
     const winner = applied.winner
     undoAppliedTurn(board, applied)
     if (winner === rootPlayer) {
-      reportProgress(nodesExpanded, playouts, maxDepthTurns)
+      context.debug.rootImmediateWinScanMs += nowMs() - rootImmediateWinScanStart
+      reportProgress(counters.nodesExpanded, counters.playouts, counters.maxDepthTurns)
       const predictedOpponentReply = bestChildAction(root.children.find((child) => child.actionFromParent === line) ?? null)
       return enrichDecisionWithSession({
         moves: line,
         stats: {
           mode: 'mcts',
           elapsedMs: nowMs() - start,
-          nodesExpanded,
-          playouts,
+          nodesExpanded: counters.nodesExpanded,
+          playouts: counters.playouts,
           boardEvaluations: context.boardEvalCounter.count,
-          maxDepthTurns,
+          maxDepthTurns: counters.maxDepthTurns,
           rootCandidates: rootCandidates.length,
           stopReason: 'early_win',
         },
-      }, session, stateMoveCount, undefined, undefined, predictedOpponentReply)
+      }, session, stateMoveCount, undefined, undefined, predictedOpponentReply, root)
+    }
+  }
+  context.debug.rootImmediateWinScanMs += nowMs() - rootImmediateWinScanStart
+
+  while (root.nextActionIndex < root.candidateActions.length) {
+    const loopStart = nowMs()
+    const selectionStart = loopStart
+    const appliedPath: AppliedBoardTurn[] = []
+
+    const expandedRoot = expandNextChild(root, board, tuning, options, context)
+    if (!expandedRoot) break
+    counters.nodesExpanded += 1
+    appliedPath.push(expandedRoot.applied)
+
+    let leaf = expandedRoot.child
+    let depthTurns = 1
+
+    if (!leaf.winner && leaf.candidateActions.length > 0) {
+      const expandedReply = expandNextChild(leaf, board, tuning, options, context)
+      if (expandedReply) {
+        counters.nodesExpanded += 1
+        appliedPath.push(expandedReply.applied)
+        leaf = expandedReply.child
+        depthTurns = 2
+      }
+    }
+
+    context.debug.selectionExpansionMs += nowMs() - selectionStart
+    const winner = finishPlayoutFromNode(loopStart, leaf, board, rootPlayer, tuning, options, context, appliedPath, depthTurns, counters)
+
+    if (winner === rootPlayer) {
+      const rootAction = rootActionFor(leaf)
+      if (rootAction) {
+        reportProgress(counters.nodesExpanded, counters.playouts, counters.maxDepthTurns)
+        const predictedOpponentReply = bestChildAction(root.children.find((child) => child.actionFromParent === rootAction) ?? null)
+        return enrichDecisionWithSession({
+          moves: rootAction,
+          stats: {
+            mode: 'mcts',
+            elapsedMs: nowMs() - start,
+            nodesExpanded: counters.nodesExpanded,
+            playouts: counters.playouts,
+            boardEvaluations: context.boardEvalCounter.count,
+            maxDepthTurns: counters.maxDepthTurns,
+            rootCandidates: rootCandidates.length,
+            stopReason: 'early_win',
+          },
+        }, session, stateMoveCount, undefined, undefined, predictedOpponentReply, root)
+      }
+    }
+
+    const now = nowMs()
+    if (now - lastYieldAt >= yieldEveryMs) {
+      reportProgress(counters.nodesExpanded, counters.playouts, counters.maxDepthTurns)
+      await sleep0()
+      lastYieldAt = nowMs()
     }
   }
 
-  while (nodesExpanded < options.budget.maxNodes && nowMs() - start < options.budget.maxTimeMs) {
+  while (counters.nodesExpanded < options.budget.maxNodes && nowMs() - start < options.budget.maxTimeMs) {
+    const loopStart = nowMs()
+    const selectionStart = loopStart
     let depthTurns = 0
     let node = root
     const appliedPath: AppliedBoardTurn[] = []
@@ -2166,24 +2533,11 @@ export async function chooseBotTurnDetailedAsyncWithSession(
       const canExpand = node.nextActionIndex < widenLimit
 
       if (canExpand) {
-        const action = node.candidateActions[node.nextActionIndex]
-        node.nextActionIndex += 1
-        const applied = applyTurnLineToBoard(board, action)
-        appliedPath.push(applied)
-        const child: SearchNode = {
-          parent: node,
-          actionFromParent: action,
-          children: [],
-          candidateActions: applied.winner ? [] : enumerateTurnCandidates(board, tuning, childSearchPolicy(tuning, options), context),
-          nextActionIndex: 0,
-          visits: 0,
-          totalValue: 0,
-          winner: applied.winner,
-          stateKey: boardStateKey(board),
-        }
-        node.children.push(child)
-        node = child
-        nodesExpanded += 1
+        const expanded = expandNextChild(node, board, tuning, options, context)
+        if (!expanded) break
+        appliedPath.push(expanded.applied)
+        node = expanded.child
+        counters.nodesExpanded += 1
         depthTurns += 1
         break
       }
@@ -2195,91 +2549,78 @@ export async function chooseBotTurnDetailedAsyncWithSession(
       node = child
       depthTurns += 1
     }
+    context.debug.selectionExpansionMs += nowMs() - selectionStart
 
-    if (depthTurns > maxDepthTurns) maxDepthTurns = depthTurns
-
-    const value = rolloutValue(board, node.winner, rootPlayer, tuning, options, context)
-    playouts += 1
-    let current: SearchNode | null = node
-    while (current) {
-      current.visits += 1
-      current.totalValue += value
-      current = current.parent
-    }
-
-    const winner = node.winner
-    for (let i = appliedPath.length - 1; i >= 0; i -= 1) {
-      undoAppliedTurn(board, appliedPath[i])
-    }
+    const winner = finishPlayoutFromNode(loopStart, node, board, rootPlayer, tuning, options, context, appliedPath, depthTurns, counters)
 
     if (winner === rootPlayer) {
       const rootAction = rootActionFor(node)
       if (rootAction) {
-        reportProgress(nodesExpanded, playouts, maxDepthTurns)
+        reportProgress(counters.nodesExpanded, counters.playouts, counters.maxDepthTurns)
         const predictedOpponentReply = bestChildAction(root.children.find((child) => child.actionFromParent === rootAction) ?? null)
         return enrichDecisionWithSession({
           moves: rootAction,
           stats: {
             mode: 'mcts',
             elapsedMs: nowMs() - start,
-            nodesExpanded,
-            playouts,
+            nodesExpanded: counters.nodesExpanded,
+            playouts: counters.playouts,
             boardEvaluations: context.boardEvalCounter.count,
-            maxDepthTurns,
+            maxDepthTurns: counters.maxDepthTurns,
             rootCandidates: rootCandidates.length,
             stopReason: 'early_win',
           },
-        }, session, stateMoveCount, undefined, undefined, predictedOpponentReply)
+        }, session, stateMoveCount, undefined, undefined, predictedOpponentReply, root)
       }
     }
 
     const now = nowMs()
     if (now - lastYieldAt >= yieldEveryMs) {
-      reportProgress(nodesExpanded, playouts, maxDepthTurns)
+      reportProgress(counters.nodesExpanded, counters.playouts, counters.maxDepthTurns)
       await sleep0()
       lastYieldAt = nowMs()
     }
   }
 
-  if (nodesExpanded >= options.budget.maxNodes) {
+  if (counters.nodesExpanded >= options.budget.maxNodes) {
     stopReason = 'nodes'
   } else if (nowMs() - start >= options.budget.maxTimeMs) {
     stopReason = 'time'
   }
 
   if (root.children.length === 0) {
-    reportProgress(nodesExpanded, playouts, maxDepthTurns)
+    reportProgress(counters.nodesExpanded, counters.playouts, counters.maxDepthTurns)
     return enrichDecisionWithSession({
       moves: chooseGreedyTurnOnBoard(board, tuning, context),
       stats: {
         mode: 'mcts',
         elapsedMs: nowMs() - start,
-        nodesExpanded,
-        playouts,
+        nodesExpanded: counters.nodesExpanded,
+        playouts: counters.playouts,
         boardEvaluations: context.boardEvalCounter.count,
-        maxDepthTurns,
+        maxDepthTurns: counters.maxDepthTurns,
         rootCandidates: rootCandidates.length,
         stopReason: 'fallback',
       },
-    }, session, stateMoveCount)
+    }, session, stateMoveCount, undefined, undefined, undefined, root)
   }
 
   sortRootChildren(root)
 
-  reportProgress(nodesExpanded, playouts, maxDepthTurns)
+  reportProgress(counters.nodesExpanded, counters.playouts, counters.maxDepthTurns)
   return enrichDecisionWithSession({
     moves: root.children[0].actionFromParent ?? chooseGreedyTurnOnBoard(board, tuning, context),
     stats: {
       mode: 'mcts',
       elapsedMs: nowMs() - start,
-      nodesExpanded,
-      playouts,
+      nodesExpanded: counters.nodesExpanded,
+      playouts: counters.playouts,
       boardEvaluations: context.boardEvalCounter.count,
-      maxDepthTurns,
+      maxDepthTurns: counters.maxDepthTurns,
       rootCandidates: rootCandidates.length,
       stopReason,
     },
-  }, session, stateMoveCount, undefined, undefined, bestChildAction(root.children[0] ?? null))
+  }, session, stateMoveCount, undefined, undefined, bestChildAction(root.children[0] ?? null), root)
 }
 
 export function chooseBotTurn(

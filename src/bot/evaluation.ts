@@ -100,8 +100,46 @@ function oneTurnThreatScore(threatGroups: Map<string, number>): number {
   return 0.995
 }
 
-function scoreOffense(counts: number[], diversity: number, tuning: BotTuning): number {
-  const severity = tuning.threatWeights[2] * counts[2] + tuning.threatWeights[3] * counts[3]
+function threatPairCount(count: number): number {
+  if (count <= 1) return 0
+  return (count * (count - 1)) / 2
+}
+
+function weightedThreatSeverity(counts: number[], tuning: BotTuning): number {
+  let severity = 0
+  for (let i = 2; i < counts.length; i += 1) {
+    severity += (tuning.threatWeights[i] ?? 0) * counts[i]
+  }
+  return severity
+}
+
+function threatClusterSeverity(counts: number[], tuning: BotTuning): number {
+  return (
+    threatPairCount(counts[3] ?? 0) * tuning.threat3ClusterBonus +
+    threatPairCount(counts[4] ?? 0) * tuning.threat4ForkBonus +
+    threatPairCount(counts[5] ?? 0) * tuning.threat5ForkBonus
+  )
+}
+
+function oneTurnThreatSeverity(threatGroups: Map<string, number>, tuning: BotTuning): number {
+  const groupCount = threatGroups.size
+  if (groupCount <= 1) return 0
+  const blockers = minimumBlockersRequired(threatGroups)
+  const forkLoad = Math.max(0, blockers - 1)
+  const overlapLoad = Math.max(0, groupCount - blockers)
+  return Math.max(0, forkLoad * tuning.oneTurnForkBonus - overlapLoad * tuning.oneTurnOverlapPenalty)
+}
+
+function scoreOffense(
+  counts: number[],
+  threatGroups: Map<string, number>,
+  diversity: number,
+  tuning: BotTuning,
+): number {
+  const severity =
+    weightedThreatSeverity(counts, tuning) +
+    threatClusterSeverity(counts, tuning) +
+    oneTurnThreatSeverity(threatGroups, tuning)
   if (severity <= 0) return 0
   const scale = Math.max(1, tuning.threatSeverityScale)
   const severityNorm = severity / (severity + scale)
@@ -124,8 +162,8 @@ function analyzeBoard(board: SearchBoard, tuning: BotTuning) {
   const oStones = countStones(board, 'O')
   const xDiversity = pressureDiversity(board.xPressureTotal, board.xPressureEntropySum, board.xPressureMap.size)
   const oDiversity = pressureDiversity(board.oPressureTotal, board.oPressureEntropySum, board.oPressureMap.size)
-  const xOffense = scoreOffense(board.xThreats, xDiversity, tuning)
-  const oOffense = scoreOffense(board.oThreats, oDiversity, tuning)
+  const xOffense = scoreOffense(board.xThreats, board.xOneTurnThreatGroupCounts, xDiversity, tuning)
+  const oOffense = scoreOffense(board.oThreats, board.oOneTurnThreatGroupCounts, oDiversity, tuning)
   const xScore = clamp01(applyTempoDiscount(xOffense + oneTurnThreatScore(board.xOneTurnThreatGroupCounts), xStones, oStones, tuning))
   const oScore = clamp01(applyTempoDiscount(oOffense + oneTurnThreatScore(board.oOneTurnThreatGroupCounts), oStones, xStones, tuning))
   const total = xScore + oScore

@@ -13,6 +13,7 @@ import {
   type BotSearchOptions,
   type BotSearchSession,
   type BotTuning,
+  type EvaluationResult,
 } from './bot/engine'
 
 type Player = 'X' | 'O'
@@ -68,6 +69,59 @@ type ReplayRecord = {
   resultType?: string | null
   moveHistory: MoveRecord[]
   finalBoard: Record<string, Player>
+}
+
+type TelemetryEvaluationSnapshot = Pick<
+  EvaluationResult,
+  | 'xScore'
+  | 'oScore'
+  | 'objectiveForX'
+  | 'objectiveForO'
+  | 'xOneTurnWins'
+  | 'oOneTurnWins'
+  | 'xThreats'
+  | 'oThreats'
+  | 'xDiversity'
+  | 'oDiversity'
+  | 'xPressureMax'
+  | 'oPressureMax'
+>
+
+type BotTelemetryEntry = {
+  id: number
+  recordedAt: string
+  mode: Mode
+  roomId: string | null
+  gameId: string | null
+  sourceState: {
+    turn: Player
+    placementsLeft: number
+    moveCount: number
+  }
+  candidateSummary: {
+    legalCellCount: number
+    topCellCount: number
+    candidateLineCount: number
+    singlePlacementLineCount: number
+    doublePlacementLineCount: number
+  }
+  decisionSummary: {
+    plannedMoveCount: number
+    executedMoveCount: number
+  }
+  stats: BotSearchStats
+  searchOptions: BotSearchOptions
+  tuning: BotTuning
+  evaluationBefore: TelemetryEvaluationSnapshot
+  evaluationAfter: TelemetryEvaluationSnapshot | null
+}
+
+type BotTelemetryFile = {
+  version: 1
+  exportedAt: string
+  app: string
+  entryCount: number
+  entries: BotTelemetryEntry[]
 }
 
 type LiveGameState = {
@@ -1025,12 +1079,42 @@ function clampValue(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value))
 }
 
+function summarizeEvaluation(result: EvaluationResult): TelemetryEvaluationSnapshot {
+  return {
+    xScore: result.xScore,
+    oScore: result.oScore,
+    objectiveForX: result.objectiveForX,
+    objectiveForO: result.objectiveForO,
+    xOneTurnWins: result.xOneTurnWins,
+    oOneTurnWins: result.oOneTurnWins,
+    xThreats: [...result.xThreats],
+    oThreats: [...result.oThreats],
+    xDiversity: result.xDiversity,
+    oDiversity: result.oDiversity,
+    xPressureMax: result.xPressureMax,
+    oPressureMax: result.oPressureMax,
+  }
+}
+
+function createBotTelemetryDownload(filename: string, payload: BotTelemetryFile): void {
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = filename
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  URL.revokeObjectURL(url)
+}
+
 function App() {
   const wrapperRef = useRef<HTMLDivElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const initializedRef = useRef(false)
   const wsRef = useRef<WebSocket | null>(null)
   const botSearchSessionRef = useRef<BotSearchSession>(createBotSearchSession())
+  const botTelemetryIdRef = useRef(1)
 
   const [size, setSize] = useState({ width: 0, height: 0 })
   const [camera, setCamera] = useState<Camera>({ x: 0, y: 0, zoom: 1 })
@@ -1073,6 +1157,8 @@ function App() {
   const [liveBotBoardEvals, setLiveBotBoardEvals] = useState(0)
   const [liveBotElapsedMs, setLiveBotElapsedMs] = useState(0)
   const [lastBotStats, setLastBotStats] = useState<BotSearchStats | null>(null)
+  const [botTelemetryEnabled, setBotTelemetryEnabled] = useState(false)
+  const [botTelemetryEntries, setBotTelemetryEntries] = useState<BotTelemetryEntry[]>([])
   const [showRulesModal, setShowRulesModal] = useState(false)
   const [dockOpen, setDockOpen] = useState(true)
   const [replayRecord, setReplayRecord] = useState<ReplayRecord | null>(null)
@@ -1714,6 +1800,20 @@ function App() {
     setLiveBotElapsedMs(0)
 
     try {
+      const candidateSnapshot = botTelemetryEnabled
+        ? inspectBotCandidates(
+            {
+              moves: sourceState.moves,
+              moveHistory: sourceState.moveHistory,
+              turn: sourceState.turn,
+              placementsLeft: sourceState.placementsLeft,
+            },
+            botTuning,
+            botSearchOptions,
+          )
+        : null
+      const evaluationBefore = botTelemetryEnabled ? summarizeEvaluation(evaluateBoardState(sourceState.moves, botTuning)) : null
+
       await new Promise<void>((resolve) => window.setTimeout(resolve, 0))
       const decision =
         botSearchOptions.budget.maxTimeMs > 0 && botSearchOptions.budget.maxNodes > 0
@@ -1751,6 +1851,51 @@ function App() {
 
       setLastBotStats(decision.stats)
       const plannedMoves = decision.moves
+      if (botTelemetryEnabled && candidateSnapshot && evaluationBefore) {
+        const nextMoves = new Map(sourceState.moves)
+        let executedMoveCount = 0
+        for (const move of plannedMoves) {
+          if (executedMoveCount >= sourceState.placementsLeft) break
+          const key = toKey(move.q, move.r)
+          if (nextMoves.has(key)) continue
+          nextMoves.set(key, sourceState.turn)
+          executedMoveCount += 1
+        }
+        const singlePlacementLineCount = candidateSnapshot.candidateLines.filter((line) => line.length === 1).length
+        const doublePlacementLineCount = candidateSnapshot.candidateLines.filter((line) => line.length >= 2).length
+
+        setBotTelemetryEntries((prev) => [
+          ...prev,
+          {
+            id: botTelemetryIdRef.current++,
+            recordedAt: new Date().toISOString(),
+            mode,
+            roomId: joinedRoom,
+            gameId: trackedGameId,
+            sourceState: {
+              turn: sourceState.turn,
+              placementsLeft: sourceState.placementsLeft,
+              moveCount: sourceState.moveHistory.length,
+            },
+            candidateSummary: {
+              legalCellCount: candidateSnapshot.legalCells.length,
+              topCellCount: candidateSnapshot.topCells.length,
+              candidateLineCount: candidateSnapshot.candidateLines.length,
+              singlePlacementLineCount,
+              doublePlacementLineCount,
+            },
+            decisionSummary: {
+              plannedMoveCount: plannedMoves.length,
+              executedMoveCount,
+            },
+            stats: JSON.parse(JSON.stringify(decision.stats)) as BotSearchStats,
+            searchOptions: JSON.parse(JSON.stringify(botSearchOptions)) as BotSearchOptions,
+            tuning: JSON.parse(JSON.stringify(botTuning)) as BotTuning,
+            evaluationBefore,
+            evaluationAfter: executedMoveCount > 0 ? summarizeEvaluation(evaluateBoardState(nextMoves, botTuning)) : null,
+          },
+        ])
+      }
 
       if (plannedMoves.length === 0) {
         return
@@ -1785,12 +1930,14 @@ function App() {
     }
   }, [
     botSearchOptions,
+    botTelemetryEnabled,
     botTuning,
     isBotThinking,
     isReplayMode,
     joinedRoom,
     liveState,
     mode,
+    trackedGameId,
   ])
 
   const setThreatWeight = (idx: number, value: number) => {
@@ -1800,6 +1947,22 @@ function App() {
       return { ...prev, threatWeights: next }
     })
   }
+
+  const clearBotTelemetry = useCallback(() => {
+    setBotTelemetryEntries([])
+  }, [])
+
+  const downloadBotTelemetry = useCallback(() => {
+    const payload: BotTelemetryFile = {
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      app: 'hex-ttt',
+      entryCount: botTelemetryEntries.length,
+      entries: botTelemetryEntries,
+    }
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
+    createBotTelemetryDownload(`hex-ttt-bot-telemetry-${timestamp}.json`, payload)
+  }, [botTelemetryEntries])
 
   const setAutoBotMode = useCallback((side: 'off' | 'X' | 'O' | 'both') => {
     const botOwnsX = side === 'X' || side === 'both'
@@ -2912,6 +3075,28 @@ function App() {
                               </button>
                             </div>
                             <div className="compute-panel">
+                              <div className="button-row">
+                                <label className="compute-meta">
+                                  <input
+                                    type="checkbox"
+                                    checked={botTelemetryEnabled}
+                                    onChange={(event) => setBotTelemetryEnabled(event.target.checked)}
+                                  />{' '}
+                                  Capture debug telemetry
+                                </label>
+                                <button onClick={downloadBotTelemetry} type="button" disabled={botTelemetryEntries.length === 0}>
+                                  Download telemetry
+                                </button>
+                                <button onClick={clearBotTelemetry} type="button" disabled={botTelemetryEntries.length === 0}>
+                                  Clear telemetry
+                                </button>
+                                <div className="compute-meta">Entries: {botTelemetryEntries.length}</div>
+                              </div>
+                              {botTelemetryEnabled ? (
+                                <div className="compute-meta">
+                                  Each bot run logs the pre-move state, candidate snapshot, search stats, and post-move evaluation into an in-memory JSON log.
+                                </div>
+                              ) : null}
                               <label className="compute-label" htmlFor="bot-compute-slider">
                                 Search time limit: {botThinkSeconds.toFixed(1)}s
                                 <HintPill text="0.0s uses greedy only. Higher values run budgeted MCTS with guided (non-random) simulation and larger node caps." />
@@ -2937,6 +3122,26 @@ function App() {
                                   {lastBotStats.playouts.toLocaleString()} | search depth {lastBotStats.maxDepthTurns} turns | candidate lines{' '}
                                   {lastBotStats.rootCandidates} | stop {lastBotStats.stopReason}
                                 </div>
+                              ) : null}
+                              {lastBotStats?.debug ? (
+                                <>
+                                  <div className="compute-meta">
+                                    Root coverage: visited {lastBotStats.debug.rootVisitedChildren} / {lastBotStats.debug.rootVisitedChildren + lastBotStats.debug.rootUnvisitedChildren} |
+                                    best visit share {(lastBotStats.debug.rootBestChildVisitShare * 100).toFixed(1)}% | avg opp replies explored{' '}
+                                    {lastBotStats.debug.rootAvgOpponentRepliesExplored.toFixed(2)} | max {lastBotStats.debug.rootMaxOpponentRepliesExplored}
+                                  </div>
+                                  <div className="compute-meta">
+                                    Timing: root setup {lastBotStats.debug.rootSetupMs.toFixed(1)}ms | root scan {lastBotStats.debug.rootImmediateWinScanMs.toFixed(1)}ms |
+                                    loop {lastBotStats.debug.mctsLoopMs.toFixed(1)}ms | select/expand {lastBotStats.debug.selectionExpansionMs.toFixed(1)}ms | rollout{' '}
+                                    {lastBotStats.debug.rolloutEvalMs.toFixed(1)}ms | undo/backprop {lastBotStats.debug.backpropUndoMs.toFixed(1)}ms | avg/playout{' '}
+                                    {lastBotStats.debug.averagePlayoutMs.toFixed(3)}ms
+                                  </div>
+                                  <div className="compute-meta">
+                                    Leaves: static {lastBotStats.debug.staticLeafEvals} | tactical {lastBotStats.debug.tacticalLeafEvals} | terminal{' '}
+                                    {lastBotStats.debug.terminalLeafHits} | own turn {lastBotStats.debug.leafEvalOwnTurnCount} | opp turn{' '}
+                                    {lastBotStats.debug.leafEvalOpponentTurnCount} | forcing {lastBotStats.debug.forcingStatus}
+                                  </div>
+                                </>
                               ) : null}
                               {lastBotStats?.session &&
                               (lastBotStats.session.reusedFromTree ||

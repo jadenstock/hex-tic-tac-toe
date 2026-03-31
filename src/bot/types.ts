@@ -113,6 +113,37 @@ export type BotSearchSessionStats = {
   forcingCacheMisses: number
 }
 
+export type BotSearchDebugStats = {
+  rolloutCalls: number
+  tacticalExtensionCalls: number
+  staticLeafEvals: number
+  tacticalLeafEvals: number
+  terminalLeafHits: number
+  leafEvalOwnTurnCount: number
+  leafEvalOpponentTurnCount: number
+  rootSetupMs: number
+  rootImmediateWinScanMs: number
+  mctsLoopMs: number
+  selectionExpansionMs: number
+  rolloutEvalMs: number
+  backpropUndoMs: number
+  averagePlayoutMs: number
+  forcingAttempted: boolean
+  forcingSolvedWin: boolean
+  forcingStatus: 'not_attempted' | 'win' | 'loss' | 'unknown'
+  rootVisitedChildren: number
+  rootUnvisitedChildren: number
+  rootChildrenWithOpponentReplies: number
+  rootChildrenWithoutOpponentReplies: number
+  rootAvgOpponentRepliesExplored: number
+  rootMaxOpponentRepliesExplored: number
+  rootBestChildVisits: number
+  rootSecondChildVisits: number
+  rootBestChildValue: number
+  rootSecondChildValue: number
+  rootBestChildVisitShare: number
+}
+
 export type BotSearchStats = {
   mode: BotSearchMode
   elapsedMs: number
@@ -121,8 +152,9 @@ export type BotSearchStats = {
   boardEvaluations: number
   maxDepthTurns: number
   rootCandidates: number
-  stopReason: 'budget_zero' | 'time' | 'nodes' | 'terminal' | 'no_candidates' | 'fallback' | 'early_win'
+  stopReason: 'budget_zero' | 'time' | 'nodes' | 'terminal' | 'no_candidates' | 'fallback' | 'early_win' | 'single_candidate'
   session?: BotSearchSessionStats
+  debug?: BotSearchDebugStats
   predictedOpponentReply?: Axial[]
   postMoveCount?: number
 }
