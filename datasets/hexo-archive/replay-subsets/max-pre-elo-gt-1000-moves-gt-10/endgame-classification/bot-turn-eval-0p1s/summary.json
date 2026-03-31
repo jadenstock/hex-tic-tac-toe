@@ -1,0 +1,67 @@
+{
+  "inputPath": "/home/jaden/hex-ttt/datasets/hexo-archive/replay-subsets/max-pre-elo-gt-1000-moves-gt-10/endgame-classification/forced.jsonl",
+  "timeLimitSeconds": 0.1,
+  "totalGames": 37,
+  "evaluatedGames": 37,
+  "skippedGames": 0,
+  "tacticalSuccesses": 37,
+  "tacticalSuccessRate": 1,
+  "tacticalOutcomes": {
+    "immediate-win": 18,
+    "forced-next-turn": 19,
+    "not-forced": 0,
+    "illegal-or-incomplete": 0
+  },
+  "overlapCounts": {
+    "0": 17,
+    "1": 7,
+    "2": 13
+  },
+  "exactSetMatches": 13,
+  "averageMatchedMoves": 0.8918918918918919,
+  "averageBotElapsedMs": 77241.0061434595,
+  "averageBotNodesExpanded": 1,
+  "averageBotPlayouts": 0,
+  "byResultReason": {
+    "surrender": {
+      "total": 17,
+      "tacticalSuccesses": 17,
+      "overlapCounts": {
+        "0": 3,
+        "1": 7,
+        "2": 7
+      }
+    },
+    "six-in-a-row": {
+      "total": 18,
+      "tacticalSuccesses": 18,
+      "overlapCounts": {
+        "0": 13,
+        "1": 0,
+        "2": 5
+      }
+    },
+    "timeout": {
+      "total": 1,
+      "tacticalSuccesses": 1,
+      "overlapCounts": {
+        "0": 1,
+        "1": 0,
+        "2": 0
+      }
+    },
+    "disconnect": {
+      "total": 1,
+      "tacticalSuccesses": 1,
+      "overlapCounts": {
+        "0": 0,
+        "1": 0,
+        "2": 1
+      }
+    }
+  },
+  "actualTurnMoveCounts": {
+    "1": 0,
+    "2": 37
+  }
+}
