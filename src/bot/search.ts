@@ -52,6 +52,8 @@ type RankedPlacement = {
 type CandidateGenerationPolicy = {
   topCellCount: number
   maxLineCount: number
+  colonyProbeCount: number
+  colonyDistance: number
 }
 
 type SearchNode = {
@@ -224,6 +226,14 @@ const TACTICAL_EXTENSION_DEPTH = 6
 const FORCING_SOLVER_DEPTH = 8
 const MAX_EVALUATION_CACHE_ENTRIES = 2_000
 const MAX_CANDIDATE_CACHE_ENTRIES = 256
+const COLONY_DIRECTIONS: ReadonlyArray<Axial> = [
+  { q: 1, r: 0 },
+  { q: 0, r: 1 },
+  { q: 1, r: -1 },
+  { q: -1, r: 0 },
+  { q: 0, r: -1 },
+  { q: -1, r: 1 },
+]
 
 function uniqueAxials(cells: Axial[]): Axial[] {
   const seen = new Set<string>()
@@ -375,7 +385,71 @@ function collectDefensiveResponseCandidateKeys(board: SearchBoard, player: Playe
   return candidates
 }
 
-function collectLegalCandidates(board: SearchBoard, player: Player, tuning: BotTuning, targetCount = 0): Axial[] {
+function axialDistance(a: Axial, b: Axial): number {
+  const dq = a.q - b.q
+  const dr = a.r - b.r
+  const ds = -dq - dr
+  return Math.max(Math.abs(dq), Math.abs(dr), Math.abs(ds))
+}
+
+function collectColonyCandidates(board: SearchBoard, count: number, distance: number): Axial[] {
+  if (count <= 0 || distance <= 0 || board.moveHistory.length < 6) return []
+
+  const occupied = board.moveHistory.map((move) => ({ q: move.q, r: move.r }))
+  const byDirection = COLONY_DIRECTIONS.map((direction) => {
+    let bestAnchor = occupied[0]
+    let bestProjection = bestAnchor.q * direction.q + bestAnchor.r * direction.r
+    for (let i = 1; i < occupied.length; i += 1) {
+      const move = occupied[i]
+      const projection = move.q * direction.q + move.r * direction.r
+      if (projection > bestProjection) {
+        bestProjection = projection
+        bestAnchor = move
+      }
+    }
+
+    const candidate = {
+      q: bestAnchor.q + direction.q * distance,
+      r: bestAnchor.r + direction.r * distance,
+    }
+
+    let nearestDistance = Number.POSITIVE_INFINITY
+    for (const move of occupied) {
+      nearestDistance = Math.min(nearestDistance, axialDistance(candidate, move))
+    }
+
+    return {
+      candidate,
+      nearestDistance,
+      frontier: bestProjection,
+    }
+  })
+
+  byDirection.sort((a, b) => {
+    if (a.nearestDistance !== b.nearestDistance) return b.nearestDistance - a.nearestDistance
+    return b.frontier - a.frontier
+  })
+
+  const picks: Axial[] = []
+  const seen = new Set<string>()
+  for (const entry of byDirection) {
+    const key = toKey(entry.candidate.q, entry.candidate.r)
+    if (board.moves.has(key) || seen.has(key)) continue
+    seen.add(key)
+    picks.push(entry.candidate)
+    if (picks.length >= count) break
+  }
+
+  return sortAxials(picks)
+}
+
+function collectLegalCandidates(
+  board: SearchBoard,
+  player: Player,
+  tuning: BotTuning,
+  targetCount = 0,
+  colonyConfig?: { count: number; distance: number },
+): Axial[] {
   const opponent: Player = player === 'X' ? 'O' : 'X'
   const ownFinishes = collectOneTurnFinishCells(board, player)
   if (ownFinishes.size > 0) {
@@ -389,20 +463,24 @@ function collectLegalCandidates(board: SearchBoard, player: Player, tuning: BotT
 
   const connected = collectThreatConnectedCandidates(board, player)
   const defensiveKeys = collectDefensiveResponseCandidateKeys(board, player)
+  const colonyCandidates =
+    colonyConfig && !hasImmediateThreats(board)
+      ? collectColonyCandidates(board, colonyConfig.count, colonyConfig.distance)
+      : []
   const primary = uniqueAxials([...connected, ...sortAxials([...defensiveKeys].map(fromKey))])
   const fallback = sortAxials(candidateCells(board, tuning.candidateRadius))
   if (primary.length > 0) {
-    if (primary.length >= targetCount || fallback.length === 0) {
-      return primary
+    if (targetCount <= 0) {
+      return uniqueAxials([...primary, ...colonyCandidates])
     }
 
     const primaryKeys = new Set(primary.map((cell) => toKey(cell.q, cell.r)))
     const needed = Math.max(0, targetCount - primary.length)
     const fallbackSupplement = fallback.filter((cell) => !primaryKeys.has(toKey(cell.q, cell.r))).slice(0, needed)
-    return uniqueAxials([...primary, ...fallbackSupplement])
+    return uniqueAxials([...primary, ...colonyCandidates, ...fallbackSupplement])
   }
 
-  return fallback
+  return uniqueAxials([...colonyCandidates, ...fallback])
 }
 
 function objectiveForPlayer(result: EvaluationSummary, player: Player, tuning: BotTuning): number {
@@ -461,6 +539,8 @@ function candidatePolicyKey(policy: CandidateGenerationPolicy, tuning: BotTuning
   return [
     policy.topCellCount,
     policy.maxLineCount,
+    policy.colonyProbeCount,
+    policy.colonyDistance,
     tuning.candidateRadius,
     tuning.topKFirstMoves,
   ].join('|')
@@ -553,7 +633,11 @@ function enumerateTurnCandidates(
   const baselineOppWins = opponentOneTurnWins(baseEval, player)
 
   const topCellCount = Math.max(1, Math.floor(policy.topCellCount))
-  const firstPool = collectLegalCandidates(board, player, tuning, topCellCount)
+  const colonyConfig =
+    policy.colonyProbeCount > 0 && policy.colonyDistance > 0
+      ? { count: policy.colonyProbeCount, distance: policy.colonyDistance }
+      : undefined
+  const firstPool = collectLegalCandidates(board, player, tuning, topCellCount, colonyConfig)
   const firstRanked = rankPlacements(board, player, tuning, firstPool, context)
   if (firstRanked.length === 0) {
     setBoundedCacheEntry(context.candidateCache, cacheKey, [], MAX_CANDIDATE_CACHE_ENTRIES)
@@ -609,7 +693,7 @@ function enumerateTurnCandidates(
       const firstUndo = makeBoardMove(board, first, player)
       if (!firstUndo) continue
 
-      const secondPool = collectLegalCandidates(board, player, tuning, topCellCount)
+      const secondPool = collectLegalCandidates(board, player, tuning, topCellCount, colonyConfig)
       const secondRanked = rankPlacements(board, player, tuning, secondPool, context).slice(0, topCellCount)
 
       if (secondRanked.length === 0) {
@@ -709,10 +793,6 @@ function enumerateTurnCandidates(
 
   setBoundedCacheEntry(context.candidateCache, cacheKey, cloneCandidateLines(picks), MAX_CANDIDATE_CACHE_ENTRIES)
   return picks
-}
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.max(min, Math.min(max, value))
 }
 
 function nowMs(): number {
@@ -1068,6 +1148,8 @@ function greedyCandidatePolicy(tuning: BotTuning, candidateCount: number): Candi
   return {
     topCellCount: widenedTopCellCount(tuning.topKFirstMoves, candidateCount, 3),
     maxLineCount: Math.max(8, Math.min(candidateCount, 24)),
+    colonyProbeCount: 2,
+    colonyDistance: 7,
   }
 }
 
@@ -1075,6 +1157,8 @@ function rootSearchPolicy(tuning: BotTuning, options: BotSearchOptions): Candida
   return {
     topCellCount: widenedTopCellCount(tuning.topKFirstMoves, options.turnCandidateCount, 3),
     maxLineCount: Math.max(8, Math.min(options.turnCandidateCount * 2, 32)),
+    colonyProbeCount: 2,
+    colonyDistance: 7,
   }
 }
 
@@ -1082,13 +1166,8 @@ function childSearchPolicy(tuning: BotTuning, options: BotSearchOptions): Candid
   return {
     topCellCount: widenedTopCellCount(tuning.topKFirstMoves, options.childTurnCandidateCount, 2),
     maxLineCount: Math.max(6, Math.min(options.childTurnCandidateCount, 20)),
-  }
-}
-
-function rolloutSearchPolicy(options: BotSearchOptions): CandidateGenerationPolicy {
-  return {
-    topCellCount: Math.max(1, Math.min(Math.floor(options.simulationTurnCandidateCount), Math.floor(options.simulationTopKFirstMoves))),
-    maxLineCount: Math.max(4, Math.min(Math.floor(options.simulationTurnCandidateCount), 10)),
+    colonyProbeCount: 0,
+    colonyDistance: 0,
   }
 }
 
@@ -1434,31 +1513,7 @@ function rolloutValue(
       tacticalLines,
     )
   }
-
-  const rolloutTuning: BotTuning = {
-    ...tuning,
-    candidateRadius: clamp(options.simulationRadius, 1, 7),
-    topKFirstMoves: Math.max(1, Math.floor(options.simulationTopKFirstMoves)),
-  }
-
-  const rolloutTurns: AppliedBoardTurn[] = []
-  let winner: Player | null = null
-
-  for (let depth = 0; depth < options.maxSimulationTurns; depth += 1) {
-    const plan = enumerateTurnCandidates(board, rolloutTuning, rolloutSearchPolicy(options), context)
-    const chosen = plan.length > 0 ? plan[0] : chooseGreedyTurnOnBoard(board, rolloutTuning, context, options.simulationTurnCandidateCount)
-    if (chosen.length === 0) break
-    const applied = applyTurnLineToBoard(board, chosen)
-    rolloutTurns.push(applied)
-    winner = applied.winner
-    if (winner) break
-  }
-
-  const value = evaluateNodeForRoot(board, winner, rootPlayer, tuning, context)
-  for (let i = rolloutTurns.length - 1; i >= 0; i -= 1) {
-    undoAppliedTurn(board, rolloutTurns[i])
-  }
-  return value
+  return evaluateNodeForRoot(board, null, rootPlayer, tuning, context)
 }
 
 function shouldAttemptForcingSolve(board: SearchBoard, player: Player): boolean {
@@ -1497,7 +1552,15 @@ export function inspectBotCandidates(
   }
 
   const policy = rootSearchPolicy(tuning, options)
-  const firstPool = collectLegalCandidates(board, board.turn, tuning, Math.max(1, Math.floor(policy.topCellCount)))
+  const firstPool = collectLegalCandidates(
+    board,
+    board.turn,
+    tuning,
+    Math.max(1, Math.floor(policy.topCellCount)),
+    policy.colonyProbeCount > 0 && policy.colonyDistance > 0
+      ? { count: policy.colonyProbeCount, distance: policy.colonyDistance }
+      : undefined,
+  )
   const ranked = rankPlacements(board, board.turn, tuning, firstPool, context)
   const topCells = ranked.slice(0, Math.max(1, Math.floor(policy.topCellCount))).map((entry) => entry.option)
   const candidateLines = enumerateTurnCandidates(board, tuning, policy, context)
