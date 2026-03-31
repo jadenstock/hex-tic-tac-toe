@@ -29,6 +29,14 @@ export type SearchBoard = {
   oPressureTotal: number
   xPressureEntropySum: number
   oPressureEntropySum: number
+  xPressureByThreatMaps: Array<Map<string, number>>
+  oPressureByThreatMaps: Array<Map<string, number>>
+  xPressureTotalsByThreat: number[]
+  oPressureTotalsByThreat: number[]
+  xPressureEntropySumsByThreat: number[]
+  oPressureEntropySumsByThreat: number[]
+  xThreatDirectionCounts: number[][]
+  oThreatDirectionCounts: number[][]
   xOneTurnThreatGroupCounts: Map<string, number>
   oOneTurnThreatGroupCounts: Map<string, number>
 }
@@ -118,6 +126,39 @@ function adjustPressureSummary(board: SearchBoard, player: Player, key: string, 
   }
 }
 
+function adjustPressureSummaryByThreat(
+  board: SearchBoard,
+  player: Player,
+  threatCount: number,
+  key: string,
+  delta: number,
+): void {
+  if (delta === 0 || threatCount < 0 || threatCount > WIN_LENGTH) return
+  const maps = player === 'X' ? board.xPressureByThreatMaps : board.oPressureByThreatMaps
+  const totals = player === 'X' ? board.xPressureTotalsByThreat : board.oPressureTotalsByThreat
+  const entropySums = player === 'X' ? board.xPressureEntropySumsByThreat : board.oPressureEntropySumsByThreat
+  const map = maps[threatCount]
+  const previous = map.get(key) ?? 0
+  const next = previous + delta
+
+  totals[threatCount] -= previous
+  if (previous > 0) entropySums[threatCount] -= previous * Math.log(previous)
+
+  if (next <= 1e-9) {
+    map.delete(key)
+  } else {
+    map.set(key, next)
+    totals[threatCount] += next
+    entropySums[threatCount] += next * Math.log(next)
+  }
+}
+
+function adjustThreatDirectionCount(board: SearchBoard, player: Player, threatCount: number, directionIndex: number, delta: number): void {
+  if (threatCount < 0 || threatCount > WIN_LENGTH) return
+  const counts = player === 'X' ? board.xThreatDirectionCounts : board.oThreatDirectionCounts
+  counts[threatCount][directionIndex] += delta
+}
+
 function adjustThreatGroup(board: SearchBoard, player: Player, groupKey: string, delta: number): void {
   const groups = player === 'X' ? board.xOneTurnThreatGroupCounts : board.oOneTurnThreatGroupCounts
   const previous = groups.get(groupKey) ?? 0
@@ -164,6 +205,7 @@ function applyWindowContribution(
 ): void {
   if (window.xCount > 0 && window.oCount === 0) {
     board.xThreats[window.xCount] += delta
+    adjustThreatDirectionCount(board, 'X', window.xCount, window.directionIndex, delta)
     const emptyCount = WIN_LENGTH - window.xCount
     const pressureWeight = THREAT_PRESSURE_WEIGHTS[window.xCount] ?? 0
     if (pressureWeight > 0 && emptyCount > 0) {
@@ -171,6 +213,7 @@ function applyWindowContribution(
       for (const cellKey of window.cellKeys) {
         if (windowCellIsOccupied(board, cellKey, changedKey, changedOccupied)) continue
         adjustPressureSummary(board, 'X', cellKey, share * delta)
+        adjustPressureSummaryByThreat(board, 'X', window.xCount, cellKey, share * delta)
       }
     }
     if (window.xCount >= 4 && emptyCount <= 2) {
@@ -178,6 +221,7 @@ function applyWindowContribution(
     }
   } else if (window.oCount > 0 && window.xCount === 0) {
     board.oThreats[window.oCount] += delta
+    adjustThreatDirectionCount(board, 'O', window.oCount, window.directionIndex, delta)
     const emptyCount = WIN_LENGTH - window.oCount
     const pressureWeight = THREAT_PRESSURE_WEIGHTS[window.oCount] ?? 0
     if (pressureWeight > 0 && emptyCount > 0) {
@@ -185,6 +229,7 @@ function applyWindowContribution(
       for (const cellKey of window.cellKeys) {
         if (windowCellIsOccupied(board, cellKey, changedKey, changedOccupied)) continue
         adjustPressureSummary(board, 'O', cellKey, share * delta)
+        adjustPressureSummaryByThreat(board, 'O', window.oCount, cellKey, share * delta)
       }
     }
     if (window.oCount >= 4 && emptyCount <= 2) {
@@ -274,6 +319,8 @@ export function isWinningPlacement(board: SearchBoard, q: number, r: number, pla
 }
 
 export function createSearchBoard(state: LiveLikeState): SearchBoard {
+  const createPressureMaps = () => Array.from({ length: WIN_LENGTH + 1 }, () => new Map<string, number>())
+  const createDirectionCounts = () => Array.from({ length: WIN_LENGTH + 1 }, () => Array<number>(WIN_DIRECTIONS.length).fill(0))
   const board: SearchBoard = {
     moves: new Map(),
     moveHistory: [...state.moveHistory],
@@ -290,6 +337,14 @@ export function createSearchBoard(state: LiveLikeState): SearchBoard {
     oPressureTotal: 0,
     xPressureEntropySum: 0,
     oPressureEntropySum: 0,
+    xPressureByThreatMaps: createPressureMaps(),
+    oPressureByThreatMaps: createPressureMaps(),
+    xPressureTotalsByThreat: Array<number>(WIN_LENGTH + 1).fill(0),
+    oPressureTotalsByThreat: Array<number>(WIN_LENGTH + 1).fill(0),
+    xPressureEntropySumsByThreat: Array<number>(WIN_LENGTH + 1).fill(0),
+    oPressureEntropySumsByThreat: Array<number>(WIN_LENGTH + 1).fill(0),
+    xThreatDirectionCounts: createDirectionCounts(),
+    oThreatDirectionCounts: createDirectionCounts(),
     xOneTurnThreatGroupCounts: new Map(),
     oOneTurnThreatGroupCounts: new Map(),
   }

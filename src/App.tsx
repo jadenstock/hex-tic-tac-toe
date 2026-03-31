@@ -81,10 +81,14 @@ type TelemetryEvaluationSnapshot = Pick<
   | 'oOneTurnWins'
   | 'xThreats'
   | 'oThreats'
-  | 'xDiversity'
-  | 'oDiversity'
-  | 'xPressureMax'
-  | 'oPressureMax'
+  | 'xOffense'
+  | 'oOffense'
+  | 'xThreat3DirectionCount'
+  | 'oThreat3DirectionCount'
+  | 'xThreat3BlockerBurden'
+  | 'oThreat3BlockerBurden'
+  | 'xThreat3StructureSeverity'
+  | 'oThreat3StructureSeverity'
 >
 
 type BotTelemetryEntry = {
@@ -1089,10 +1093,14 @@ function summarizeEvaluation(result: EvaluationResult): TelemetryEvaluationSnaps
     oOneTurnWins: result.oOneTurnWins,
     xThreats: [...result.xThreats],
     oThreats: [...result.oThreats],
-    xDiversity: result.xDiversity,
-    oDiversity: result.oDiversity,
-    xPressureMax: result.xPressureMax,
-    oPressureMax: result.oPressureMax,
+    xOffense: result.xOffense,
+    oOffense: result.oOffense,
+    xThreat3DirectionCount: result.xThreat3DirectionCount,
+    oThreat3DirectionCount: result.oThreat3DirectionCount,
+    xThreat3BlockerBurden: result.xThreat3BlockerBurden,
+    oThreat3BlockerBurden: result.oThreat3BlockerBurden,
+    xThreat3StructureSeverity: result.xThreat3StructureSeverity,
+    oThreat3StructureSeverity: result.oThreat3StructureSeverity,
   }
 }
 
@@ -1146,7 +1154,6 @@ function App() {
   const [showThreatHighlights, setShowThreatHighlights] = useState(false)
   const [showPressureMap, setShowPressureMap] = useState(false)
   const [showBotCandidateCells, setShowBotCandidateCells] = useState(false)
-  const [showPredictedReply, setShowPredictedReply] = useState(false)
   const [autoBotEnabled, setAutoBotEnabled] = useState(false)
   const [autoBotSide, setAutoBotSide] = useState<'X' | 'O' | 'both'>('both')
   const [botThinkSeconds, setBotThinkSeconds] = useState(2)
@@ -1470,16 +1477,6 @@ function App() {
     for (const cell of botCandidateSnapshot?.topCells ?? []) keys.add(toKey(cell.q, cell.r))
     return keys
   }, [botCandidateSnapshot])
-  const predictedReplyKeys = useMemo(() => {
-    const keys = new Set<string>()
-    if (!lastBotStats?.predictedOpponentReply) return keys
-    if (lastBotStats.postMoveCount !== displayState.moveHistory.length) return keys
-    for (const cell of lastBotStats.predictedOpponentReply) {
-      keys.add(toKey(cell.q, cell.r))
-    }
-    return keys
-  }, [displayState.moveHistory.length, lastBotStats])
-
   const liveStatus = useMemo(() => {
     if (replayRecord) {
       return `Replay move ${replayStep}/${replayRecord.moveHistory.length}`
@@ -2383,50 +2380,6 @@ function App() {
       ctx.restore()
     }
 
-    if (showPredictedReply && predictedReplyKeys.size > 0) {
-      for (const key of predictedReplyKeys) {
-        if (displayState.moves.has(key)) continue
-        if (hiddenDeadHexKeySet.has(key)) continue
-
-        const { q, r } = fromKey(key)
-        const world = axialToWorld(q, r, BASE_HEX_SIZE)
-        const screen = worldToScreen(world.x, world.y)
-        const overlaySize = BASE_HEX_SIZE * camera.zoom * 0.92
-        const overlayRadius = BASE_HEX_SIZE * camera.zoom * 0.46
-        const strokeColor = displayState.turn === 'X' ? theme.xColor : theme.oColor
-        const fillColor = displayState.turn === 'X' ? theme.xFill : theme.oFill
-
-        ctx.save()
-        ctx.globalAlpha = 0.2
-        ctx.beginPath()
-        for (let i = 0; i < 6; i += 1) {
-          const angle = (Math.PI / 180) * (60 * i - 30)
-          const px = screen.x + overlaySize * Math.cos(angle)
-          const py = screen.y + overlaySize * Math.sin(angle)
-          if (i === 0) ctx.moveTo(px, py)
-          else ctx.lineTo(px, py)
-        }
-        ctx.closePath()
-        ctx.fillStyle = fillColor
-        ctx.fill()
-
-        ctx.globalAlpha = 0.95
-        ctx.strokeStyle = strokeColor
-        ctx.lineWidth = Math.max(2, camera.zoom * 2.4)
-        ctx.setLineDash([Math.max(4, camera.zoom * 4), Math.max(4, camera.zoom * 4)])
-        ctx.beginPath()
-        ctx.arc(screen.x, screen.y, overlayRadius, 0, Math.PI * 2)
-        ctx.stroke()
-
-        ctx.setLineDash([])
-        ctx.beginPath()
-        ctx.arc(screen.x, screen.y, Math.max(2, camera.zoom * 2.6), 0, Math.PI * 2)
-        ctx.fillStyle = strokeColor
-        ctx.fill()
-        ctx.restore()
-      }
-    }
-
     if (showThreatHighlights) {
       const drawThreatDot = (key: string, fill: string, line: string, radiusScale: number) => {
         if (displayState.moves.has(key)) return
@@ -2501,12 +2454,10 @@ function App() {
     highlightedKeys,
     botLegalCandidateKeys,
     botTopCandidateKeys,
-    predictedReplyKeys,
     hideDeadHexes,
     moveNumberByKey,
     pieceStyle,
     showBotCandidateCells,
-    showPredictedReply,
     showMoveNumbers,
     showPressureMap,
     showThreatHighlights,
@@ -3146,8 +3097,7 @@ function App() {
                               {lastBotStats?.session &&
                               (lastBotStats.session.reusedFromTree ||
                                 lastBotStats.session.currentTree.nodeCount > 0 ||
-                                lastBotStats.session.keptAfterMove ||
-                                (lastBotStats.predictedOpponentReply?.length ?? 0) > 0) ? (
+                                lastBotStats.session.keptAfterMove) ? (
                                 <>
                                   <div className="compute-meta">
                                     Forcing line: {lastBotStats.session.reusedFromTree ? 'reused' : 'fresh'}
@@ -3165,13 +3115,26 @@ function App() {
                                     {lastBotStats.session.currentTree.averageLeafDepth.toFixed(2)}
                                     </div>
                                   ) : null}
-                                  {lastBotStats.predictedOpponentReply && lastBotStats.predictedOpponentReply.length > 0 ? (
-                                    <div className="compute-meta">
-                                      Predicted reply {lastBotStats.predictedOpponentReply.map((cell) => `(${cell.q},${cell.r})`).join(' ')}
-                                    </div>
-                                  ) : null}
                                 </>
                               ) : null}
+                              <div className="button-row">
+                                <label className="play-as">
+                                  Show pressure map
+                                  <input
+                                    type="checkbox"
+                                    checked={showPressureMap}
+                                    onChange={(event) => setShowPressureMap(event.target.checked)}
+                                  />
+                                </label>
+                                <label className="play-as">
+                                  Show bot candidates
+                                  <input
+                                    type="checkbox"
+                                    checked={showBotCandidateCells}
+                                    onChange={(event) => setShowBotCandidateCells(event.target.checked)}
+                                  />
+                                </label>
+                              </div>
                               {isBotThinking ? (
                                 <div className="compute-meta">
                                   Thinking now: {(liveBotElapsedMs / 1000).toFixed(2)}s | board evals {liveBotBoardEvals.toLocaleString()} | nodes{' '}
@@ -3180,7 +3143,7 @@ function App() {
                               ) : null}
                             </div>
                             <details className="tuning-panel">
-                              <summary>Advanced tuning (threat + diversity model)</summary>
+                              <summary>Advanced tuning (window pressure model)</summary>
                               <div className="tuning-grid">
                                 <label>
                                   <span className="tuning-label-text">
@@ -3231,30 +3194,8 @@ function App() {
                                 </label>
                                 <label>
                                   <span className="tuning-label-text">
-                                    Threat vs diversity mix{' '}
-                                    <HintPill text="0.00 = threat severity only, 1.00 = diversity only. Middle values blend both normalized signals." />
-                                  </span>
-                                  <div>
-                                    <input
-                                      type="range"
-                                      min={0}
-                                      max={1}
-                                      step={0.01}
-                                      value={botTuning.threatDiversityBlend}
-                                      onChange={(e) =>
-                                        setBotTuning((prev) => ({
-                                          ...prev,
-                                          threatDiversityBlend: clampValue(Number(e.target.value) || 0, 0, 1),
-                                        }))
-                                      }
-                                    />
-                                    <div className="compute-meta">Value: {botTuning.threatDiversityBlend.toFixed(2)}</div>
-                                  </div>
-                                </label>
-                                <label>
-                                  <span className="tuning-label-text">
                                     Threat normalization scale{' '}
-                                    <HintPill text="Saturation scale for raw threat severity before blending with diversity. Higher means slower saturation." />
+                                    <HintPill text="Saturation scale for raw pressure. Higher means slower saturation and less extreme early scores." />
                                   </span>
                                   <input
                                     type="number"
@@ -3273,7 +3214,7 @@ function App() {
                                 <label>
                                   <span className="tuning-label-text">
                                     Defense weight{' '}
-                                    <HintPill text="Offense/defense slider. Higher values prioritize suppressing opponent offense; lower values favor pure self-pressure." />
+                                    <HintPill text="Relative offense/defense slider. Higher values prioritize suppressing opponent pressure; lower values favor self-pressure." />
                                   </span>
                                   <div>
                                     <input
@@ -3290,6 +3231,28 @@ function App() {
                                       }
                                     />
                                     <div className="compute-meta">Value: {botTuning.defenseWeight.toFixed(2)}</div>
+                                  </div>
+                                </label>
+                                <label>
+                                  <span className="tuning-label-text">
+                                    Tempo discount{' '}
+                                    <HintPill text="Discounts pressure for the side that has already placed more stones, to reduce overcrediting extra material." />
+                                  </span>
+                                  <div>
+                                    <input
+                                      type="range"
+                                      min={0}
+                                      max={0.25}
+                                      step={0.01}
+                                      value={botTuning.tempoDiscountPerStone}
+                                      onChange={(e) =>
+                                        setBotTuning((prev) => ({
+                                          ...prev,
+                                          tempoDiscountPerStone: clampValue(Number(e.target.value) || 0, 0, 0.25),
+                                        }))
+                                      }
+                                    />
+                                    <div className="compute-meta">Value: {botTuning.tempoDiscountPerStone.toFixed(2)}</div>
                                   </div>
                                 </label>
                               </div>
@@ -3339,30 +3302,6 @@ function App() {
                           type="checkbox"
                           checked={showThreatHighlights}
                           onChange={(event) => setShowThreatHighlights(event.target.checked)}
-                        />
-                      </label>
-                      <label className="play-as">
-                        Show pressure map
-                        <input
-                          type="checkbox"
-                          checked={showPressureMap}
-                          onChange={(event) => setShowPressureMap(event.target.checked)}
-                        />
-                      </label>
-                      <label className="play-as">
-                        Show bot candidates
-                        <input
-                          type="checkbox"
-                          checked={showBotCandidateCells}
-                          onChange={(event) => setShowBotCandidateCells(event.target.checked)}
-                        />
-                      </label>
-                      <label className="play-as">
-                        Highlight predicted reply
-                        <input
-                          type="checkbox"
-                          checked={showPredictedReply}
-                          onChange={(event) => setShowPredictedReply(event.target.checked)}
                         />
                       </label>
                       <div className="auto-bot-group" role="group" aria-label="Color palette options">

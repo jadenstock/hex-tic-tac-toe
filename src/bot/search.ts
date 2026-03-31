@@ -11,7 +11,6 @@ import {
   undoBoardMove,
   windowEmpties,
   type ActiveWindow,
-  type AppliedBoardTurn,
   type SearchBoard,
 } from './board.ts'
 import { evaluateBoardSummary, oneTurnBlockersRequired, type EvaluationSummary } from './evaluation.ts'
@@ -27,7 +26,7 @@ import type {
   LiveLikeState,
   Player,
 } from './types.ts'
-import { DEFAULT_BOT_SEARCH_OPTIONS, DEFAULT_BOT_TUNING } from './types.ts'
+import { DEFAULT_BOT_SEARCH_OPTIONS, DEFAULT_BOT_TUNING, WIN_DIRECTIONS, WIN_LENGTH } from './types.ts'
 
 type SearchContext = {
   boardEvalCounter: { count: number }
@@ -51,12 +50,24 @@ type RankedPlacement = {
   oppOneTurnWins: number
 }
 
+type RankedAnchorPlacement = RankedPlacement & {
+  ownLift: number
+  oppDrop: number
+}
+
 type RankedLine = {
   line: Axial[]
   objective: number
   ownScore: number
   immediateWin: boolean
   oppOneTurnWins: number
+}
+
+type ResidualRankedLine = RankedLine & {
+  initialRank: number
+  residualObjective: number
+  opponentReplyObjective: number
+  opponentReply?: Axial[]
 }
 
 type CandidateGenerationPolicy = {
@@ -132,12 +143,6 @@ type SearchProgressOptions = {
   yieldEveryMs?: number
 }
 
-type SearchRunCounters = {
-  nodesExpanded: number
-  playouts: number
-  maxDepthTurns: number
-}
-
 type ForcingProofBudget = {
   deadlineMs: number
   maxNodes: number
@@ -174,6 +179,12 @@ function createSearchDebugStats(): BotSearchDebugStats {
     rootBestChildValue: 0,
     rootSecondChildValue: 0,
     rootBestChildVisitShare: 0,
+    rootAnchorCount: 0,
+    rootFinalLineCount: 0,
+    selectedInitialRank: 0,
+    selectedResidualRank: 0,
+    bestResidualInitialRank: 0,
+    rootRankingPreview: [],
   }
 }
 
@@ -270,21 +281,11 @@ function sortAxials(cells: Axial[]): Axial[] {
   return cells.sort((a, b) => (a.q !== b.q ? a.q - b.q : a.r - b.r))
 }
 
-const LEAF_OBJECTIVE_GAIN = 3
-const TACTICAL_EXPANSION_THRESHOLD = 6
-const TACTICAL_EXTENSION_DEPTH = 6
 const FORCING_SOLVER_DEPTH = 8
 const MAX_EVALUATION_CACHE_ENTRIES = 2_000
 const MAX_CANDIDATE_CACHE_ENTRIES = 256
-const ROOT_CANDIDATE_DEFENSE_MULTIPLIERS = [0.65, 1, 1.5]
-const COLONY_DIRECTIONS: ReadonlyArray<Axial> = [
-  { q: 1, r: 0 },
-  { q: 0, r: 1 },
-  { q: 1, r: -1 },
-  { q: -1, r: 0 },
-  { q: 0, r: -1 },
-  { q: -1, r: 1 },
-]
+const MIN_SCORED_CANDIDATE_POINTS = 3
+const SINGLE_THREAT_MAX_DISTANCE = 2
 
 function uniqueAxials(cells: Axial[]): Axial[] {
   const seen = new Set<string>()
@@ -405,12 +406,6 @@ function hasImmediateThreats(board: SearchBoard): boolean {
   return false
 }
 
-function shouldForceTacticalSearch(board: SearchBoard, candidateCount?: number): boolean {
-  if (!hasImmediateThreats(board)) return false
-  if (candidateCount == null) return true
-  return candidateCount <= TACTICAL_EXPANSION_THRESHOLD
-}
-
 function collectThreatConnectedCandidates(board: SearchBoard, player: Player): Axial[] {
   if (board.moves.size === 0) return [{ q: 0, r: 0 }]
 
@@ -443,55 +438,100 @@ function axialDistance(a: Axial, b: Axial): number {
   return Math.max(Math.abs(dq), Math.abs(dr), Math.abs(ds))
 }
 
-function collectColonyCandidates(board: SearchBoard, count: number, distance: number): Axial[] {
-  if (count <= 0 || distance <= 0 || board.moveHistory.length < 6) return []
+function canBelongToPlayerWinningSix(board: SearchBoard, q: number, r: number, player: Player): boolean {
+  const opponent: Player = player === 'X' ? 'O' : 'X'
+  if (board.moves.get(toKey(q, r)) === opponent) return false
 
-  const occupied = board.moveHistory.map((move) => ({ q: move.q, r: move.r }))
-  const byDirection = COLONY_DIRECTIONS.map((direction) => {
-    let bestAnchor = occupied[0]
-    let bestProjection = bestAnchor.q * direction.q + bestAnchor.r * direction.r
-    for (let i = 1; i < occupied.length; i += 1) {
-      const move = occupied[i]
-      const projection = move.q * direction.q + move.r * direction.r
-      if (projection > bestProjection) {
-        bestProjection = projection
-        bestAnchor = move
+  for (const [dq, dr] of WIN_DIRECTIONS) {
+    for (let offset = -(WIN_LENGTH - 1); offset <= 0; offset += 1) {
+      let blocked = false
+      for (let i = 0; i < WIN_LENGTH; i += 1) {
+        const key = toKey(q + dq * (offset + i), r + dr * (offset + i))
+        if (board.moves.get(key) === opponent) {
+          blocked = true
+          break
+        }
       }
+      if (!blocked) return true
     }
-
-    const candidate = {
-      q: bestAnchor.q + direction.q * distance,
-      r: bestAnchor.r + direction.r * distance,
-    }
-
-    let nearestDistance = Number.POSITIVE_INFINITY
-    for (const move of occupied) {
-      nearestDistance = Math.min(nearestDistance, axialDistance(candidate, move))
-    }
-
-    return {
-      candidate,
-      nearestDistance,
-      frontier: bestProjection,
-    }
-  })
-
-  byDirection.sort((a, b) => {
-    if (a.nearestDistance !== b.nearestDistance) return b.nearestDistance - a.nearestDistance
-    return b.frontier - a.frontier
-  })
-
-  const picks: Axial[] = []
-  const seen = new Set<string>()
-  for (const entry of byDirection) {
-    const key = toKey(entry.candidate.q, entry.candidate.r)
-    if (board.moves.has(key) || seen.has(key)) continue
-    seen.add(key)
-    picks.push(entry.candidate)
-    if (picks.length >= count) break
   }
 
-  return sortAxials(picks)
+  return false
+}
+
+function isDeadCandidateHex(board: SearchBoard, q: number, r: number): boolean {
+  return !canBelongToPlayerWinningSix(board, q, r, 'X') && !canBelongToPlayerWinningSix(board, q, r, 'O')
+}
+
+function collectLiveNeighborCandidates(board: SearchBoard): Axial[] {
+  const neighbors: Axial[] = []
+  const seen = new Set<string>()
+
+  for (const move of board.moveHistory) {
+    if (isDeadCandidateHex(board, move.q, move.r)) continue
+    for (const [dq, dr] of WIN_DIRECTIONS) {
+      const forward = { q: move.q + dq, r: move.r + dr }
+      const backward = { q: move.q - dq, r: move.r - dr }
+      for (const cell of [forward, backward]) {
+        const key = toKey(cell.q, cell.r)
+        if (board.moves.has(key) || seen.has(key) || isDeadCandidateHex(board, cell.q, cell.r)) continue
+        seen.add(key)
+        neighbors.push(cell)
+      }
+    }
+  }
+
+  return sortAxials(neighbors)
+}
+
+function nearestOccupiedDistanceInWindow(
+  board: SearchBoard,
+  window: ActiveWindow,
+  player: Player,
+  cellKey: string,
+): number {
+  const cell = fromKey(cellKey)
+  let best = Number.POSITIVE_INFINITY
+  for (const windowCellKey of window.cellKeys) {
+    if (board.moves.get(windowCellKey) !== player) continue
+    best = Math.min(best, axialDistance(cell, fromKey(windowCellKey)))
+  }
+  return best
+}
+
+function collectScoredCandidateEntries(board: SearchBoard): Array<{ cell: Axial; score: number }> {
+  const scores = new Map<string, number>()
+
+  for (const window of board.activeWindows.values()) {
+    const player = window.xCount > 0 && window.oCount === 0
+      ? 'X'
+      : window.oCount > 0 && window.xCount === 0
+        ? 'O'
+        : null
+    if (!player) continue
+
+    const threat = player === 'X' ? window.xCount : window.oCount
+    if (threat <= 0) continue
+    const points = threat >= 2 ? 2 : 1
+
+    for (const emptyKey of windowEmpties(board, window)) {
+      if (threat === 1) {
+        const distance = nearestOccupiedDistanceInWindow(board, window, player, emptyKey)
+        if (distance > SINGLE_THREAT_MAX_DISTANCE) continue
+      }
+      const empty = fromKey(emptyKey)
+      if (isDeadCandidateHex(board, empty.q, empty.r)) continue
+      scores.set(emptyKey, (scores.get(emptyKey) ?? 0) + points)
+    }
+  }
+
+  return [...scores.entries()]
+    .map(([key, score]) => ({ cell: fromKey(key), score }))
+    .sort((a, b) => {
+      if (a.score !== b.score) return b.score - a.score
+      if (a.cell.q !== b.cell.q) return a.cell.q - b.cell.q
+      return a.cell.r - b.cell.r
+    })
 }
 
 function collectLegalCandidates(
@@ -499,7 +539,6 @@ function collectLegalCandidates(
   player: Player,
   tuning: BotTuning,
   targetCount = 0,
-  colonyConfig?: { count: number; distance: number },
 ): Axial[] {
   const opponent: Player = player === 'X' ? 'O' : 'X'
   const ownFinishes = collectOneTurnFinishCells(board, player)
@@ -512,32 +551,41 @@ function collectLegalCandidates(
     return sortAxials([...forcedBlocks].map(fromKey))
   }
 
-  const connected = collectThreatConnectedCandidates(board, player)
-  const defensiveKeys = collectDefensiveResponseCandidateKeys(board, player)
-  const colonyCandidates =
-    colonyConfig && !hasImmediateThreats(board)
-      ? collectColonyCandidates(board, colonyConfig.count, colonyConfig.distance)
-      : []
-  const primary = uniqueAxials([...connected, ...sortAxials([...defensiveKeys].map(fromKey))])
-  const fallback = sortAxials(candidateCells(board, tuning.candidateRadius))
-  if (primary.length > 0) {
-    if (targetCount <= 0) {
-      return uniqueAxials([...primary, ...colonyCandidates])
-    }
+  const scored = collectScoredCandidateEntries(board)
+  const thresholded = scored.filter((entry) => entry.score >= MIN_SCORED_CANDIDATE_POINTS)
+  const fallbackThresholded = thresholded.length > 0 ? thresholded : scored.filter((entry) => entry.score >= 2)
+  const selected = fallbackThresholded.length > 0 ? fallbackThresholded : scored
+  const liveNeighbors = collectLiveNeighborCandidates(board)
 
-    const primaryKeys = new Set(primary.map((cell) => toKey(cell.q, cell.r)))
-    const needed = Math.max(0, targetCount - primary.length)
-    const fallbackSupplement = fallback.filter((cell) => !primaryKeys.has(toKey(cell.q, cell.r))).slice(0, needed)
-    return uniqueAxials([...primary, ...colonyCandidates, ...fallbackSupplement])
+  if (selected.length > 0 || liveNeighbors.length > 0) {
+    const cap = targetCount > 0 ? Math.max(targetCount * 3, targetCount + 6) : 24
+    return uniqueAxials([...liveNeighbors, ...selected.slice(0, cap).map((entry) => entry.cell)])
   }
 
-  return uniqueAxials([...colonyCandidates, ...fallback])
+  const connected = collectThreatConnectedCandidates(board, player)
+  const defensiveKeys = collectDefensiveResponseCandidateKeys(board, player)
+  const primary = uniqueAxials([
+    ...liveNeighbors,
+    ...connected.filter((cell) => !isDeadCandidateHex(board, cell.q, cell.r)),
+    ...sortAxials([...defensiveKeys].map(fromKey)).filter((cell) => !isDeadCandidateHex(board, cell.q, cell.r)),
+  ])
+  if (primary.length > 0) return primary
+
+  return sortAxials(candidateCells(board, Math.min(2, tuning.candidateRadius))).filter((cell) => !isDeadCandidateHex(board, cell.q, cell.r))
 }
 
 function objectiveForPlayer(result: EvaluationSummary, player: Player, tuning: BotTuning): number {
   const own = player === 'X' ? result.xScore : result.oScore
   const opp = player === 'X' ? result.oScore : result.xScore
   return own - tuning.defenseWeight * opp
+}
+
+function scoreForPlayer(result: EvaluationSummary, player: Player): number {
+  return player === 'X' ? result.xScore : result.oScore
+}
+
+function scoreForOpponent(result: EvaluationSummary, player: Player): number {
+  return player === 'X' ? result.oScore : result.xScore
 }
 
 function opponentOneTurnWins(result: EvaluationSummary, player: Player): number {
@@ -570,6 +618,40 @@ function rankPlacements(
     if (a.objective !== b.objective) return b.objective - a.objective
     return b.ownScore - a.ownScore
   })
+
+  return ranked
+}
+
+function rankAnchorPlacements(
+  board: SearchBoard,
+  player: Player,
+  tuning: BotTuning,
+  moveOptions: Axial[],
+  context: SearchContext,
+): RankedAnchorPlacement[] {
+  const baseline = evaluateBoardStateTracked(board, tuning, context)
+  const ownBefore = scoreForPlayer(baseline, player)
+  const oppBefore = scoreForOpponent(baseline, player)
+  const ranked: RankedAnchorPlacement[] = []
+
+  for (const option of moveOptions) {
+    const undo = makeBoardMove(board, option, player)
+    if (!undo) continue
+    const immediateWin = undo.winner === player
+    const evalResult = evaluateBoardStateTracked(board, tuning, context)
+    const ownAfter = scoreForPlayer(evalResult, player)
+    const oppAfter = scoreForOpponent(evalResult, player)
+    ranked.push({
+      option,
+      immediateWin,
+      objective: immediateWin ? Number.POSITIVE_INFINITY : objectiveForPlayer(evalResult, player, tuning),
+      ownScore: ownAfter,
+      oppOneTurnWins: opponentOneTurnWins(evalResult, player),
+      ownLift: ownAfter - ownBefore,
+      oppDrop: oppBefore - oppAfter,
+    })
+    undoBoardMove(board, undo)
+  }
 
   return ranked
 }
@@ -632,26 +714,6 @@ function pruneDefensivelyCriticalLines(lines: RankedLine[], baselineOppWins: num
 
   const minOppWins = lines.reduce((min, entry) => Math.min(min, entry.oppOneTurnWins), Number.POSITIVE_INFINITY)
   return lines.filter((entry) => entry.oppOneTurnWins === minOppWins)
-}
-
-function tuningWithDefenseWeight(base: BotTuning, defenseWeight: number): BotTuning {
-  return { ...base, defenseWeight }
-}
-
-function rootCandidateTunings(tuning: BotTuning): BotTuning[] {
-  const seen = new Set<string>()
-  const variants: BotTuning[] = []
-
-  for (const multiplier of ROOT_CANDIDATE_DEFENSE_MULTIPLIERS) {
-    const defenseWeight = Math.max(0, tuning.defenseWeight * multiplier)
-    const key = defenseWeight.toFixed(6)
-    if (seen.has(key)) continue
-    seen.add(key)
-    variants.push(tuningWithDefenseWeight(tuning, defenseWeight))
-  }
-
-  if (variants.length === 0) return [tuning]
-  return variants
 }
 
 function widenedTopCellCount(baseTopK: number, maxCount: number, maxBonus: number): number {
@@ -741,11 +803,7 @@ function enumerateTurnCandidatesBase(
   const baselineOppWins = opponentOneTurnWins(baseEval, player)
 
   const topCellCount = Math.max(1, Math.floor(policy.topCellCount))
-  const colonyConfig =
-    policy.colonyProbeCount > 0 && policy.colonyDistance > 0
-      ? { count: policy.colonyProbeCount, distance: policy.colonyDistance }
-      : undefined
-  const firstPool = collectLegalCandidates(board, player, tuning, topCellCount, colonyConfig)
+  const firstPool = collectLegalCandidates(board, player, tuning, topCellCount)
   const firstRanked = rankPlacements(board, player, tuning, firstPool, context)
   if (firstRanked.length === 0) {
     setBoundedCacheEntry(context.candidateCache, cacheKey, [], MAX_CANDIDATE_CACHE_ENTRIES)
@@ -786,7 +844,7 @@ function enumerateTurnCandidatesBase(
       const firstUndo = makeBoardMove(board, first, player)
       if (!firstUndo) continue
 
-      const secondPool = collectLegalCandidates(board, player, tuning, topCellCount, colonyConfig)
+      const secondPool = collectLegalCandidates(board, player, tuning, topCellCount)
       const secondRanked = rankPlacements(board, player, tuning, secondPool, context).slice(0, topCellCount)
 
       if (secondRanked.length === 0) {
@@ -870,81 +928,6 @@ function enumerateTurnCandidatesBase(
   }
 
   setBoundedCacheEntry(context.candidateCache, cacheKey, cloneCandidateLines(picks), MAX_CANDIDATE_CACHE_ENTRIES)
-  return picks
-}
-
-function enumerateRootTurnCandidates(
-  board: SearchBoard,
-  tuning: BotTuning,
-  options: BotSearchOptions,
-  context: SearchContext,
-): Axial[][] {
-  const policy = rootSearchPolicy(tuning, options)
-  const lineLimit = rootCandidateLineLimit(options)
-  const variants = rootCandidateTunings(tuning)
-  if (variants.length <= 1) {
-    return enumerateTurnCandidatesBase(board, tuning, policy, context).slice(0, lineLimit)
-  }
-
-  const seedQuota = rootCandidateSeedQuota(lineLimit)
-  const variantLines = variants.map((variant) => enumerateTurnCandidatesBase(board, variant, policy, context))
-  const unique = new Map<string, Axial[]>()
-  const seededKeys = new Set<string>()
-
-  for (let depth = 0; depth < seedQuota; depth += 1) {
-    for (const lines of variantLines) {
-      const line = lines[depth]
-      if (!line) continue
-      const key = canonicalLineKey(line)
-      if (!unique.has(key)) unique.set(key, line)
-      seededKeys.add(key)
-    }
-  }
-
-  for (const lines of variantLines) {
-    for (const line of lines) {
-      const key = canonicalLineKey(line)
-      if (unique.has(key)) continue
-      unique.set(key, line)
-    }
-  }
-
-  const merged = [...unique.values()]
-  if (merged.length <= 1) return merged
-
-  const player = board.turn
-  const baseEval = evaluateBoardStateTracked(board, tuning, context)
-  const baselineOppWins = opponentOneTurnWins(baseEval, player)
-  const rescored: RankedLine[] = []
-
-  for (const line of merged) {
-    const applied = applyTurnLineToBoard(board, line)
-    rescored.push(scoreAppliedTurn(board, player, line, applied.winner, tuning, context))
-    undoAppliedTurn(board, applied)
-  }
-
-  const pruned = pruneDefensivelyCriticalLines(rescored, baselineOppWins)
-  sortRankedLines(pruned)
-
-  const picks: Axial[][] = []
-  const pickedKeys = new Set<string>()
-
-  for (const entry of pruned) {
-    const key = canonicalLineKey(entry.line)
-    if (!seededKeys.has(key) || pickedKeys.has(key)) continue
-    picks.push(entry.line)
-    pickedKeys.add(key)
-    if (picks.length >= lineLimit) return picks
-  }
-
-  for (const entry of pruned) {
-    const key = canonicalLineKey(entry.line)
-    if (pickedKeys.has(key)) continue
-    picks.push(entry.line)
-    pickedKeys.add(key)
-    if (picks.length >= lineLimit) break
-  }
-
   return picks
 }
 
@@ -1143,33 +1126,6 @@ function ensureSessionStructure(session: BotSearchSession, tuning: BotTuning, op
   session.structureSignature = structureSignature
 }
 
-function evaluateNodeForRoot(
-  board: SearchBoard,
-  winner: Player | null,
-  rootPlayer: Player,
-  tuning: BotTuning,
-  context: SearchContext,
-  leafType: 'static' | 'tactical',
-): number {
-  if (winner) {
-    context.debug.terminalLeafHits += 1
-    return winner === rootPlayer ? 1 : -1
-  }
-  if (leafType === 'static') {
-    context.debug.staticLeafEvals += 1
-  } else {
-    context.debug.tacticalLeafEvals += 1
-  }
-  if (board.turn === rootPlayer) {
-    context.debug.leafEvalOwnTurnCount += 1
-  } else {
-    context.debug.leafEvalOpponentTurnCount += 1
-  }
-  const result = evaluateBoardStateTracked(board, tuning, context)
-  const objective = objectiveForPlayer(result, rootPlayer, tuning)
-  return Math.tanh(objective * LEAF_OBJECTIVE_GAIN)
-}
-
 function meanChildValue(node: SearchNode): number {
   if (node.visits <= 0) return 0
   return node.totalValue / node.visits
@@ -1205,61 +1161,6 @@ function summarizeRootDebug(root: SearchNode | null, rootCandidateCount: number,
     rootSecondChildValue: secondChild ? meanChildValue(secondChild) : 0,
     rootBestChildVisitShare: totalChildVisits > 0 && bestChild ? bestChild.visits / totalChildVisits : 0,
   }
-}
-
-function tacticalValue(
-  board: SearchBoard,
-  winner: Player | null,
-  rootPlayer: Player,
-  tuning: BotTuning,
-  options: BotSearchOptions,
-  context: SearchContext,
-  depthRemaining: number,
-  candidateLines?: Axial[][],
-  alpha = -1,
-  beta = 1,
-): number {
-  if (winner) return evaluateNodeForRoot(board, winner, rootPlayer, tuning, context, 'tactical')
-  if (depthRemaining <= 0) return evaluateNodeForRoot(board, null, rootPlayer, tuning, context, 'tactical')
-
-  const lines = candidateLines ?? enumerateTurnCandidates(board, tuning, childSearchPolicy(tuning, options), context)
-  if (lines.length === 0 || !shouldForceTacticalSearch(board, lines.length)) {
-    return evaluateNodeForRoot(board, null, rootPlayer, tuning, context, 'tactical')
-  }
-
-  const maximizing = board.turn === rootPlayer
-  let best = maximizing ? Number.NEGATIVE_INFINITY : Number.POSITIVE_INFINITY
-  let localAlpha = alpha
-  let localBeta = beta
-
-  for (const line of lines) {
-    const applied = applyTurnLineToBoard(board, line)
-    const value = tacticalValue(
-      board,
-      applied.winner,
-      rootPlayer,
-      tuning,
-      options,
-      context,
-      depthRemaining - 1,
-      undefined,
-      localAlpha,
-      localBeta,
-    )
-    undoAppliedTurn(board, applied)
-
-    if (maximizing) {
-      if (value > best) best = value
-      if (best > localAlpha) localAlpha = best
-    } else {
-      if (value < best) best = value
-      if (best < localBeta) localBeta = best
-    }
-
-    if (localAlpha >= localBeta || best === 1 || best === -1) break
-  }
-
-  return best
 }
 
 function exactBlockingResponses(board: SearchBoard, attacker: Player): Axial[][] {
@@ -1316,34 +1217,6 @@ function opponentCanWinImmediately(board: SearchBoard, player: Player, tuning: B
   return collectWinningTurnLines(board, player, tuning).length > 0
 }
 
-function selectUctChild(node: SearchNode, explorationC: number): SearchNode {
-  const logParent = Math.log(Math.max(1, node.visits))
-  let best = node.children[0]
-  let bestScore = Number.NEGATIVE_INFINITY
-
-  for (const child of node.children) {
-    if (child.visits === 0) return child
-    const exploit = child.totalValue / child.visits
-    const explore = explorationC * Math.sqrt(logParent / child.visits)
-    const score = exploit + explore
-    if (score > bestScore) {
-      bestScore = score
-      best = child
-    }
-  }
-
-  return best
-}
-
-function rootActionFor(node: SearchNode): Axial[] | null {
-  let current: SearchNode | null = node
-  while (current && current.parent && current.parent.parent) {
-    current = current.parent
-  }
-  if (!current || !current.parent) return null
-  return current.actionFromParent
-}
-
 function findImmediateWinningMove(board: SearchBoard, player: Player, radius: number): Axial | null {
   const options = candidateCells(board, radius)
   for (const option of options) {
@@ -1368,32 +1241,14 @@ function greedyCandidatePolicy(tuning: BotTuning, candidateCount: number): Candi
   return {
     topCellCount: widenedTopCellCount(tuning.topKFirstMoves, candidateCount, 3),
     maxLineCount: Math.max(8, Math.min(candidateCount, 24)),
-    colonyProbeCount: 2,
-    colonyDistance: 7,
+    colonyProbeCount: 0,
+    colonyDistance: 0,
   }
 }
 
 function rootCandidateLineLimit(options: BotSearchOptions): number {
   const requested = Math.max(1, Math.floor(options.turnCandidateCount))
-  const budgetMs = Math.max(0, options.budget.maxTimeMs)
-
-  let budgetCap = 4
-  if (budgetMs >= 4000) {
-    budgetCap = 8
-  } else if (budgetMs >= 2500) {
-    budgetCap = 7
-  } else if (budgetMs >= 1600) {
-    budgetCap = 6
-  } else if (budgetMs >= 900) {
-    budgetCap = 5
-  }
-
-  return Math.max(3, Math.min(requested, budgetCap))
-}
-
-function rootCandidateSeedQuota(lineLimit: number): number {
-  if (lineLimit >= 6) return 2
-  return 1
+  return Math.max(3, Math.min(requested, 16))
 }
 
 function rootSearchPolicy(tuning: BotTuning, options: BotSearchOptions): CandidateGenerationPolicy {
@@ -1402,8 +1257,8 @@ function rootSearchPolicy(tuning: BotTuning, options: BotSearchOptions): Candida
   return {
     topCellCount: widenedTopCellCount(tuning.topKFirstMoves, topCellBudget, 2),
     maxLineCount: Math.max(lineLimit, Math.min(lineLimit * 2, 16)),
-    colonyProbeCount: 2,
-    colonyDistance: 7,
+    colonyProbeCount: 0,
+    colonyDistance: 0,
   }
 }
 
@@ -1416,131 +1271,303 @@ function childSearchPolicy(tuning: BotTuning, options: BotSearchOptions): Candid
   }
 }
 
-function progressiveWideningLimit(node: SearchNode, options: BotSearchOptions): number {
-  if (node.candidateActions.length === 0) return 0
-  const base = Math.max(1, Math.floor(options.progressiveWideningBase))
-  const scale = Math.max(0, options.progressiveWideningScale)
-  const limit = base + Math.floor(Math.sqrt(Math.max(0, node.visits)) * scale)
-  return Math.max(1, Math.min(node.candidateActions.length, limit))
+function rootAnchorQuota(lineLimit: number): number {
+  return Math.max(2, Math.min(4, Math.ceil(lineLimit / 2)))
 }
 
-function createRootNode(board: SearchBoard, tuning: BotTuning, options: BotSearchOptions, context: SearchContext): SearchNode {
+function sortRankedAnchorsByOwnLift(anchors: RankedAnchorPlacement[]): RankedAnchorPlacement[] {
+  return [...anchors].sort((a, b) => {
+    if (a.immediateWin !== b.immediateWin) return a.immediateWin ? -1 : 1
+    if (a.ownLift !== b.ownLift) return b.ownLift - a.ownLift
+    if (a.objective !== b.objective) return b.objective - a.objective
+    return b.ownScore - a.ownScore
+  })
+}
+
+function sortRankedAnchorsByOppDrop(anchors: RankedAnchorPlacement[]): RankedAnchorPlacement[] {
+  return [...anchors].sort((a, b) => {
+    if (a.immediateWin !== b.immediateWin) return a.immediateWin ? -1 : 1
+    if (a.oppDrop !== b.oppDrop) return b.oppDrop - a.oppDrop
+    if (a.objective !== b.objective) return b.objective - a.objective
+    return b.ownScore - a.ownScore
+  })
+}
+
+function collectAnchorPlacements(
+  board: SearchBoard,
+  player: Player,
+  tuning: BotTuning,
+  legalCells: Axial[],
+  lineLimit: number,
+  context: SearchContext,
+): RankedAnchorPlacement[] {
+  const ranked = rankAnchorPlacements(board, player, tuning, legalCells, context)
+  if (ranked.length <= 1) return ranked
+
+  const quota = rootAnchorQuota(lineLimit)
+  const unique = new Map<string, RankedAnchorPlacement>()
+
+  for (const anchor of sortRankedAnchorsByOwnLift(ranked).slice(0, quota)) {
+    unique.set(toKey(anchor.option.q, anchor.option.r), anchor)
+  }
+  for (const anchor of sortRankedAnchorsByOppDrop(ranked).slice(0, quota)) {
+    const key = toKey(anchor.option.q, anchor.option.r)
+    if (!unique.has(key)) unique.set(key, anchor)
+  }
+
+  if (unique.size === 0) {
+    const fallback = [...ranked].sort((a, b) => b.objective - a.objective).slice(0, quota)
+    for (const anchor of fallback) unique.set(toKey(anchor.option.q, anchor.option.r), anchor)
+  }
+
+  return [...unique.values()].sort((a, b) => {
+    if (a.immediateWin !== b.immediateWin) return a.immediateWin ? -1 : 1
+    if (a.objective !== b.objective) return b.objective - a.objective
+    return b.ownScore - a.ownScore
+  })
+}
+
+function scoreSingleMoveLine(
+  board: SearchBoard,
+  player: Player,
+  move: Axial,
+  tuning: BotTuning,
+  context: SearchContext,
+): RankedLine | null {
+  const undo = makeBoardMove(board, move, player)
+  if (!undo) return null
+  const scored = scoreAppliedTurn(board, player, [move], undo.winner, tuning, context)
+  undoBoardMove(board, undo)
+  return scored
+}
+
+function enumerateAnchoredTurnCandidates(
+  board: SearchBoard,
+  tuning: BotTuning,
+  lineLimit: number,
+  secondMoveTargetCount: number,
+  context: SearchContext,
+): { legalCells: Axial[]; anchors: RankedAnchorPlacement[]; rankedLines: RankedLine[] } {
+  const player = board.turn
+  const legalCells = collectLegalCandidates(board, player, tuning, Math.max(lineLimit * 3, 18))
+  if (legalCells.length === 0) return { legalCells: [], anchors: [], rankedLines: [] }
+
+  const anchors = collectAnchorPlacements(board, player, tuning, legalCells, lineLimit, context)
+  if (anchors.length === 0) return { legalCells, anchors: [], rankedLines: [] }
+
+  const baseEval = evaluateBoardStateTracked(board, tuning, context)
+  const baselineOppWins = opponentOneTurnWins(baseEval, player)
+  const lines: RankedLine[] = []
+  const seen = new Set<string>()
+
+  if (board.placementsLeft <= 1) {
+    for (const anchor of anchors) {
+      const single = scoreSingleMoveLine(board, player, anchor.option, tuning, context)
+      if (!single) continue
+      const key = canonicalLineKey(single.line)
+      if (seen.has(key)) continue
+      seen.add(key)
+      lines.push(single)
+    }
+  } else {
+    for (const anchor of anchors) {
+      const first = anchor.option
+      const firstUndo = makeBoardMove(board, first, player)
+      if (!firstUndo) continue
+
+      if (firstUndo.winner === player) {
+        const winLine = scoreAppliedTurn(board, player, [first], firstUndo.winner, tuning, context)
+        const key = canonicalLineKey(winLine.line)
+        if (!seen.has(key)) {
+          seen.add(key)
+          lines.push(winLine)
+        }
+        undoBoardMove(board, firstUndo)
+        continue
+      }
+
+      const secondPool = collectLegalCandidates(board, player, tuning, Math.max(secondMoveTargetCount, 18))
+      for (const second of secondPool) {
+        const pairKey = canonicalLineKey([first, second])
+        if (seen.has(pairKey)) continue
+        const secondUndo = makeBoardMove(board, second, player)
+        if (!secondUndo) continue
+        seen.add(pairKey)
+        lines.push(scoreAppliedTurn(board, player, [first, second], secondUndo.winner, tuning, context))
+        undoBoardMove(board, secondUndo)
+      }
+
+      undoBoardMove(board, firstUndo)
+    }
+  }
+
+  if (lines.length === 0) return { legalCells, anchors, rankedLines: [] }
+  const pruned = pruneDefensivelyCriticalLines(lines, baselineOppWins)
+  sortRankedLines(pruned)
   return {
-    parent: null,
-    actionFromParent: null,
-    children: [],
-    candidateActions: enumerateRootTurnCandidates(board, tuning, options, context),
-    nextActionIndex: 0,
-    visits: 0,
-    totalValue: 0,
-    winner: null,
-    stateKey: boardStateKey(board),
+    legalCells,
+    anchors,
+    rankedLines: pruned.slice(0, Math.max(1, lineLimit)),
   }
 }
 
-function expandNextChild(
-  parent: SearchNode,
+function chooseBestDeterministicReply(
   board: SearchBoard,
   tuning: BotTuning,
   options: BotSearchOptions,
   context: SearchContext,
-): { child: SearchNode; applied: AppliedBoardTurn } | null {
-  if (parent.nextActionIndex >= parent.candidateActions.length) return null
-
-  const action = parent.candidateActions[parent.nextActionIndex]
-  parent.nextActionIndex += 1
-  const applied = applyTurnLineToBoard(board, action)
-  const child: SearchNode = {
-    parent,
-    actionFromParent: action,
-    children: [],
-    candidateActions: applied.winner ? [] : enumerateTurnCandidates(board, tuning, childSearchPolicy(tuning, options), context),
-    nextActionIndex: 0,
-    visits: 0,
-    totalValue: 0,
-    winner: applied.winner,
-    stateKey: boardStateKey(board),
+): { line?: Axial[]; objective: number } {
+  const replyPlayer = board.turn
+  if (board.placementsLeft <= 0) {
+    const evalResult = evaluateBoardStateTracked(board, tuning, context)
+    return {
+      objective: objectiveForPlayer(evalResult, replyPlayer, tuning),
+    }
   }
-  parent.children.push(child)
-  return { child, applied }
+
+  const replyLimit = Math.max(3, Math.min(options.childTurnCandidateCount, 6))
+  const replySearch = enumerateAnchoredTurnCandidates(board, tuning, replyLimit, Math.max(replyLimit * 3, 18), context)
+  if (replySearch.rankedLines.length === 0) {
+    const evalResult = evaluateBoardStateTracked(board, tuning, context)
+    return {
+      objective: objectiveForPlayer(evalResult, replyPlayer, tuning),
+    }
+  }
+
+  let bestLine = replySearch.rankedLines[0].line
+  let bestObjective = Number.NEGATIVE_INFINITY
+  let bestOwn = Number.NEGATIVE_INFINITY
+
+  for (const candidate of replySearch.rankedLines) {
+    const applied = applyTurnLineToBoard(board, candidate.line)
+    const evalResult = evaluateBoardStateTracked(board, tuning, context)
+    const objective = applied.winner === replyPlayer ? Number.POSITIVE_INFINITY : objectiveForPlayer(evalResult, replyPlayer, tuning)
+    const ownScore = scoreForPlayer(evalResult, replyPlayer)
+    if (objective > bestObjective || (objective === bestObjective && ownScore > bestOwn)) {
+      bestLine = candidate.line
+      bestObjective = objective
+      bestOwn = ownScore
+    }
+    undoAppliedTurn(board, applied)
+  }
+
+  return { line: bestLine, objective: bestObjective }
 }
 
-function finishPlayoutFromNode(
-  loopStart: number,
-  node: SearchNode,
+function applyDeterministicRootDebug(
+  context: SearchContext,
+  anchors: RankedAnchorPlacement[],
+  rankedLines: RankedLine[],
+  residualLines: ResidualRankedLine[],
+): void {
+  context.debug.rootAnchorCount = anchors.length
+  context.debug.rootFinalLineCount = residualLines.length
+  context.debug.rootVisitedChildren = rankedLines.length
+  context.debug.rootUnvisitedChildren = 0
+  context.debug.rootChildrenWithOpponentReplies = residualLines.filter((entry) => entry.opponentReply && entry.opponentReply.length > 0).length
+  context.debug.rootChildrenWithoutOpponentReplies = Math.max(0, residualLines.length - context.debug.rootChildrenWithOpponentReplies)
+  context.debug.rootAvgOpponentRepliesExplored = residualLines.length > 0 ? 1 : 0
+  context.debug.rootMaxOpponentRepliesExplored = residualLines.length > 0 ? 1 : 0
+
+  const residualSorted = [...residualLines].sort((a, b) => {
+    if (a.residualObjective !== b.residualObjective) return b.residualObjective - a.residualObjective
+    if (a.objective !== b.objective) return b.objective - a.objective
+    return b.ownScore - a.ownScore
+  })
+  const selected = residualSorted[0]
+  if (selected) {
+    context.debug.selectedInitialRank = selected.initialRank
+    context.debug.selectedResidualRank = 1
+  }
+  const bestResidual = residualSorted[0]
+  if (bestResidual) context.debug.bestResidualInitialRank = bestResidual.initialRank
+
+  context.debug.rootRankingPreview = residualSorted.slice(0, 8).map((entry, index) => ({
+    initialRank: entry.initialRank,
+    residualRank: index + 1,
+    initialObjective: entry.objective,
+    residualObjective: entry.residualObjective,
+    opponentReplyObjective: entry.opponentReplyObjective,
+  }))
+}
+
+function chooseDeterministicRootDecision(
   board: SearchBoard,
-  rootPlayer: Player,
   tuning: BotTuning,
   options: BotSearchOptions,
   context: SearchContext,
-  appliedPath: AppliedBoardTurn[],
-  depthTurns: number,
-  counters: SearchRunCounters,
-): Player | null {
-  if (depthTurns > counters.maxDepthTurns) counters.maxDepthTurns = depthTurns
+): { moves: Axial[]; rootCandidates: number; stopReason: BotSearchStats['stopReason'] } {
+  const lineLimit = rootCandidateLineLimit(options)
+  const rootSearch = enumerateAnchoredTurnCandidates(board, tuning, lineLimit, Math.max(lineLimit * 4, 20), context)
+  context.debug.rootAnchorCount = rootSearch.anchors.length
 
-  const rolloutStart = nowMs()
-  const value = rolloutValue(board, node.winner, rootPlayer, tuning, options, context)
-  context.debug.rolloutEvalMs += nowMs() - rolloutStart
-  counters.playouts += 1
-
-  const backpropStart = nowMs()
-  let current: SearchNode | null = node
-  while (current) {
-    current.visits += 1
-    current.totalValue += value
-    current = current.parent
+  if (rootSearch.rankedLines.length === 0) {
+    return { moves: [], rootCandidates: 0, stopReason: 'no_candidates' }
   }
 
-  const winner = node.winner
-  for (let i = appliedPath.length - 1; i >= 0; i -= 1) {
-    undoAppliedTurn(board, appliedPath[i])
+  if (rootSearch.rankedLines.length === 1) {
+    applyDeterministicRootDebug(context, rootSearch.anchors, rootSearch.rankedLines, [{
+      ...rootSearch.rankedLines[0],
+      initialRank: 1,
+      residualObjective: rootSearch.rankedLines[0].objective,
+      opponentReplyObjective: Number.NEGATIVE_INFINITY,
+    }])
+    return { moves: rootSearch.rankedLines[0].line, rootCandidates: 1, stopReason: 'single_candidate' }
   }
-  context.debug.backpropUndoMs += nowMs() - backpropStart
-  context.debug.mctsLoopMs += nowMs() - loopStart
-  return winner
-}
 
-function forceRootReplyCoverage(
-  root: SearchNode,
-  board: SearchBoard,
-  rootPlayer: Player,
-  tuning: BotTuning,
-  options: BotSearchOptions,
-  context: SearchContext,
-  counters: SearchRunCounters,
-): Axial[] | null {
-  while (root.nextActionIndex < root.candidateActions.length) {
-    const loopStart = nowMs()
-    const selectionStart = loopStart
-    const appliedPath: AppliedBoardTurn[] = []
+  const residualLines: ResidualRankedLine[] = []
+  const rootPlayer = board.turn
 
-    const expandedRoot = expandNextChild(root, board, tuning, options, context)
-    if (!expandedRoot) break
-    counters.nodesExpanded += 1
-    appliedPath.push(expandedRoot.applied)
+  for (let i = 0; i < rootSearch.rankedLines.length; i += 1) {
+    const ranked = rootSearch.rankedLines[i]
+    const applied = applyTurnLineToBoard(board, ranked.line)
+    let residualObjective = ranked.objective
+    let opponentReplyObjective = Number.NEGATIVE_INFINITY
+    let opponentReply: Axial[] | undefined
 
-    let leaf = expandedRoot.child
-    let depthTurns = 1
-
-    if (!leaf.winner && leaf.candidateActions.length > 0) {
-      const expandedReply = expandNextChild(leaf, board, tuning, options, context)
-      if (expandedReply) {
-        counters.nodesExpanded += 1
-        appliedPath.push(expandedReply.applied)
-        leaf = expandedReply.child
-        depthTurns = 2
+    if (applied.winner !== rootPlayer) {
+      const reply = chooseBestDeterministicReply(board, tuning, options, context)
+      if (reply.line && reply.line.length > 0) {
+        opponentReply = reply.line
+        opponentReplyObjective = reply.objective
+        const replyApplied = applyTurnLineToBoard(board, reply.line)
+        const evalResult = evaluateBoardStateTracked(board, tuning, context)
+        residualObjective = replyApplied.winner === rootPlayer
+          ? Number.POSITIVE_INFINITY
+          : replyApplied.winner
+            ? Number.NEGATIVE_INFINITY
+            : objectiveForPlayer(evalResult, rootPlayer, tuning)
+        undoAppliedTurn(board, replyApplied)
+      } else {
+        const evalResult = evaluateBoardStateTracked(board, tuning, context)
+        residualObjective = objectiveForPlayer(evalResult, rootPlayer, tuning)
       }
     }
 
-    context.debug.selectionExpansionMs += nowMs() - selectionStart
-    const winner = finishPlayoutFromNode(loopStart, leaf, board, rootPlayer, tuning, options, context, appliedPath, depthTurns, counters)
-    if (winner === rootPlayer) {
-      return rootActionFor(leaf)
-    }
+    residualLines.push({
+      ...ranked,
+      initialRank: i + 1,
+      residualObjective,
+      opponentReplyObjective,
+      opponentReply,
+    })
+    undoAppliedTurn(board, applied)
   }
 
-  return null
+  residualLines.sort((a, b) => {
+    if (a.residualObjective !== b.residualObjective) return b.residualObjective - a.residualObjective
+    if (a.objective !== b.objective) return b.objective - a.objective
+    return b.ownScore - a.ownScore
+  })
+
+  applyDeterministicRootDebug(context, rootSearch.anchors, rootSearch.rankedLines, residualLines)
+  const best = residualLines[0]
+  if (!best) return { moves: [], rootCandidates: 0, stopReason: 'fallback' }
+  return {
+    moves: best.line,
+    rootCandidates: rootSearch.rankedLines.length,
+    stopReason: 'deterministic',
+  }
 }
 
 function prepareSearchSession(
@@ -1599,21 +1626,6 @@ function prepareSearchSession(
     trimmedTreeNodes: previousTreeNodes,
     keptAfterMove: false,
   }
-}
-
-function sortRootChildren(root: SearchNode): void {
-  root.children.sort((a, b) => {
-    if (a.visits !== b.visits) return b.visits - a.visits
-    const aMean = a.visits > 0 ? a.totalValue / a.visits : Number.NEGATIVE_INFINITY
-    const bMean = b.visits > 0 ? b.totalValue / b.visits : Number.NEGATIVE_INFINITY
-    return bMean - aMean
-  })
-}
-
-function bestChildAction(node: SearchNode | null): Axial[] | undefined {
-  if (!node || node.children.length === 0) return undefined
-  sortRootChildren(node)
-  return node.children[0].actionFromParent ?? undefined
 }
 
 function statusValue(status: ForcingSolveResult['status']): number {
@@ -1844,34 +1856,6 @@ function chooseGreedyTurnOnBoard(
   return bestLine
 }
 
-function rolloutValue(
-  board: SearchBoard,
-  nodeWinner: Player | null,
-  rootPlayer: Player,
-  tuning: BotTuning,
-  options: BotSearchOptions,
-  context: SearchContext,
-): number {
-  context.debug.rolloutCalls += 1
-  if (nodeWinner) return evaluateNodeForRoot(board, nodeWinner, rootPlayer, tuning, context, 'static')
-
-  const tacticalLines = enumerateTurnCandidates(board, tuning, childSearchPolicy(tuning, options), context)
-  if (shouldForceTacticalSearch(board, tacticalLines.length)) {
-    context.debug.tacticalExtensionCalls += 1
-    return tacticalValue(
-      board,
-      null,
-      rootPlayer,
-      tuning,
-      options,
-      context,
-      TACTICAL_EXTENSION_DEPTH,
-      tacticalLines,
-    )
-  }
-  return evaluateNodeForRoot(board, null, rootPlayer, tuning, context, 'static')
-}
-
 function shouldAttemptForcingSolve(board: SearchBoard, player: Player): boolean {
   if (!hasImmediateThreats(board)) return false
   return oneTurnBlockersRequired(board, player) >= 2
@@ -1907,24 +1891,13 @@ export function inspectBotCandidates(
     }
   }
 
-  const policy = rootSearchPolicy(tuning, options)
-  const firstPool = collectLegalCandidates(
-    board,
-    board.turn,
-    tuning,
-    Math.max(1, Math.floor(policy.topCellCount)),
-    policy.colonyProbeCount > 0 && policy.colonyDistance > 0
-      ? { count: policy.colonyProbeCount, distance: policy.colonyDistance }
-      : undefined,
-  )
-  const ranked = rankPlacements(board, board.turn, tuning, firstPool, context)
-  const topCells = ranked.slice(0, Math.max(1, Math.floor(policy.topCellCount))).map((entry) => entry.option)
-  const candidateLines = enumerateRootTurnCandidates(board, tuning, options, context)
+  const lineLimit = rootCandidateLineLimit(options)
+  const rootSearch = enumerateAnchoredTurnCandidates(board, tuning, lineLimit, Math.max(lineLimit * 4, 20), context)
 
   return {
-    legalCells: firstPool,
-    topCells,
-    candidateLines,
+    legalCells: rootSearch.legalCells,
+    topCells: rootSearch.anchors.map((entry) => entry.option),
+    candidateLines: rootSearch.rankedLines.map((entry) => entry.line),
   }
 }
 
@@ -2078,17 +2051,17 @@ function chooseBotTurnDetailedWithSessionInternal(
   }
 
   const rootSetupStart = nowMs()
-  const root = createRootNode(board, tuning, options, context)
+  const rootDecision = chooseDeterministicRootDecision(board, tuning, options, context)
   context.debug.rootSetupMs += nowMs() - rootSetupStart
-  const rootCandidates = root.candidateActions
+  const rootCandidates = rootDecision.rootCandidates
 
-  if (rootCandidates.length === 0) {
+  if (rootCandidates === 0) {
     return enrichDecisionWithSession({
       moves: chooseGreedyTurnOnBoard(board, tuning, context),
       stats: {
-        mode: 'mcts',
+        mode: 'beam',
         elapsedMs: nowMs() - start,
-        nodesExpanded: 1,
+        nodesExpanded: Math.max(1, context.debug.rootAnchorCount),
         playouts: 0,
         boardEvaluations: context.boardEvalCounter.count,
         maxDepthTurns: 0,
@@ -2098,163 +2071,35 @@ function chooseBotTurnDetailedWithSessionInternal(
     }, session, stateMoveCount)
   }
 
-  if (rootCandidates.length === 1) {
+  if (rootCandidates === 1) {
     return enrichDecisionWithSession({
-      moves: rootCandidates[0],
+      moves: rootDecision.moves,
       stats: {
-        mode: 'mcts',
+        mode: 'beam',
         elapsedMs: nowMs() - start,
-        nodesExpanded: 1,
+        nodesExpanded: Math.max(1, context.debug.rootAnchorCount),
         playouts: 0,
         boardEvaluations: context.boardEvalCounter.count,
         maxDepthTurns: 0,
         rootCandidates: 1,
         stopReason: 'single_candidate',
       },
-    }, session, stateMoveCount, undefined, undefined, undefined, root)
+    }, session, stateMoveCount)
   }
 
-  const counters: SearchRunCounters = {
-    nodesExpanded: 1,
-    playouts: 0,
-    maxDepthTurns: 0,
-  }
-  let stopReason: BotSearchStats['stopReason'] = 'time'
-
-  const rootImmediateWinScanStart = nowMs()
-  for (const line of rootCandidates) {
-    const applied = applyTurnLineToBoard(board, line)
-    const winner = applied.winner
-    undoAppliedTurn(board, applied)
-    if (winner === rootPlayer) {
-      context.debug.rootImmediateWinScanMs += nowMs() - rootImmediateWinScanStart
-      const predictedOpponentReply = bestChildAction(root.children.find((child) => child.actionFromParent === line) ?? null)
-      return enrichDecisionWithSession({
-        moves: line,
-        stats: {
-          mode: 'mcts',
-          elapsedMs: nowMs() - start,
-          nodesExpanded: counters.nodesExpanded,
-          playouts: counters.playouts,
-          boardEvaluations: context.boardEvalCounter.count,
-          maxDepthTurns: counters.maxDepthTurns,
-          rootCandidates: rootCandidates.length,
-        stopReason: 'early_win',
-        },
-      }, session, stateMoveCount, undefined, undefined, predictedOpponentReply, root)
-    }
-  }
-  context.debug.rootImmediateWinScanMs += nowMs() - rootImmediateWinScanStart
-
-  const forcedRootWin = forceRootReplyCoverage(root, board, rootPlayer, tuning, options, context, counters)
-  if (forcedRootWin) {
-    const predictedOpponentReply = bestChildAction(root.children.find((child) => child.actionFromParent === forcedRootWin) ?? null)
-    return enrichDecisionWithSession({
-      moves: forcedRootWin,
-      stats: {
-        mode: 'mcts',
-        elapsedMs: nowMs() - start,
-        nodesExpanded: counters.nodesExpanded,
-        playouts: counters.playouts,
-        boardEvaluations: context.boardEvalCounter.count,
-        maxDepthTurns: counters.maxDepthTurns,
-        rootCandidates: rootCandidates.length,
-        stopReason: 'early_win',
-      },
-    }, session, stateMoveCount, undefined, undefined, predictedOpponentReply, root)
-  }
-
-  while (counters.nodesExpanded < options.budget.maxNodes && nowMs() - start < options.budget.maxTimeMs) {
-    const loopStart = nowMs()
-    const selectionStart = loopStart
-    let depthTurns = 0
-    let node = root
-    const appliedPath: AppliedBoardTurn[] = []
-
-    while (!node.winner) {
-      const widenLimit = shouldForceTacticalSearch(board, node.candidateActions.length)
-        ? node.candidateActions.length
-        : progressiveWideningLimit(node, options)
-      const canExpand = node.nextActionIndex < widenLimit
-
-      if (canExpand) {
-        const expanded = expandNextChild(node, board, tuning, options, context)
-        if (!expanded) break
-        appliedPath.push(expanded.applied)
-        node = expanded.child
-        counters.nodesExpanded += 1
-        depthTurns += 1
-        break
-      }
-
-      if (node.children.length === 0) break
-      const child = selectUctChild(node, options.explorationC)
-      const applied = applyTurnLineToBoard(board, child.actionFromParent as Axial[])
-      appliedPath.push(applied)
-      node = child
-      depthTurns += 1
-    }
-    context.debug.selectionExpansionMs += nowMs() - selectionStart
-
-    const winner = finishPlayoutFromNode(loopStart, node, board, rootPlayer, tuning, options, context, appliedPath, depthTurns, counters)
-
-    if (winner === rootPlayer) {
-      const rootAction = rootActionFor(node)
-      if (rootAction) {
-        const predictedOpponentReply = bestChildAction(root.children.find((child) => child.actionFromParent === rootAction) ?? null)
-        return enrichDecisionWithSession({
-          moves: rootAction,
-          stats: {
-            mode: 'mcts',
-            elapsedMs: nowMs() - start,
-            nodesExpanded: counters.nodesExpanded,
-            playouts: counters.playouts,
-            boardEvaluations: context.boardEvalCounter.count,
-            maxDepthTurns: counters.maxDepthTurns,
-            rootCandidates: rootCandidates.length,
-            stopReason: 'early_win',
-          },
-        }, session, stateMoveCount, undefined, undefined, predictedOpponentReply, root)
-      }
-    }
-  }
-
-  if (counters.nodesExpanded >= options.budget.maxNodes) {
-    stopReason = 'nodes'
-  } else if (nowMs() - start >= options.budget.maxTimeMs) {
-    stopReason = 'time'
-  }
-
-  if (root.children.length === 0) {
-    return enrichDecisionWithSession({
-      moves: chooseGreedyTurnOnBoard(board, tuning, context),
-      stats: {
-        mode: 'mcts',
-        elapsedMs: nowMs() - start,
-        nodesExpanded: counters.nodesExpanded,
-        playouts: counters.playouts,
-        boardEvaluations: context.boardEvalCounter.count,
-        maxDepthTurns: counters.maxDepthTurns,
-        rootCandidates: rootCandidates.length,
-        stopReason: 'fallback',
-      },
-    }, session, stateMoveCount, undefined, undefined, undefined, root)
-  }
-
-  sortRootChildren(root)
   return enrichDecisionWithSession({
-    moves: root.children[0].actionFromParent ?? chooseGreedyTurnOnBoard(board, tuning, context),
+    moves: rootDecision.moves,
     stats: {
-      mode: 'mcts',
+      mode: 'beam',
       elapsedMs: nowMs() - start,
-      nodesExpanded: counters.nodesExpanded,
-      playouts: counters.playouts,
+      nodesExpanded: Math.max(1, context.debug.rootAnchorCount + context.debug.rootFinalLineCount),
+      playouts: 0,
       boardEvaluations: context.boardEvalCounter.count,
-      maxDepthTurns: counters.maxDepthTurns,
-      rootCandidates: rootCandidates.length,
-      stopReason,
+      maxDepthTurns: rootCandidates > 0 ? 2 : 0,
+      rootCandidates,
+      stopReason: rootDecision.stopReason,
     },
-  }, session, stateMoveCount, undefined, undefined, bestChildAction(root.children[0] ?? null), root)
+  }, session, stateMoveCount)
 }
 
 export function chooseBotTurnDetailedWithSession(
@@ -2272,12 +2117,6 @@ export function chooseBotTurnDetailed(
   partialOptions: Partial<BotSearchOptions> = {},
 ): BotTurnDecision {
   return chooseBotTurnDetailedWithSession(state, createBotSearchSession(), tuning, partialOptions)
-}
-
-function sleep0(): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, 0)
-  })
 }
 
 export async function chooseBotTurnDetailedAsync(
@@ -2318,7 +2157,7 @@ export async function chooseBotTurnDetailedAsyncWithSession(
       keptAfterMove: false,
     }
   }
-  const { onProgress, yieldEveryMs = 16 } = progressOptions
+  const { onProgress } = progressOptions
 
   const reportProgress = (nodesExpanded: number, playouts: number, maxDepthTurns: number) => {
     onProgress?.({
@@ -2392,18 +2231,18 @@ export async function chooseBotTurnDetailedAsyncWithSession(
   }
 
   const rootSetupStart = nowMs()
-  const root = createRootNode(board, tuning, options, context)
+  const rootDecision = chooseDeterministicRootDecision(board, tuning, options, context)
   context.debug.rootSetupMs += nowMs() - rootSetupStart
-  const rootCandidates = root.candidateActions
+  const rootCandidates = rootDecision.rootCandidates
 
-  if (root.candidateActions.length === 0) {
+  if (rootCandidates === 0) {
     reportProgress(1, 0, 0)
     return enrichDecisionWithSession({
       moves: chooseGreedyTurnOnBoard(board, tuning, context),
       stats: {
-        mode: 'mcts',
+        mode: 'beam',
         elapsedMs: nowMs() - start,
-        nodesExpanded: 1,
+        nodesExpanded: Math.max(1, context.debug.rootAnchorCount),
         playouts: 0,
         boardEvaluations: context.boardEvalCounter.count,
         maxDepthTurns: 0,
@@ -2413,214 +2252,37 @@ export async function chooseBotTurnDetailedAsyncWithSession(
     }, session, stateMoveCount)
   }
 
-  if (rootCandidates.length === 1) {
+  if (rootCandidates === 1) {
     reportProgress(1, 0, 0)
     return enrichDecisionWithSession({
-      moves: rootCandidates[0],
+      moves: rootDecision.moves,
       stats: {
-        mode: 'mcts',
+        mode: 'beam',
         elapsedMs: nowMs() - start,
-        nodesExpanded: 1,
+        nodesExpanded: Math.max(1, context.debug.rootAnchorCount),
         playouts: 0,
         boardEvaluations: context.boardEvalCounter.count,
         maxDepthTurns: 0,
         rootCandidates: 1,
         stopReason: 'single_candidate',
       },
-    }, session, stateMoveCount, undefined, undefined, undefined, root)
+    }, session, stateMoveCount)
   }
 
-  const counters: SearchRunCounters = {
-    nodesExpanded: 1,
-    playouts: 0,
-    maxDepthTurns: 0,
-  }
-  let stopReason: BotSearchStats['stopReason'] = 'time'
-  let lastYieldAt = nowMs()
-
-  const rootImmediateWinScanStart = nowMs()
-  for (const line of rootCandidates) {
-    const applied = applyTurnLineToBoard(board, line)
-    const winner = applied.winner
-    undoAppliedTurn(board, applied)
-    if (winner === rootPlayer) {
-      context.debug.rootImmediateWinScanMs += nowMs() - rootImmediateWinScanStart
-      reportProgress(counters.nodesExpanded, counters.playouts, counters.maxDepthTurns)
-      const predictedOpponentReply = bestChildAction(root.children.find((child) => child.actionFromParent === line) ?? null)
-      return enrichDecisionWithSession({
-        moves: line,
-        stats: {
-          mode: 'mcts',
-          elapsedMs: nowMs() - start,
-          nodesExpanded: counters.nodesExpanded,
-          playouts: counters.playouts,
-          boardEvaluations: context.boardEvalCounter.count,
-          maxDepthTurns: counters.maxDepthTurns,
-          rootCandidates: rootCandidates.length,
-          stopReason: 'early_win',
-        },
-      }, session, stateMoveCount, undefined, undefined, predictedOpponentReply, root)
-    }
-  }
-  context.debug.rootImmediateWinScanMs += nowMs() - rootImmediateWinScanStart
-
-  while (root.nextActionIndex < root.candidateActions.length) {
-    const loopStart = nowMs()
-    const selectionStart = loopStart
-    const appliedPath: AppliedBoardTurn[] = []
-
-    const expandedRoot = expandNextChild(root, board, tuning, options, context)
-    if (!expandedRoot) break
-    counters.nodesExpanded += 1
-    appliedPath.push(expandedRoot.applied)
-
-    let leaf = expandedRoot.child
-    let depthTurns = 1
-
-    if (!leaf.winner && leaf.candidateActions.length > 0) {
-      const expandedReply = expandNextChild(leaf, board, tuning, options, context)
-      if (expandedReply) {
-        counters.nodesExpanded += 1
-        appliedPath.push(expandedReply.applied)
-        leaf = expandedReply.child
-        depthTurns = 2
-      }
-    }
-
-    context.debug.selectionExpansionMs += nowMs() - selectionStart
-    const winner = finishPlayoutFromNode(loopStart, leaf, board, rootPlayer, tuning, options, context, appliedPath, depthTurns, counters)
-
-    if (winner === rootPlayer) {
-      const rootAction = rootActionFor(leaf)
-      if (rootAction) {
-        reportProgress(counters.nodesExpanded, counters.playouts, counters.maxDepthTurns)
-        const predictedOpponentReply = bestChildAction(root.children.find((child) => child.actionFromParent === rootAction) ?? null)
-        return enrichDecisionWithSession({
-          moves: rootAction,
-          stats: {
-            mode: 'mcts',
-            elapsedMs: nowMs() - start,
-            nodesExpanded: counters.nodesExpanded,
-            playouts: counters.playouts,
-            boardEvaluations: context.boardEvalCounter.count,
-            maxDepthTurns: counters.maxDepthTurns,
-            rootCandidates: rootCandidates.length,
-            stopReason: 'early_win',
-          },
-        }, session, stateMoveCount, undefined, undefined, predictedOpponentReply, root)
-      }
-    }
-
-    const now = nowMs()
-    if (now - lastYieldAt >= yieldEveryMs) {
-      reportProgress(counters.nodesExpanded, counters.playouts, counters.maxDepthTurns)
-      await sleep0()
-      lastYieldAt = nowMs()
-    }
-  }
-
-  while (counters.nodesExpanded < options.budget.maxNodes && nowMs() - start < options.budget.maxTimeMs) {
-    const loopStart = nowMs()
-    const selectionStart = loopStart
-    let depthTurns = 0
-    let node = root
-    const appliedPath: AppliedBoardTurn[] = []
-
-    while (!node.winner) {
-      const widenLimit = shouldForceTacticalSearch(board, node.candidateActions.length)
-        ? node.candidateActions.length
-        : progressiveWideningLimit(node, options)
-      const canExpand = node.nextActionIndex < widenLimit
-
-      if (canExpand) {
-        const expanded = expandNextChild(node, board, tuning, options, context)
-        if (!expanded) break
-        appliedPath.push(expanded.applied)
-        node = expanded.child
-        counters.nodesExpanded += 1
-        depthTurns += 1
-        break
-      }
-
-      if (node.children.length === 0) break
-      const child = selectUctChild(node, options.explorationC)
-      const applied = applyTurnLineToBoard(board, child.actionFromParent as Axial[])
-      appliedPath.push(applied)
-      node = child
-      depthTurns += 1
-    }
-    context.debug.selectionExpansionMs += nowMs() - selectionStart
-
-    const winner = finishPlayoutFromNode(loopStart, node, board, rootPlayer, tuning, options, context, appliedPath, depthTurns, counters)
-
-    if (winner === rootPlayer) {
-      const rootAction = rootActionFor(node)
-      if (rootAction) {
-        reportProgress(counters.nodesExpanded, counters.playouts, counters.maxDepthTurns)
-        const predictedOpponentReply = bestChildAction(root.children.find((child) => child.actionFromParent === rootAction) ?? null)
-        return enrichDecisionWithSession({
-          moves: rootAction,
-          stats: {
-            mode: 'mcts',
-            elapsedMs: nowMs() - start,
-            nodesExpanded: counters.nodesExpanded,
-            playouts: counters.playouts,
-            boardEvaluations: context.boardEvalCounter.count,
-            maxDepthTurns: counters.maxDepthTurns,
-            rootCandidates: rootCandidates.length,
-            stopReason: 'early_win',
-          },
-        }, session, stateMoveCount, undefined, undefined, predictedOpponentReply, root)
-      }
-    }
-
-    const now = nowMs()
-    if (now - lastYieldAt >= yieldEveryMs) {
-      reportProgress(counters.nodesExpanded, counters.playouts, counters.maxDepthTurns)
-      await sleep0()
-      lastYieldAt = nowMs()
-    }
-  }
-
-  if (counters.nodesExpanded >= options.budget.maxNodes) {
-    stopReason = 'nodes'
-  } else if (nowMs() - start >= options.budget.maxTimeMs) {
-    stopReason = 'time'
-  }
-
-  if (root.children.length === 0) {
-    reportProgress(counters.nodesExpanded, counters.playouts, counters.maxDepthTurns)
-    return enrichDecisionWithSession({
-      moves: chooseGreedyTurnOnBoard(board, tuning, context),
-      stats: {
-        mode: 'mcts',
-        elapsedMs: nowMs() - start,
-        nodesExpanded: counters.nodesExpanded,
-        playouts: counters.playouts,
-        boardEvaluations: context.boardEvalCounter.count,
-        maxDepthTurns: counters.maxDepthTurns,
-        rootCandidates: rootCandidates.length,
-        stopReason: 'fallback',
-      },
-    }, session, stateMoveCount, undefined, undefined, undefined, root)
-  }
-
-  sortRootChildren(root)
-
-  reportProgress(counters.nodesExpanded, counters.playouts, counters.maxDepthTurns)
+  reportProgress(Math.max(1, context.debug.rootAnchorCount + context.debug.rootFinalLineCount), 0, rootCandidates > 0 ? 2 : 0)
   return enrichDecisionWithSession({
-    moves: root.children[0].actionFromParent ?? chooseGreedyTurnOnBoard(board, tuning, context),
+    moves: rootDecision.moves,
     stats: {
-      mode: 'mcts',
+      mode: 'beam',
       elapsedMs: nowMs() - start,
-      nodesExpanded: counters.nodesExpanded,
-      playouts: counters.playouts,
+      nodesExpanded: Math.max(1, context.debug.rootAnchorCount + context.debug.rootFinalLineCount),
+      playouts: 0,
       boardEvaluations: context.boardEvalCounter.count,
-      maxDepthTurns: counters.maxDepthTurns,
-      rootCandidates: rootCandidates.length,
-      stopReason,
+      maxDepthTurns: rootCandidates > 0 ? 2 : 0,
+      rootCandidates,
+      stopReason: rootDecision.stopReason,
     },
-  }, session, stateMoveCount, undefined, undefined, bestChildAction(root.children[0] ?? null), root)
+  }, session, stateMoveCount)
 }
 
 export function chooseBotTurn(

@@ -27,6 +27,30 @@ export type EvaluationResult = {
   oOffense: number
   xDiversity: number
   oDiversity: number
+  xBreadthSeverity: number
+  oBreadthSeverity: number
+  xThreat3Breadth: number
+  oThreat3Breadth: number
+  xThreat3DirectionCount: number
+  oThreat3DirectionCount: number
+  xThreat3BlockerBurden: number
+  oThreat3BlockerBurden: number
+  xTriangleCount: number
+  oTriangleCount: number
+  xRhombusCount: number
+  oRhombusCount: number
+  xThreat3StructureSeverity: number
+  oThreat3StructureSeverity: number
+  xThreat3BaseSeverity: number
+  oThreat3BaseSeverity: number
+  xThreat3BreadthSeverity: number
+  oThreat3BreadthSeverity: number
+  xUrgencyLoad: number
+  oUrgencyLoad: number
+  xUrgencyPressure: number
+  oUrgencyPressure: number
+  xUrgencyDiscount: number
+  oUrgencyDiscount: number
   xPressureMap: Map<string, number>
   oPressureMap: Map<string, number>
   xPressureMax: number
@@ -60,8 +84,12 @@ export type BotTuning = {
   oneTurnForkBonus: number
   oneTurnOverlapPenalty: number
   threat3ClusterBonus: number
+  threat3ClusterBreadthFloor: number
   threat4ForkBonus: number
   threat5ForkBonus: number
+  triangleBonus: number
+  rhombusBonus: number
+  threat3BlockerBonus: number
   candidateRadius: number
   topKFirstMoves: number
 }
@@ -84,7 +112,15 @@ export type BotSearchOptions = {
   progressiveWideningScale: number
 }
 
-export type BotSearchMode = 'greedy' | 'mcts'
+export type BotSearchMode = 'greedy' | 'mcts' | 'beam'
+
+export type BotRootRankingEntry = {
+  initialRank: number
+  residualRank: number
+  initialObjective: number
+  residualObjective: number
+  opponentReplyObjective: number
+}
 
 export type BotSearchTreeStats = {
   nodeCount: number
@@ -142,6 +178,12 @@ export type BotSearchDebugStats = {
   rootBestChildValue: number
   rootSecondChildValue: number
   rootBestChildVisitShare: number
+  rootAnchorCount: number
+  rootFinalLineCount: number
+  selectedInitialRank: number
+  selectedResidualRank: number
+  bestResidualInitialRank: number
+  rootRankingPreview: BotRootRankingEntry[]
 }
 
 export type BotSearchStats = {
@@ -152,7 +194,7 @@ export type BotSearchStats = {
   boardEvaluations: number
   maxDepthTurns: number
   rootCandidates: number
-  stopReason: 'budget_zero' | 'time' | 'nodes' | 'terminal' | 'no_candidates' | 'fallback' | 'early_win' | 'single_candidate'
+  stopReason: 'budget_zero' | 'time' | 'nodes' | 'terminal' | 'no_candidates' | 'fallback' | 'early_win' | 'single_candidate' | 'deterministic'
   session?: BotSearchSessionStats
   debug?: BotSearchDebugStats
   predictedOpponentReply?: Axial[]
@@ -166,18 +208,22 @@ export type BotTurnDecision = {
 
 export const DEFAULT_BOT_TUNING: BotTuning = {
   threatWeights: [0, 0, 6, 36, 860, 860, 20000],
-  defenseWeight: 1.75,
+  defenseWeight: 1.25,
   threatDiversityBlend: 0.25,
   tempoDiscountPerStone: 0.08,
   threatSeverityScale: 1200,
   immediateDangerPenalty: 150000,
   oneTurnWinBonus: 3500,
-  threatBreadthWeights: [0, 0, 0, 0, 0, 0, 0],
+  threatBreadthWeights: [0, 0, 0, 42, 14, 8, 0],
   oneTurnForkBonus: 27300,
   oneTurnOverlapPenalty: 6975,
   threat3ClusterBonus: 120,
+  threat3ClusterBreadthFloor: 0.2,
   threat4ForkBonus: 17400,
   threat5ForkBonus: 15000,
+  triangleBonus: 0,
+  rhombusBonus: 0,
+  threat3BlockerBonus: 0,
   candidateRadius: 4,
   topKFirstMoves: 12,
 }
