@@ -1,10 +1,9 @@
 import { createServer } from 'node:http'
 import {
+  buildTimedSearchOptions,
   chooseBotTurnDetailed,
-  DEFAULT_BOT_SEARCH_OPTIONS,
   DEFAULT_BOT_TUNING,
   evaluateBoardState,
-  type BotSearchOptions,
   type Player,
 } from '../src/bot/engine.ts'
 
@@ -153,29 +152,6 @@ function applyMove(
   return { next, valid: true }
 }
 
-function buildSearchOptions(timeLimitSeconds: number): BotSearchOptions {
-  if (timeLimitSeconds <= 0) {
-    return {
-      ...DEFAULT_BOT_SEARCH_OPTIONS,
-      budget: { maxTimeMs: 0, maxNodes: 0 },
-    }
-  }
-
-  const seconds = Math.max(0.1, Math.min(12, timeLimitSeconds))
-  const normalized = seconds / 12
-  return {
-    ...DEFAULT_BOT_SEARCH_OPTIONS,
-    budget: {
-      maxTimeMs: Math.round(seconds * 1000),
-      maxNodes: Math.round(50_000 + normalized * 750_000),
-    },
-    turnCandidateCount: Math.max(5, Math.min(12, 5 + Math.floor(normalized * 7))),
-    maxSimulationTurns: Math.max(2, Math.min(6, 2 + Math.floor(normalized * 4))),
-    simulationRadius: Math.max(2, Math.min(6, 2 + Math.floor(normalized * 4))),
-    simulationTopKFirstMoves: Math.max(1, Math.min(4, 1 + Math.floor(normalized * 3))),
-  }
-}
-
 const port = Number(process.env.PORT ?? '8080')
 
 const server = createServer(async (req, res) => {
@@ -225,7 +201,7 @@ const server = createServer(async (req, res) => {
         placementsLeft: turnState.placementsLeft,
       },
       DEFAULT_BOT_TUNING,
-      buildSearchOptions(payload.time_limit ?? 0),
+      buildTimedSearchOptions(payload.time_limit ?? 0),
     )
 
     const legalPieces = decision.moves.slice(0, turnState.placementsLeft)
