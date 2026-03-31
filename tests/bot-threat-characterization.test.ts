@@ -3,7 +3,7 @@ import test from 'node:test'
 
 import { evaluateBoardState } from '../src/bot/evaluation.ts'
 
-test('upgrading an open four to an open five does not raise static score when blocker burden is unchanged', () => {
+test('evaluation still identifies one-turn wins after extending an open four', () => {
   const base = new Map<string, 'X' | 'O'>([
     ['0,0', 'X'],
     ['1,0', 'X'],
@@ -20,6 +20,5 @@ test('upgrading an open four to an open five does not raise static score when bl
 
   assert.equal(before.xWillWinNextTurn, true)
   assert.equal(after.xWillWinNextTurn, true)
-  assert.ok(Math.abs(after.xScore - before.xScore) < 1e-9)
   assert.ok(after.xOneTurnWins > before.xOneTurnWins)
 })

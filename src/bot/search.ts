@@ -49,6 +49,14 @@ type RankedPlacement = {
   oppOneTurnWins: number
 }
 
+type RankedLine = {
+  line: Axial[]
+  objective: number
+  ownScore: number
+  immediateWin: boolean
+  oppOneTurnWins: number
+}
+
 type CandidateGenerationPolicy = {
   topCellCount: number
   maxLineCount: number
@@ -226,6 +234,8 @@ const TACTICAL_EXTENSION_DEPTH = 6
 const FORCING_SOLVER_DEPTH = 8
 const MAX_EVALUATION_CACHE_ENTRIES = 2_000
 const MAX_CANDIDATE_CACHE_ENTRIES = 256
+const ROOT_CANDIDATE_DEFENSE_MULTIPLIERS = [0.65, 1, 1.5]
+const ROOT_CANDIDATE_MAX_LINE_CAP = 48
 const COLONY_DIRECTIONS: ReadonlyArray<Axial> = [
   { q: 1, r: 0 },
   { q: 0, r: 1 },
@@ -541,9 +551,66 @@ function candidatePolicyKey(policy: CandidateGenerationPolicy, tuning: BotTuning
     policy.maxLineCount,
     policy.colonyProbeCount,
     policy.colonyDistance,
+    tuning.defenseWeight,
     tuning.candidateRadius,
     tuning.topKFirstMoves,
   ].join('|')
+}
+
+function scoreAppliedTurn(
+  board: SearchBoard,
+  player: Player,
+  line: Axial[],
+  winner: Player | null,
+  tuning: BotTuning,
+  context: SearchContext,
+): RankedLine {
+  const evalResult = evaluateBoardStateTracked(board, tuning, context)
+  return {
+    line,
+    objective: winner === player ? Number.POSITIVE_INFINITY : objectiveForPlayer(evalResult, player, tuning),
+    ownScore: player === 'X' ? evalResult.xScore : evalResult.oScore,
+    immediateWin: winner === player,
+    oppOneTurnWins: opponentOneTurnWins(evalResult, player),
+  }
+}
+
+function sortRankedLines(lines: RankedLine[]): void {
+  lines.sort((a, b) => {
+    if (a.immediateWin !== b.immediateWin) return a.immediateWin ? -1 : 1
+    if (a.objective !== b.objective) return b.objective - a.objective
+    return b.ownScore - a.ownScore
+  })
+}
+
+function pruneDefensivelyCriticalLines(lines: RankedLine[], baselineOppWins: number): RankedLine[] {
+  if (baselineOppWins <= 0) return lines
+
+  const fullyBlocked = lines.filter((entry) => entry.oppOneTurnWins === 0)
+  if (fullyBlocked.length > 0) return fullyBlocked
+
+  const minOppWins = lines.reduce((min, entry) => Math.min(min, entry.oppOneTurnWins), Number.POSITIVE_INFINITY)
+  return lines.filter((entry) => entry.oppOneTurnWins === minOppWins)
+}
+
+function tuningWithDefenseWeight(base: BotTuning, defenseWeight: number): BotTuning {
+  return { ...base, defenseWeight }
+}
+
+function rootCandidateTunings(tuning: BotTuning): BotTuning[] {
+  const seen = new Set<string>()
+  const variants: BotTuning[] = []
+
+  for (const multiplier of ROOT_CANDIDATE_DEFENSE_MULTIPLIERS) {
+    const defenseWeight = Math.max(0, tuning.defenseWeight * multiplier)
+    const key = defenseWeight.toFixed(6)
+    if (seen.has(key)) continue
+    seen.add(key)
+    variants.push(tuningWithDefenseWeight(tuning, defenseWeight))
+  }
+
+  if (variants.length === 0) return [tuning]
+  return variants
 }
 
 function widenedTopCellCount(baseTopK: number, maxCount: number, maxBonus: number): number {
@@ -604,7 +671,7 @@ function collectWinningTurnLines(board: SearchBoard, player: Player, tuning: Bot
   return winners
 }
 
-function enumerateTurnCandidates(
+function enumerateTurnCandidatesBase(
   board: SearchBoard,
   tuning: BotTuning,
   policy: CandidateGenerationPolicy,
@@ -646,17 +713,6 @@ function enumerateTurnCandidates(
   const topCellPlacements = firstRanked.slice(0, topCellCount)
 
   const baselineOppFinish = collectOneTurnFinishCells(board, player === 'X' ? 'O' : 'X')
-  const maybeApplyDefensivePruning = (
-    lines: Array<{ line: Axial[]; objective: number; ownScore: number; immediateWin: boolean; oppOneTurnWins: number }>,
-  ) => {
-    if (baselineOppWins <= 0) return lines
-
-    const fullyBlocked = lines.filter((entry) => entry.oppOneTurnWins === 0)
-    if (fullyBlocked.length > 0) return fullyBlocked
-
-    const minOppWins = lines.reduce((min, entry) => Math.min(min, entry.oppOneTurnWins), Number.POSITIVE_INFINITY)
-    return lines.filter((entry) => entry.oppOneTurnWins === minOppWins)
-  }
 
   if (placements === 1) {
     const forcedBlocks = baselineOppFinish
@@ -672,18 +728,14 @@ function enumerateTurnCandidates(
       immediateWin: entry.immediateWin,
       oppOneTurnWins: entry.oppOneTurnWins,
     }))
-    const pruned = maybeApplyDefensivePruning(lines)
-    pruned.sort((a, b) => {
-      if (a.immediateWin !== b.immediateWin) return a.immediateWin ? -1 : 1
-      if (a.objective !== b.objective) return b.objective - a.objective
-      return b.ownScore - a.ownScore
-    })
+    const pruned = pruneDefensivelyCriticalLines(lines, baselineOppWins)
+    sortRankedLines(pruned)
     const picks = pruned.map((entry) => entry.line)
     setBoundedCacheEntry(context.candidateCache, cacheKey, cloneCandidateLines(picks), MAX_CANDIDATE_CACHE_ENTRIES)
     return picks
   }
 
-  const lines: Array<{ line: Axial[]; objective: number; ownScore: number; immediateWin: boolean; oppOneTurnWins: number }> = []
+  const lines: RankedLine[] = []
   const seenPairKeys = new Set<string>()
   const topCells = topCellPlacements.map((entry) => entry.option)
 
@@ -697,14 +749,7 @@ function enumerateTurnCandidates(
       const secondRanked = rankPlacements(board, player, tuning, secondPool, context).slice(0, topCellCount)
 
       if (secondRanked.length === 0) {
-        const evalResult = evaluateBoardStateTracked(board, tuning, context)
-        lines.push({
-          line: [first],
-          objective: objectiveForPlayer(evalResult, player, tuning),
-          ownScore: player === 'X' ? evalResult.xScore : evalResult.oScore,
-          immediateWin: firstUndo.winner === player,
-          oppOneTurnWins: opponentOneTurnWins(evalResult, player),
-        })
+        lines.push(scoreAppliedTurn(board, player, [first], firstUndo.winner, tuning, context))
         undoBoardMove(board, firstUndo)
         continue
       }
@@ -727,12 +772,8 @@ function enumerateTurnCandidates(
       undoBoardMove(board, firstUndo)
     }
 
-    const pruned = maybeApplyDefensivePruning(lines)
-    pruned.sort((a, b) => {
-      if (a.immediateWin !== b.immediateWin) return a.immediateWin ? -1 : 1
-      if (a.objective !== b.objective) return b.objective - a.objective
-      return b.ownScore - a.ownScore
-    })
+    const pruned = pruneDefensivelyCriticalLines(lines, baselineOppWins)
+    sortRankedLines(pruned)
     const picks = pruned.map((entry) => entry.line)
     setBoundedCacheEntry(context.candidateCache, cacheKey, cloneCandidateLines(picks), MAX_CANDIDATE_CACHE_ENTRIES)
     return picks
@@ -773,12 +814,8 @@ function enumerateTurnCandidates(
     return fallback
   }
 
-  const pruned = maybeApplyDefensivePruning(lines)
-  pruned.sort((a, b) => {
-    if (a.immediateWin !== b.immediateWin) return a.immediateWin ? -1 : 1
-    if (a.objective !== b.objective) return b.objective - a.objective
-    return b.ownScore - a.ownScore
-  })
+  const pruned = pruneDefensivelyCriticalLines(lines, baselineOppWins)
+  sortRankedLines(pruned)
 
   const unique = new Set<string>()
   const picks: Axial[][] = []
@@ -793,6 +830,58 @@ function enumerateTurnCandidates(
 
   setBoundedCacheEntry(context.candidateCache, cacheKey, cloneCandidateLines(picks), MAX_CANDIDATE_CACHE_ENTRIES)
   return picks
+}
+
+function enumerateRootTurnCandidates(
+  board: SearchBoard,
+  tuning: BotTuning,
+  options: BotSearchOptions,
+  context: SearchContext,
+): Axial[][] {
+  const policy = rootSearchPolicy(tuning, options)
+  const variants = rootCandidateTunings(tuning)
+  if (variants.length <= 1) {
+    return enumerateTurnCandidatesBase(board, tuning, policy, context)
+  }
+
+  const unique = new Map<string, Axial[]>()
+  for (const variant of variants) {
+    const lines = enumerateTurnCandidatesBase(board, variant, policy, context)
+    for (const line of lines) {
+      const key = canonicalLineKey(line)
+      if (unique.has(key)) continue
+      unique.set(key, line)
+    }
+  }
+
+  const merged = [...unique.values()]
+  if (merged.length <= 1) return merged
+
+  const player = board.turn
+  const baseEval = evaluateBoardStateTracked(board, tuning, context)
+  const baselineOppWins = opponentOneTurnWins(baseEval, player)
+  const rescored: RankedLine[] = []
+
+  for (const line of merged) {
+    const applied = applyTurnLineToBoard(board, line)
+    rescored.push(scoreAppliedTurn(board, player, line, applied.winner, tuning, context))
+    undoAppliedTurn(board, applied)
+  }
+
+  const pruned = pruneDefensivelyCriticalLines(rescored, baselineOppWins)
+  sortRankedLines(pruned)
+
+  const lineLimit = Math.max(policy.maxLineCount, Math.min(policy.maxLineCount * 2, ROOT_CANDIDATE_MAX_LINE_CAP))
+  return pruned.slice(0, lineLimit).map((entry) => entry.line)
+}
+
+function enumerateTurnCandidates(
+  board: SearchBoard,
+  tuning: BotTuning,
+  policy: CandidateGenerationPolicy,
+  context: SearchContext,
+): Axial[][] {
+  return enumerateTurnCandidatesBase(board, tuning, policy, context)
 }
 
 function nowMs(): number {
@@ -1184,7 +1273,7 @@ function createRootNode(board: SearchBoard, tuning: BotTuning, options: BotSearc
     parent: null,
     actionFromParent: null,
     children: [],
-    candidateActions: enumerateTurnCandidates(board, tuning, rootSearchPolicy(tuning, options), context),
+    candidateActions: enumerateRootTurnCandidates(board, tuning, options, context),
     nextActionIndex: 0,
     visits: 0,
     totalValue: 0,
@@ -1563,7 +1652,7 @@ export function inspectBotCandidates(
   )
   const ranked = rankPlacements(board, board.turn, tuning, firstPool, context)
   const topCells = ranked.slice(0, Math.max(1, Math.floor(policy.topCellCount))).map((entry) => entry.option)
-  const candidateLines = enumerateTurnCandidates(board, tuning, policy, context)
+  const candidateLines = enumerateRootTurnCandidates(board, tuning, options, context)
 
   return {
     legalCells: firstPool,
