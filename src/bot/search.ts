@@ -14,10 +14,12 @@ import {
   type AppliedBoardTurn,
   type SearchBoard,
 } from './board.ts'
-import { evaluateBoardSummary, type EvaluationSummary } from './evaluation.ts'
+import { evaluateBoardSummary, oneTurnBlockersRequired, type EvaluationSummary } from './evaluation.ts'
 import type {
   Axial,
+  BotSearchMode,
   BotSearchOptions,
+  BotSearchSessionStats,
   BotSearchStats,
   BotTuning,
   BotTurnDecision,
@@ -30,6 +32,13 @@ type SearchContext = {
   boardEvalCounter: { count: number }
   evaluationCache: Map<string, EvaluationSummary>
   candidateCache: Map<string, Axial[][]>
+  forcingCache: Map<string, ForcingSolveResult>
+  evaluationCacheHits: number
+  evaluationCacheMisses: number
+  candidateCacheHits: number
+  candidateCacheMisses: number
+  forcingCacheHits: number
+  forcingCacheMisses: number
 }
 
 type RankedPlacement = {
@@ -42,6 +51,7 @@ type RankedPlacement = {
 
 type CandidateGenerationPolicy = {
   topCellCount: number
+  maxLineCount: number
 }
 
 type SearchNode = {
@@ -53,7 +63,43 @@ type SearchNode = {
   visits: number
   totalValue: number
   winner: Player | null
+  stateKey: string
 }
+
+type ForcingNode = {
+  parent: ForcingNode | null
+  actionFromParent: Axial[] | null
+  children: ForcingNode[]
+  stateKey: string
+  playerToMove: Player
+  attacker: Player
+  depthRemaining: number
+  status: ForcingSolveResult['status']
+}
+
+type SearchStructureSignature = string
+
+type SessionPreparationStats = {
+  reusedCurrentRoot: boolean
+  reusedFromTree: boolean
+  previousTreeNodes: number
+  retainedTreeNodes: number
+  trimmedTreeNodes: number
+  keptAfterMove: boolean
+}
+
+export type BotSearchSession = {
+  context: SearchContext
+  root: ForcingNode | null
+  stateIndex: Map<string, ForcingNode[]>
+  forcingAttacker: Player | null
+  structureSignature: SearchStructureSignature | null
+  lastPreparation: SessionPreparationStats
+}
+
+type ForcingSolveResult =
+  | { status: 'win'; line: Axial[] }
+  | { status: 'loss' | 'unknown'; line: null }
 
 export type BotSearchProgress = {
   elapsedMs: number
@@ -74,21 +120,72 @@ type SearchProgressOptions = {
   yieldEveryMs?: number
 }
 
+type ForcingProofBudget = {
+  deadlineMs: number
+  maxNodes: number
+  nodesVisited: number
+}
+
 function createSearchContext(): SearchContext {
   return {
     boardEvalCounter: { count: 0 },
     evaluationCache: new Map(),
     candidateCache: new Map(),
+    forcingCache: new Map(),
+    evaluationCacheHits: 0,
+    evaluationCacheMisses: 0,
+    candidateCacheHits: 0,
+    candidateCacheMisses: 0,
+    forcingCacheHits: 0,
+    forcingCacheMisses: 0,
+  }
+}
+
+export function createBotSearchSession(): BotSearchSession {
+  return {
+    context: createSearchContext(),
+    root: null,
+    stateIndex: new Map(),
+    forcingAttacker: null,
+    structureSignature: null,
+    lastPreparation: {
+      reusedCurrentRoot: false,
+      reusedFromTree: false,
+      previousTreeNodes: 0,
+      retainedTreeNodes: 0,
+      trimmedTreeNodes: 0,
+      keptAfterMove: false,
+    },
+  }
+}
+
+export function resetBotSearchSession(session: BotSearchSession): void {
+  session.context = createSearchContext()
+  session.root = null
+  session.stateIndex = new Map()
+  session.forcingAttacker = null
+  session.structureSignature = null
+  session.lastPreparation = {
+    reusedCurrentRoot: false,
+    reusedFromTree: false,
+    previousTreeNodes: 0,
+    retainedTreeNodes: 0,
+    trimmedTreeNodes: 0,
+    keptAfterMove: false,
   }
 }
 
 function evaluateBoardStateTracked(board: SearchBoard, tuning: BotTuning, context: SearchContext): EvaluationSummary {
   const key = boardStateKey(board)
   const cached = context.evaluationCache.get(key)
-  if (cached) return cached
+  if (cached) {
+    context.evaluationCacheHits += 1
+    return cached
+  }
+  context.evaluationCacheMisses += 1
   context.boardEvalCounter.count += 1
   const result = evaluateBoardSummary(board, tuning)
-  context.evaluationCache.set(key, result)
+  setBoundedCacheEntry(context.evaluationCache, key, result, MAX_EVALUATION_CACHE_ENTRIES)
   return result
 }
 
@@ -124,6 +221,9 @@ function sortAxials(cells: Axial[]): Axial[] {
 const LEAF_OBJECTIVE_GAIN = 3
 const TACTICAL_EXPANSION_THRESHOLD = 6
 const TACTICAL_EXTENSION_DEPTH = 6
+const FORCING_SOLVER_DEPTH = 8
+const MAX_EVALUATION_CACHE_ENTRIES = 2_000
+const MAX_CANDIDATE_CACHE_ENTRIES = 256
 
 function uniqueAxials(cells: Axial[]): Axial[] {
   const seen = new Set<string>()
@@ -160,6 +260,78 @@ function collectOneTurnFinishCells(board: SearchBoard, player: Player): Set<stri
     finishCells.add(groupKey.slice(splitIndex + 1))
   }
   return finishCells
+}
+
+function threatGroupPairs(board: SearchBoard, player: Player): Array<{ first: string; second: string }> {
+  const pairs: Array<{ first: string; second: string }> = []
+  for (const groupKey of oneTurnThreatGroups(board, player).keys()) {
+    if (groupKey.length === 0) continue
+    const splitIndex = groupKey.indexOf('|')
+    if (splitIndex < 0) {
+      pairs.push({ first: groupKey, second: '' })
+      continue
+    }
+    pairs.push({
+      first: groupKey.slice(0, splitIndex),
+      second: groupKey.slice(splitIndex + 1),
+    })
+  }
+  return pairs
+}
+
+function enumerateCoveringMoveSets(
+  pairs: Array<{ first: string; second: string }>,
+  placementsAvailable: number,
+): string[][] {
+  if (pairs.length === 0 || placementsAvailable <= 0) return []
+
+  const uniqueCells: string[] = []
+  const seen = new Set<string>()
+  for (const pair of pairs) {
+    if (!seen.has(pair.first)) {
+      seen.add(pair.first)
+      uniqueCells.push(pair.first)
+    }
+    if (pair.second.length > 0 && !seen.has(pair.second)) {
+      seen.add(pair.second)
+      uniqueCells.push(pair.second)
+    }
+  }
+
+  const coveringSets: string[][] = []
+  const current: string[] = []
+
+  const coversAll = (cells: string[]) => {
+    for (const pair of pairs) {
+      let covered = false
+      for (const cell of cells) {
+        if (cell === pair.first || cell === pair.second) {
+          covered = true
+          break
+        }
+      }
+      if (!covered) return false
+    }
+    return true
+  }
+
+  const visit = (startIndex: number) => {
+    if (current.length > placementsAvailable) return
+    if (current.length > 0 && coversAll(current)) {
+      coveringSets.push([...current])
+      return
+    }
+    if (current.length === placementsAvailable) return
+
+    for (let i = startIndex; i < uniqueCells.length; i += 1) {
+      current.push(uniqueCells[i])
+      visit(i + 1)
+      current.pop()
+    }
+  }
+
+  visit(0)
+  return coveringSets
 }
 
 function hasImmediateThreats(board: SearchBoard): boolean {
@@ -288,6 +460,7 @@ function cloneCandidateLines(lines: Axial[][]): Axial[][] {
 function candidatePolicyKey(policy: CandidateGenerationPolicy, tuning: BotTuning): string {
   return [
     policy.topCellCount,
+    policy.maxLineCount,
     tuning.candidateRadius,
     tuning.topKFirstMoves,
   ].join('|')
@@ -361,14 +534,18 @@ function enumerateTurnCandidates(
 
   const cacheKey = `${boardStateKey(board)}|${candidatePolicyKey(policy, tuning)}`
   const cached = context.candidateCache.get(cacheKey)
-  if (cached) return cloneCandidateLines(cached)
+  if (cached) {
+    context.candidateCacheHits += 1
+    return cloneCandidateLines(cached)
+  }
+  context.candidateCacheMisses += 1
 
   const player = board.turn
   const placements = board.placementsLeft
 
   const winningLines = collectWinningTurnLines(board, player, tuning)
   if (winningLines.length > 0) {
-    context.candidateCache.set(cacheKey, cloneCandidateLines(winningLines))
+    setBoundedCacheEntry(context.candidateCache, cacheKey, cloneCandidateLines(winningLines), MAX_CANDIDATE_CACHE_ENTRIES)
     return winningLines
   }
 
@@ -379,7 +556,7 @@ function enumerateTurnCandidates(
   const firstPool = collectLegalCandidates(board, player, tuning, topCellCount)
   const firstRanked = rankPlacements(board, player, tuning, firstPool, context)
   if (firstRanked.length === 0) {
-    context.candidateCache.set(cacheKey, [])
+    setBoundedCacheEntry(context.candidateCache, cacheKey, [], MAX_CANDIDATE_CACHE_ENTRIES)
     return []
   }
   const topCellPlacements = firstRanked.slice(0, topCellCount)
@@ -418,7 +595,7 @@ function enumerateTurnCandidates(
       return b.ownScore - a.ownScore
     })
     const picks = pruned.map((entry) => entry.line)
-    context.candidateCache.set(cacheKey, cloneCandidateLines(picks))
+    setBoundedCacheEntry(context.candidateCache, cacheKey, cloneCandidateLines(picks), MAX_CANDIDATE_CACHE_ENTRIES)
     return picks
   }
 
@@ -473,7 +650,7 @@ function enumerateTurnCandidates(
       return b.ownScore - a.ownScore
     })
     const picks = pruned.map((entry) => entry.line)
-    context.candidateCache.set(cacheKey, cloneCandidateLines(picks))
+    setBoundedCacheEntry(context.candidateCache, cacheKey, cloneCandidateLines(picks), MAX_CANDIDATE_CACHE_ENTRIES)
     return picks
   }
 
@@ -508,7 +685,7 @@ function enumerateTurnCandidates(
 
   if (lines.length === 0) {
     const fallback = topCells.length > 0 ? [[topCells[0]]] : []
-    context.candidateCache.set(cacheKey, cloneCandidateLines(fallback))
+    setBoundedCacheEntry(context.candidateCache, cacheKey, cloneCandidateLines(fallback), MAX_CANDIDATE_CACHE_ENTRIES)
     return fallback
   }
 
@@ -521,14 +698,16 @@ function enumerateTurnCandidates(
 
   const unique = new Set<string>()
   const picks: Axial[][] = []
+  const maxLineCount = Math.max(1, Math.floor(policy.maxLineCount))
   for (const candidate of pruned) {
     const key = canonicalLineKey(candidate.line)
     if (unique.has(key)) continue
     unique.add(key)
     picks.push(candidate.line)
+    if (picks.length >= maxLineCount) break
   }
 
-  context.candidateCache.set(cacheKey, cloneCandidateLines(picks))
+  setBoundedCacheEntry(context.candidateCache, cacheKey, cloneCandidateLines(picks), MAX_CANDIDATE_CACHE_ENTRIES)
   return picks
 }
 
@@ -541,6 +720,184 @@ function nowMs(): number {
     return performance.now()
   }
   return Date.now()
+}
+
+function setBoundedCacheEntry<K, V>(cache: Map<K, V>, key: K, value: V, maxEntries: number): void {
+  if (cache.has(key)) {
+    cache.delete(key)
+  }
+  cache.set(key, value)
+  while (cache.size > maxEntries) {
+    const oldestKey = cache.keys().next().value as K | undefined
+    if (oldestKey === undefined) break
+    cache.delete(oldestKey)
+  }
+}
+
+function buildForcingProofBudget(options: BotSearchOptions, startMs: number): ForcingProofBudget {
+  const maxTimeMs = Math.max(0, options.budget.maxTimeMs)
+  const sliceMs = Math.max(40, Math.min(400, Math.floor(maxTimeMs * 0.2)))
+  const maxNodes = Math.max(64, Math.min(1500, Math.floor(options.budget.maxNodes * 0.02)))
+  return {
+    deadlineMs: startMs + sliceMs,
+    maxNodes,
+    nodesVisited: 0,
+  }
+}
+
+function clearTransientSearchCaches(context: SearchContext): void {
+  context.candidateCache.clear()
+  context.forcingCache.clear()
+}
+
+function clearRunSearchCaches(context: SearchContext): void {
+  context.evaluationCache.clear()
+  clearTransientSearchCaches(context)
+}
+
+function resetRunSearchStats(context: SearchContext): void {
+  context.boardEvalCounter.count = 0
+  context.evaluationCacheHits = 0
+  context.evaluationCacheMisses = 0
+  context.candidateCacheHits = 0
+  context.candidateCacheMisses = 0
+  context.forcingCacheHits = 0
+  context.forcingCacheMisses = 0
+}
+
+function prepareRunSearchContext(context: SearchContext): void {
+  clearRunSearchCaches(context)
+  resetRunSearchStats(context)
+}
+
+function structuralSearchSignature(tuning: BotTuning, options: BotSearchOptions): SearchStructureSignature {
+  return JSON.stringify({
+    tuning,
+    explorationC: options.explorationC,
+    turnCandidateCount: options.turnCandidateCount,
+    childTurnCandidateCount: options.childTurnCandidateCount,
+    maxSimulationTurns: options.maxSimulationTurns,
+    simulationTurnCandidateCount: options.simulationTurnCandidateCount,
+    simulationRadius: options.simulationRadius,
+    simulationTopKFirstMoves: options.simulationTopKFirstMoves,
+    progressiveWideningBase: options.progressiveWideningBase,
+    progressiveWideningScale: options.progressiveWideningScale,
+  })
+}
+
+function sessionStateCandidates(session: BotSearchSession, stateKey: string): ForcingNode[] {
+  return session.stateIndex.get(stateKey) ?? []
+}
+
+function countTreeNodes(root: ForcingNode | null): number {
+  if (!root) return 0
+  let count = 0
+  const queue: ForcingNode[] = [root]
+  while (queue.length > 0) {
+    const node = queue.pop() as ForcingNode
+    count += 1
+    for (const child of node.children) queue.push(child)
+  }
+  return count
+}
+
+function computeTreeStats(root: ForcingNode | null) {
+  if (!root) {
+    return {
+      nodeCount: 0,
+      leafCount: 0,
+      maxDepth: 0,
+      averageDepth: 0,
+      averageLeafDepth: 0,
+    }
+  }
+
+  let nodeCount = 0
+  let leafCount = 0
+  let maxDepth = 0
+  let totalDepth = 0
+  let totalLeafDepth = 0
+  const queue: Array<{ node: ForcingNode; depth: number }> = [{ node: root, depth: 0 }]
+
+  while (queue.length > 0) {
+    const current = queue.pop() as { node: ForcingNode; depth: number }
+    nodeCount += 1
+    totalDepth += current.depth
+    if (current.depth > maxDepth) maxDepth = current.depth
+
+    if (current.node.children.length === 0) {
+      leafCount += 1
+      totalLeafDepth += current.depth
+      continue
+    }
+
+    for (const child of current.node.children) {
+      queue.push({ node: child, depth: current.depth + 1 })
+    }
+  }
+
+  return {
+    nodeCount,
+    leafCount,
+    maxDepth,
+    averageDepth: nodeCount > 0 ? totalDepth / nodeCount : 0,
+    averageLeafDepth: leafCount > 0 ? totalLeafDepth / leafCount : 0,
+  }
+}
+
+function rebuildSessionIndex(session: BotSearchSession): void {
+  const next = new Map<string, ForcingNode[]>()
+  const queue: ForcingNode[] = session.root ? [session.root] : []
+
+  while (queue.length > 0) {
+    const node = queue.pop() as ForcingNode
+    const existing = next.get(node.stateKey)
+    if (existing) {
+      existing.push(node)
+    } else {
+      next.set(node.stateKey, [node])
+    }
+    for (const child of node.children) queue.push(child)
+  }
+
+  session.stateIndex = next
+}
+
+function chooseIndexedNode(nodes: ForcingNode[]): ForcingNode | null {
+  if (nodes.length === 0) return null
+  let best = nodes[0]
+  for (let i = 1; i < nodes.length; i += 1) {
+    const candidate = nodes[i]
+    if (candidate.depthRemaining > best.depthRemaining) {
+      best = candidate
+      continue
+    }
+    if (candidate.depthRemaining === best.depthRemaining && candidate.children.length > best.children.length) {
+      best = candidate
+    }
+  }
+  return best
+}
+
+function reRootSession(session: BotSearchSession, root: ForcingNode): void {
+  root.parent = null
+  root.actionFromParent = null
+  session.root = root
+  rebuildSessionIndex(session)
+}
+
+function resetSessionTree(session: BotSearchSession): void {
+  session.root = null
+  session.stateIndex = new Map()
+  session.forcingAttacker = null
+  session.context.forcingCache.clear()
+}
+
+function ensureSessionStructure(session: BotSearchSession, tuning: BotTuning, options: BotSearchOptions): void {
+  const structureSignature = structuralSearchSignature(tuning, options)
+  if (session.structureSignature === structureSignature) return
+  resetBotSearchSession(session)
+  session.structureSignature = structureSignature
 }
 
 function evaluateNodeForRoot(board: SearchBoard, winner: Player | null, rootPlayer: Player, tuning: BotTuning, context: SearchContext): number {
@@ -605,6 +962,60 @@ function tacticalValue(
   return best
 }
 
+function exactBlockingResponses(board: SearchBoard, attacker: Player): Axial[][] {
+  const pairs = threatGroupPairs(board, attacker)
+  if (pairs.length === 0) return []
+
+  const exactCovers = enumerateCoveringMoveSets(pairs, board.placementsLeft)
+  const deduped = new Set<string>()
+  const lines: Axial[][] = []
+
+  for (const cover of exactCovers) {
+    const line = sortAxials(cover.map(fromKey))
+    const key = canonicalLineKey(line)
+    if (deduped.has(key)) continue
+    deduped.add(key)
+    lines.push(line)
+  }
+
+  return lines
+}
+
+function forcingCandidateLines(
+  board: SearchBoard,
+  attacker: Player,
+  tuning: BotTuning,
+  options: BotSearchOptions,
+  context: SearchContext,
+): Axial[][] {
+  const policy = board.turn === attacker ? rootSearchPolicy(tuning, options) : childSearchPolicy(tuning, options)
+  const candidates = enumerateTurnCandidates(board, tuning, policy, context)
+  const forcing: Axial[][] = []
+
+  for (const line of candidates) {
+    const applied = applyTurnLineToBoard(board, line)
+    const key = canonicalLineKey(applied.appliedMoves)
+    const immediateWin = applied.winner === attacker
+    let keep = immediateWin
+
+    if (!keep && applied.appliedMoves.length > 0) {
+      const blockersRequired = oneTurnBlockersRequired(board, attacker)
+      const forcingThreshold = Math.min(2, Math.max(1, board.placementsLeft))
+      keep = blockersRequired >= forcingThreshold
+    }
+
+    undoAppliedTurn(board, applied)
+    if (!keep || key.length === 0) continue
+    forcing.push(line)
+  }
+
+  return forcing
+}
+
+function opponentCanWinImmediately(board: SearchBoard, player: Player, tuning: BotTuning): boolean {
+  return collectWinningTurnLines(board, player, tuning).length > 0
+}
+
 function selectUctChild(node: SearchNode, explorationC: number): SearchNode {
   const logParent = Math.log(Math.max(1, node.visits))
   let best = node.children[0]
@@ -656,24 +1067,28 @@ function findWinner(board: SearchBoard): Player | null {
 function greedyCandidatePolicy(tuning: BotTuning, candidateCount: number): CandidateGenerationPolicy {
   return {
     topCellCount: widenedTopCellCount(tuning.topKFirstMoves, candidateCount, 3),
+    maxLineCount: Math.max(8, Math.min(candidateCount, 24)),
   }
 }
 
 function rootSearchPolicy(tuning: BotTuning, options: BotSearchOptions): CandidateGenerationPolicy {
   return {
     topCellCount: widenedTopCellCount(tuning.topKFirstMoves, options.turnCandidateCount, 3),
+    maxLineCount: Math.max(8, Math.min(options.turnCandidateCount * 2, 32)),
   }
 }
 
 function childSearchPolicy(tuning: BotTuning, options: BotSearchOptions): CandidateGenerationPolicy {
   return {
     topCellCount: widenedTopCellCount(tuning.topKFirstMoves, options.childTurnCandidateCount, 2),
+    maxLineCount: Math.max(6, Math.min(options.childTurnCandidateCount, 20)),
   }
 }
 
 function rolloutSearchPolicy(options: BotSearchOptions): CandidateGenerationPolicy {
   return {
     topCellCount: Math.max(1, Math.min(Math.floor(options.simulationTurnCandidateCount), Math.floor(options.simulationTopKFirstMoves))),
+    maxLineCount: Math.max(4, Math.min(Math.floor(options.simulationTurnCandidateCount), 10)),
   }
 }
 
@@ -683,6 +1098,276 @@ function progressiveWideningLimit(node: SearchNode, options: BotSearchOptions): 
   const scale = Math.max(0, options.progressiveWideningScale)
   const limit = base + Math.floor(Math.sqrt(Math.max(0, node.visits)) * scale)
   return Math.max(1, Math.min(node.candidateActions.length, limit))
+}
+
+function createRootNode(board: SearchBoard, tuning: BotTuning, options: BotSearchOptions, context: SearchContext): SearchNode {
+  return {
+    parent: null,
+    actionFromParent: null,
+    children: [],
+    candidateActions: enumerateTurnCandidates(board, tuning, rootSearchPolicy(tuning, options), context),
+    nextActionIndex: 0,
+    visits: 0,
+    totalValue: 0,
+    winner: null,
+    stateKey: boardStateKey(board),
+  }
+}
+
+function prepareSearchSession(
+  session: BotSearchSession,
+  board: SearchBoard,
+  attacker: Player,
+): void {
+  const previousTreeNodes = countTreeNodes(session.root)
+  const targetStateKey = boardStateKey(board)
+  if (session.root && session.forcingAttacker === attacker && session.root.stateKey === targetStateKey) {
+    session.lastPreparation = {
+      reusedCurrentRoot: true,
+      reusedFromTree: true,
+      previousTreeNodes,
+      retainedTreeNodes: previousTreeNodes,
+      trimmedTreeNodes: 0,
+      keptAfterMove: false,
+    }
+    return
+  }
+
+  if (session.forcingAttacker !== attacker) {
+    resetSessionTree(session)
+    session.lastPreparation = {
+      reusedCurrentRoot: false,
+      reusedFromTree: false,
+      previousTreeNodes,
+      retainedTreeNodes: 0,
+      trimmedTreeNodes: previousTreeNodes,
+      keptAfterMove: false,
+    }
+    return
+  }
+
+  const indexed = chooseIndexedNode(sessionStateCandidates(session, targetStateKey))
+  if (indexed) {
+    const retainedTreeNodes = countTreeNodes(indexed)
+    reRootSession(session, indexed)
+    session.lastPreparation = {
+      reusedCurrentRoot: false,
+      reusedFromTree: true,
+      previousTreeNodes,
+      retainedTreeNodes,
+      trimmedTreeNodes: Math.max(0, previousTreeNodes - retainedTreeNodes),
+      keptAfterMove: false,
+    }
+    return
+  }
+
+  resetSessionTree(session)
+  session.lastPreparation = {
+    reusedCurrentRoot: false,
+    reusedFromTree: false,
+    previousTreeNodes,
+    retainedTreeNodes: 0,
+    trimmedTreeNodes: previousTreeNodes,
+    keptAfterMove: false,
+  }
+}
+
+function sortRootChildren(root: SearchNode): void {
+  root.children.sort((a, b) => {
+    if (a.visits !== b.visits) return b.visits - a.visits
+    const aMean = a.visits > 0 ? a.totalValue / a.visits : Number.NEGATIVE_INFINITY
+    const bMean = b.visits > 0 ? b.totalValue / b.visits : Number.NEGATIVE_INFINITY
+    return bMean - aMean
+  })
+}
+
+function bestChildAction(node: SearchNode | null): Axial[] | undefined {
+  if (!node || node.children.length === 0) return undefined
+  sortRootChildren(node)
+  return node.children[0].actionFromParent ?? undefined
+}
+
+function statusValue(status: ForcingSolveResult['status']): number {
+  if (status === 'win') return 1
+  if (status === 'loss') return -1
+  return 0
+}
+
+function valueStatus(value: number): ForcingSolveResult['status'] {
+  if (value >= 1) return 'win'
+  if (value <= -1) return 'loss'
+  return 'unknown'
+}
+
+function createForcingNode(
+  board: SearchBoard,
+  attacker: Player,
+  depthRemaining: number,
+  parent: ForcingNode | null,
+  actionFromParent: Axial[] | null,
+): ForcingNode {
+  return {
+    parent,
+    actionFromParent,
+    children: [],
+    stateKey: boardStateKey(board),
+    playerToMove: board.turn,
+    attacker,
+    depthRemaining,
+    status: 'unknown',
+  }
+}
+
+function sortForcingChildren(node: ForcingNode): void {
+  const attackerTurn = node.playerToMove === node.attacker
+  node.children.sort((a, b) => {
+    const delta = statusValue(b.status) - statusValue(a.status)
+    return attackerTurn ? delta : -delta
+  })
+}
+
+function bestForcingChildAction(node: ForcingNode | null): Axial[] | undefined {
+  if (!node || node.children.length === 0) return undefined
+  sortForcingChildren(node)
+  return node.children[0].actionFromParent ?? undefined
+}
+
+function findForcingChildByAction(node: ForcingNode | null, action: Axial[]): ForcingNode | null {
+  if (!node) return null
+  const actionKey = canonicalLineKey(action)
+  for (const child of node.children) {
+    if (child.actionFromParent && canonicalLineKey(child.actionFromParent) === actionKey) {
+      return child
+    }
+  }
+  return null
+}
+
+function buildForcingProofNode(
+  board: SearchBoard,
+  attacker: Player,
+  tuning: BotTuning,
+  options: BotSearchOptions,
+  context: SearchContext,
+  budget: ForcingProofBudget,
+  depthRemaining: number,
+  parent: ForcingNode | null = null,
+  actionFromParent: Axial[] | null = null,
+  alpha = -1,
+  beta = 1,
+): ForcingNode {
+  const node = createForcingNode(board, attacker, depthRemaining, parent, actionFromParent)
+  if (budget.nodesVisited >= budget.maxNodes || nowMs() >= budget.deadlineMs) return node
+  budget.nodesVisited += 1
+  if (depthRemaining <= 0) return node
+
+  const defender: Player = attacker === 'X' ? 'O' : 'X'
+  const currentPlayer = board.turn
+  const forcingThreshold = Math.min(2, Math.max(1, board.placementsLeft))
+  const blockersRequired = oneTurnBlockersRequired(board, attacker)
+
+  if (currentPlayer === defender && opponentCanWinImmediately(board, defender, tuning)) {
+    node.status = 'loss'
+    return node
+  }
+
+  if (currentPlayer === defender && blockersRequired >= board.placementsLeft + 1) {
+    node.status = 'win'
+    return node
+  }
+
+  if (currentPlayer === attacker) {
+    const forcingLines = forcingCandidateLines(board, attacker, tuning, options, context)
+    if (forcingLines.length === 0) return node
+
+    let bestValue = -1
+    let localAlpha = alpha
+    for (const line of forcingLines) {
+      const applied = applyTurnLineToBoard(board, line)
+      const child = applied.winner === attacker
+        ? (() => {
+            const leaf = createForcingNode(board, attacker, depthRemaining - 1, node, line)
+            leaf.status = 'win'
+            return leaf
+          })()
+        : buildForcingProofNode(board, attacker, tuning, options, context, budget, depthRemaining - 1, node, line, localAlpha, beta)
+      undoAppliedTurn(board, applied)
+      node.children.push(child)
+      const childValue = statusValue(child.status)
+      if (childValue > bestValue) bestValue = childValue
+      if (bestValue > localAlpha) localAlpha = bestValue
+      if (localAlpha >= beta || bestValue === 1) break
+    }
+
+    node.status = valueStatus(bestValue)
+    sortForcingChildren(node)
+    return node
+  }
+
+  if (blockersRequired < forcingThreshold) {
+    return node
+  }
+
+  if (blockersRequired >= board.placementsLeft + 1) {
+    node.status = 'win'
+    return node
+  }
+
+  const blockingLines = exactBlockingResponses(board, attacker)
+  if (blockingLines.length === 0) {
+    node.status = 'win'
+    return node
+  }
+
+  let bestValue = 1
+  let localBeta = beta
+  for (const line of blockingLines) {
+    const applied = applyTurnLineToBoard(board, line)
+    const child = buildForcingProofNode(board, attacker, tuning, options, context, budget, depthRemaining - 1, node, line, alpha, localBeta)
+    undoAppliedTurn(board, applied)
+    node.children.push(child)
+    const childValue = statusValue(child.status)
+    if (childValue < bestValue) bestValue = childValue
+    if (bestValue < localBeta) localBeta = bestValue
+    if (alpha >= localBeta || bestValue === -1) break
+  }
+
+  node.status = valueStatus(bestValue)
+  sortForcingChildren(node)
+  return node
+}
+
+function buildForcingProof(
+  board: SearchBoard,
+  attacker: Player,
+  tuning: BotTuning,
+  options: BotSearchOptions,
+  context: SearchContext,
+  startMs: number,
+): ForcingNode | null {
+  if (!shouldAttemptForcingSolve(board, attacker)) return null
+  return buildForcingProofNode(board, attacker, tuning, options, context, buildForcingProofBudget(options, startMs), FORCING_SOLVER_DEPTH)
+}
+
+function buildSessionStats(session: BotSearchSession): BotSearchSessionStats {
+  return {
+    reusedCurrentRoot: session.lastPreparation.reusedCurrentRoot,
+    reusedFromTree: session.lastPreparation.reusedFromTree,
+    previousTreeNodes: session.lastPreparation.previousTreeNodes,
+    retainedTreeNodes: session.lastPreparation.retainedTreeNodes,
+    trimmedTreeNodes: session.lastPreparation.trimmedTreeNodes,
+    keptAfterMove: session.lastPreparation.keptAfterMove,
+    currentTree: computeTreeStats(session.root),
+    evaluationCacheSize: session.context.evaluationCache.size,
+    candidateCacheSize: session.context.candidateCache.size,
+    forcingCacheSize: session.context.forcingCache.size,
+    evaluationCacheHits: session.context.evaluationCacheHits,
+    evaluationCacheMisses: session.context.evaluationCacheMisses,
+    candidateCacheHits: session.context.candidateCacheHits,
+    candidateCacheMisses: session.context.candidateCacheMisses,
+    forcingCacheHits: session.context.forcingCacheHits,
+    forcingCacheMisses: session.context.forcingCacheMisses,
+  }
 }
 
 function chooseGreedyTurnOnBoard(
@@ -776,19 +1461,31 @@ function rolloutValue(
   return value
 }
 
+function shouldAttemptForcingSolve(board: SearchBoard, player: Player): boolean {
+  if (!hasImmediateThreats(board)) return false
+  return oneTurnBlockersRequired(board, player) >= 2
+}
+
+function finalizeSessionForDecision(session: BotSearchSession, retainedRoot: ForcingNode | null, attacker: Player | null): void {
+  session.lastPreparation.keptAfterMove = retainedRoot !== null
+  if (!retainedRoot || !attacker) {
+    resetSessionTree(session)
+    clearRunSearchCaches(session.context)
+    return
+  }
+
+  session.root = retainedRoot
+  session.forcingAttacker = attacker
+  rebuildSessionIndex(session)
+  clearRunSearchCaches(session.context)
+}
+
 export function inspectBotCandidates(
   state: LiveLikeState,
   tuning: BotTuning = DEFAULT_BOT_TUNING,
   partialOptions: Partial<BotSearchOptions> = {},
 ): BotCandidateSnapshot {
-  const options: BotSearchOptions = {
-    ...DEFAULT_BOT_SEARCH_OPTIONS,
-    ...partialOptions,
-    budget: {
-      ...DEFAULT_BOT_SEARCH_OPTIONS.budget,
-      ...partialOptions.budget,
-    },
-  }
+  const options = normalizeSearchOptions(partialOptions)
   const context = createSearchContext()
   const board = createSearchBoard(state)
   if (board.placementsLeft <= 0) {
@@ -812,6 +1509,17 @@ export function inspectBotCandidates(
   }
 }
 
+function normalizeSearchOptions(partialOptions: Partial<BotSearchOptions>): BotSearchOptions {
+  return {
+    ...DEFAULT_BOT_SEARCH_OPTIONS,
+    ...partialOptions,
+    budget: {
+      ...DEFAULT_BOT_SEARCH_OPTIONS.budget,
+      ...partialOptions.budget,
+    },
+  }
+}
+
 function chooseGreedyDecision(state: LiveLikeState, tuning: BotTuning, context: SearchContext): BotTurnDecision {
   const start = nowMs()
   const board = createSearchBoard(state)
@@ -831,75 +1539,128 @@ function chooseGreedyDecision(state: LiveLikeState, tuning: BotTuning, context: 
   }
 }
 
-export function chooseBotTurnDetailed(
-  state: LiveLikeState,
-  tuning: BotTuning = DEFAULT_BOT_TUNING,
-  partialOptions: Partial<BotSearchOptions> = {},
+function enrichDecisionWithSession(
+  decision: BotTurnDecision,
+  session: BotSearchSession,
+  stateMoveCount: number,
+  retainedRoot?: ForcingNode | null,
+  attacker?: Player | null,
+  predictedOpponentReply?: Axial[],
 ): BotTurnDecision {
-  const start = nowMs()
-  const options: BotSearchOptions = {
-    ...DEFAULT_BOT_SEARCH_OPTIONS,
-    ...partialOptions,
-    budget: {
-      ...DEFAULT_BOT_SEARCH_OPTIONS.budget,
-      ...partialOptions.budget,
+  finalizeSessionForDecision(session, retainedRoot ?? null, attacker ?? null)
+  decision.stats.session = buildSessionStats(session)
+  if (predictedOpponentReply && predictedOpponentReply.length > 0) {
+    decision.stats.predictedOpponentReply = predictedOpponentReply
+  }
+  decision.stats.postMoveCount = stateMoveCount + decision.moves.length
+  return decision
+}
+
+function terminalDecision(start: number, context: SearchContext, mode: BotSearchMode = 'mcts'): BotTurnDecision {
+  return {
+    moves: [],
+    stats: {
+      mode,
+      elapsedMs: nowMs() - start,
+      nodesExpanded: 0,
+      playouts: 0,
+      boardEvaluations: context.boardEvalCounter.count,
+      maxDepthTurns: 0,
+      rootCandidates: 0,
+      stopReason: 'terminal',
     },
   }
-  const context = createSearchContext()
+}
+
+function chooseBotTurnDetailedWithSessionInternal(
+  state: LiveLikeState,
+  tuning: BotTuning,
+  options: BotSearchOptions,
+  session: BotSearchSession,
+): BotTurnDecision {
+  const start = nowMs()
+  ensureSessionStructure(session, tuning, options)
+  const context = session.context
+  prepareRunSearchContext(context)
   const board = createSearchBoard(state)
+  const stateMoveCount = board.moves.size
+  const rootPlayer = board.turn
+
+  if (shouldAttemptForcingSolve(board, rootPlayer)) {
+    prepareSearchSession(session, board, rootPlayer)
+  } else {
+    const previousTreeNodes = countTreeNodes(session.root)
+    resetSessionTree(session)
+    session.lastPreparation = {
+      reusedCurrentRoot: false,
+      reusedFromTree: false,
+      previousTreeNodes,
+      retainedTreeNodes: 0,
+      trimmedTreeNodes: previousTreeNodes,
+      keptAfterMove: false,
+    }
+  }
 
   if (board.placementsLeft <= 0) {
-    return {
-      moves: [],
-      stats: {
-        mode: 'greedy',
-        elapsedMs: nowMs() - start,
-        nodesExpanded: 0,
-        playouts: 0,
-        boardEvaluations: context.boardEvalCounter.count,
-        maxDepthTurns: 0,
-        rootCandidates: 0,
-        stopReason: 'terminal',
-      },
+    return enrichDecisionWithSession(terminalDecision(start, context, 'greedy'), session, stateMoveCount)
+  }
+
+  if (findWinner(board)) {
+    return enrichDecisionWithSession(terminalDecision(start, context), session, stateMoveCount)
+  }
+
+  if (session.root && session.root.playerToMove === rootPlayer && session.root.status === 'win') {
+    const forcedLine = bestForcingChildAction(session.root)
+    if (forcedLine && forcedLine.length > 0) {
+      const retainedRoot = findForcingChildByAction(session.root, forcedLine)
+      const predictedOpponentReply = bestForcingChildAction(retainedRoot)
+      return enrichDecisionWithSession({
+        moves: forcedLine,
+        stats: {
+          mode: 'mcts',
+          elapsedMs: nowMs() - start,
+          nodesExpanded: 0,
+          playouts: 0,
+          boardEvaluations: context.boardEvalCounter.count,
+          maxDepthTurns: 0,
+          rootCandidates: session.root.children.length,
+          stopReason: 'early_win',
+        },
+      }, session, stateMoveCount, retainedRoot, rootPlayer, predictedOpponentReply)
+    }
+  }
+
+  const forcingProof = buildForcingProof(board, rootPlayer, tuning, options, context, start)
+  if (forcingProof?.status === 'win') {
+    const forcedLine = bestForcingChildAction(forcingProof)
+    if (forcedLine && forcedLine.length > 0) {
+      const retainedRoot = findForcingChildByAction(forcingProof, forcedLine)
+      const predictedOpponentReply = bestForcingChildAction(retainedRoot)
+      return enrichDecisionWithSession({
+        moves: forcedLine,
+        stats: {
+          mode: 'mcts',
+          elapsedMs: nowMs() - start,
+          nodesExpanded: 1,
+          playouts: 0,
+          boardEvaluations: context.boardEvalCounter.count,
+          maxDepthTurns: 0,
+          rootCandidates: forcingProof.children.length,
+          stopReason: 'early_win',
+        },
+      }, session, stateMoveCount, retainedRoot, rootPlayer, predictedOpponentReply)
     }
   }
 
   if (options.budget.maxTimeMs <= 0 || options.budget.maxNodes <= 0) {
-    return chooseGreedyDecision(state, tuning, context)
+    return enrichDecisionWithSession(chooseGreedyDecision(state, tuning, context), session, stateMoveCount)
   }
 
-  const existingWinner = findWinner(board)
-  if (existingWinner) {
-    return {
-      moves: [],
-      stats: {
-        mode: 'mcts',
-        elapsedMs: nowMs() - start,
-        nodesExpanded: 0,
-        playouts: 0,
-        boardEvaluations: context.boardEvalCounter.count,
-        maxDepthTurns: 0,
-        rootCandidates: 0,
-        stopReason: 'terminal',
-      },
-    }
-  }
+  const root = createRootNode(board, tuning, options, context)
+  const rootCandidates = root.candidateActions
 
-  const rootPlayer = board.turn
-  const rootCandidates = enumerateTurnCandidates(board, tuning, rootSearchPolicy(tuning, options), context)
-  const root: SearchNode = {
-    parent: null,
-    actionFromParent: null,
-    children: [],
-    candidateActions: rootCandidates,
-    nextActionIndex: 0,
-    visits: 0,
-    totalValue: 0,
-    winner: null,
-  }
-
-  if (root.candidateActions.length === 0) {
-    return {
+  if (rootCandidates.length === 0) {
+    return enrichDecisionWithSession({
       moves: chooseGreedyTurnOnBoard(board, tuning, context),
       stats: {
         mode: 'mcts',
@@ -911,7 +1672,7 @@ export function chooseBotTurnDetailed(
         rootCandidates: 0,
         stopReason: 'no_candidates',
       },
-    }
+    }, session, stateMoveCount)
   }
 
   let nodesExpanded = 1
@@ -924,7 +1685,8 @@ export function chooseBotTurnDetailed(
     const winner = applied.winner
     undoAppliedTurn(board, applied)
     if (winner === rootPlayer) {
-      return {
+      const predictedOpponentReply = bestChildAction(root.children.find((child) => child.actionFromParent === line) ?? null)
+      return enrichDecisionWithSession({
         moves: line,
         stats: {
           mode: 'mcts',
@@ -934,9 +1696,9 @@ export function chooseBotTurnDetailed(
           boardEvaluations: context.boardEvalCounter.count,
           maxDepthTurns,
           rootCandidates: rootCandidates.length,
-          stopReason: 'early_win',
+        stopReason: 'early_win',
         },
-      }
+      }, session, stateMoveCount, undefined, undefined, predictedOpponentReply)
     }
   }
 
@@ -965,6 +1727,7 @@ export function chooseBotTurnDetailed(
           visits: 0,
           totalValue: 0,
           winner: applied.winner,
+          stateKey: boardStateKey(board),
         }
         node.children.push(child)
         node = child
@@ -1000,7 +1763,8 @@ export function chooseBotTurnDetailed(
     if (winner === rootPlayer) {
       const rootAction = rootActionFor(node)
       if (rootAction) {
-        return {
+        const predictedOpponentReply = bestChildAction(root.children.find((child) => child.actionFromParent === rootAction) ?? null)
+        return enrichDecisionWithSession({
           moves: rootAction,
           stats: {
             mode: 'mcts',
@@ -1012,7 +1776,7 @@ export function chooseBotTurnDetailed(
             rootCandidates: rootCandidates.length,
             stopReason: 'early_win',
           },
-        }
+        }, session, stateMoveCount, undefined, undefined, predictedOpponentReply)
       }
     }
   }
@@ -1024,7 +1788,7 @@ export function chooseBotTurnDetailed(
   }
 
   if (root.children.length === 0) {
-    return {
+    return enrichDecisionWithSession({
       moves: chooseGreedyTurnOnBoard(board, tuning, context),
       stats: {
         mode: 'mcts',
@@ -1036,17 +1800,11 @@ export function chooseBotTurnDetailed(
         rootCandidates: rootCandidates.length,
         stopReason: 'fallback',
       },
-    }
+    }, session, stateMoveCount)
   }
 
-  root.children.sort((a, b) => {
-    if (a.visits !== b.visits) return b.visits - a.visits
-    const aMean = a.visits > 0 ? a.totalValue / a.visits : Number.NEGATIVE_INFINITY
-    const bMean = b.visits > 0 ? b.totalValue / b.visits : Number.NEGATIVE_INFINITY
-    return bMean - aMean
-  })
-
-  return {
+  sortRootChildren(root)
+  return enrichDecisionWithSession({
     moves: root.children[0].actionFromParent ?? chooseGreedyTurnOnBoard(board, tuning, context),
     stats: {
       mode: 'mcts',
@@ -1058,7 +1816,24 @@ export function chooseBotTurnDetailed(
       rootCandidates: rootCandidates.length,
       stopReason,
     },
-  }
+  }, session, stateMoveCount, undefined, undefined, bestChildAction(root.children[0] ?? null))
+}
+
+export function chooseBotTurnDetailedWithSession(
+  state: LiveLikeState,
+  session: BotSearchSession,
+  tuning: BotTuning = DEFAULT_BOT_TUNING,
+  partialOptions: Partial<BotSearchOptions> = {},
+): BotTurnDecision {
+  return chooseBotTurnDetailedWithSessionInternal(state, tuning, normalizeSearchOptions(partialOptions), session)
+}
+
+export function chooseBotTurnDetailed(
+  state: LiveLikeState,
+  tuning: BotTuning = DEFAULT_BOT_TUNING,
+  partialOptions: Partial<BotSearchOptions> = {},
+): BotTurnDecision {
+  return chooseBotTurnDetailedWithSession(state, createBotSearchSession(), tuning, partialOptions)
 }
 
 function sleep0(): Promise<void> {
@@ -1073,17 +1848,38 @@ export async function chooseBotTurnDetailedAsync(
   partialOptions: Partial<BotSearchOptions> = {},
   progressOptions: SearchProgressOptions = {},
 ): Promise<BotTurnDecision> {
+  return chooseBotTurnDetailedAsyncWithSession(state, createBotSearchSession(), tuning, partialOptions, progressOptions)
+}
+
+export async function chooseBotTurnDetailedAsyncWithSession(
+  state: LiveLikeState,
+  session: BotSearchSession,
+  tuning: BotTuning = DEFAULT_BOT_TUNING,
+  partialOptions: Partial<BotSearchOptions> = {},
+  progressOptions: SearchProgressOptions = {},
+): Promise<BotTurnDecision> {
   const start = nowMs()
-  const options: BotSearchOptions = {
-    ...DEFAULT_BOT_SEARCH_OPTIONS,
-    ...partialOptions,
-    budget: {
-      ...DEFAULT_BOT_SEARCH_OPTIONS.budget,
-      ...partialOptions.budget,
-    },
-  }
-  const context = createSearchContext()
+  const options = normalizeSearchOptions(partialOptions)
+  ensureSessionStructure(session, tuning, options)
+  const context = session.context
+  prepareRunSearchContext(context)
   const board = createSearchBoard(state)
+  const stateMoveCount = board.moves.size
+  const rootPlayer = board.turn
+  if (shouldAttemptForcingSolve(board, rootPlayer)) {
+    prepareSearchSession(session, board, rootPlayer)
+  } else {
+    const previousTreeNodes = countTreeNodes(session.root)
+    resetSessionTree(session)
+    session.lastPreparation = {
+      reusedCurrentRoot: false,
+      reusedFromTree: false,
+      previousTreeNodes,
+      retainedTreeNodes: 0,
+      trimmedTreeNodes: previousTreeNodes,
+      keptAfterMove: false,
+    }
+  }
   const { onProgress, yieldEveryMs = 16 } = progressOptions
 
   const reportProgress = (nodesExpanded: number, playouts: number, maxDepthTurns: number) => {
@@ -1098,61 +1894,71 @@ export async function chooseBotTurnDetailedAsync(
 
   if (board.placementsLeft <= 0) {
     reportProgress(0, 0, 0)
-    return {
-      moves: [],
-      stats: {
-        mode: 'greedy',
-        elapsedMs: nowMs() - start,
-        nodesExpanded: 0,
-        playouts: 0,
-        boardEvaluations: context.boardEvalCounter.count,
-        maxDepthTurns: 0,
-        rootCandidates: 0,
-        stopReason: 'terminal',
-      },
+    return enrichDecisionWithSession(terminalDecision(start, context, 'greedy'), session, stateMoveCount)
+  }
+
+  if (findWinner(board)) {
+    reportProgress(0, 0, 0)
+    return enrichDecisionWithSession(terminalDecision(start, context), session, stateMoveCount)
+  }
+
+  if (session.root && session.root.playerToMove === rootPlayer && session.root.status === 'win') {
+    const forcedLine = bestForcingChildAction(session.root)
+    if (forcedLine && forcedLine.length > 0) {
+      reportProgress(0, 0, 0)
+      const retainedRoot = findForcingChildByAction(session.root, forcedLine)
+      const predictedOpponentReply = bestForcingChildAction(retainedRoot)
+      return enrichDecisionWithSession({
+        moves: forcedLine,
+        stats: {
+          mode: 'mcts',
+          elapsedMs: nowMs() - start,
+          nodesExpanded: 0,
+          playouts: 0,
+          boardEvaluations: context.boardEvalCounter.count,
+          maxDepthTurns: 0,
+          rootCandidates: session.root.children.length,
+          stopReason: 'early_win',
+        },
+      }, session, stateMoveCount, retainedRoot, rootPlayer, predictedOpponentReply)
+    }
+  }
+
+  const forcingProof = buildForcingProof(board, rootPlayer, tuning, options, context, start)
+  if (forcingProof?.status === 'win') {
+    const forcedLine = bestForcingChildAction(forcingProof)
+    if (forcedLine && forcedLine.length > 0) {
+      reportProgress(1, 0, 0)
+      const retainedRoot = findForcingChildByAction(forcingProof, forcedLine)
+      const predictedOpponentReply = bestForcingChildAction(retainedRoot)
+      return enrichDecisionWithSession({
+        moves: forcedLine,
+        stats: {
+          mode: 'mcts',
+          elapsedMs: nowMs() - start,
+          nodesExpanded: 1,
+          playouts: 0,
+          boardEvaluations: context.boardEvalCounter.count,
+          maxDepthTurns: 0,
+          rootCandidates: forcingProof.children.length,
+          stopReason: 'early_win',
+        },
+      }, session, stateMoveCount, retainedRoot, rootPlayer, predictedOpponentReply)
     }
   }
 
   if (options.budget.maxTimeMs <= 0 || options.budget.maxNodes <= 0) {
     const decision = chooseGreedyDecision(boardToLiveState(board), tuning, context)
     reportProgress(0, 0, 0)
-    return decision
+    return enrichDecisionWithSession(decision, session, stateMoveCount)
   }
 
-  const existingWinner = findWinner(board)
-  if (existingWinner) {
-    reportProgress(0, 0, 0)
-    return {
-      moves: [],
-      stats: {
-        mode: 'mcts',
-        elapsedMs: nowMs() - start,
-        nodesExpanded: 0,
-        playouts: 0,
-        boardEvaluations: context.boardEvalCounter.count,
-        maxDepthTurns: 0,
-        rootCandidates: 0,
-        stopReason: 'terminal',
-      },
-    }
-  }
-
-  const rootPlayer = board.turn
-  const rootCandidates = enumerateTurnCandidates(board, tuning, rootSearchPolicy(tuning, options), context)
-  const root: SearchNode = {
-    parent: null,
-    actionFromParent: null,
-    children: [],
-    candidateActions: rootCandidates,
-    nextActionIndex: 0,
-    visits: 0,
-    totalValue: 0,
-    winner: null,
-  }
+  const root = createRootNode(board, tuning, options, context)
+  const rootCandidates = root.candidateActions
 
   if (root.candidateActions.length === 0) {
     reportProgress(1, 0, 0)
-    return {
+    return enrichDecisionWithSession({
       moves: chooseGreedyTurnOnBoard(board, tuning, context),
       stats: {
         mode: 'mcts',
@@ -1164,7 +1970,7 @@ export async function chooseBotTurnDetailedAsync(
         rootCandidates: 0,
         stopReason: 'no_candidates',
       },
-    }
+    }, session, stateMoveCount)
   }
 
   let nodesExpanded = 1
@@ -1179,7 +1985,8 @@ export async function chooseBotTurnDetailedAsync(
     undoAppliedTurn(board, applied)
     if (winner === rootPlayer) {
       reportProgress(nodesExpanded, playouts, maxDepthTurns)
-      return {
+      const predictedOpponentReply = bestChildAction(root.children.find((child) => child.actionFromParent === line) ?? null)
+      return enrichDecisionWithSession({
         moves: line,
         stats: {
           mode: 'mcts',
@@ -1191,7 +1998,7 @@ export async function chooseBotTurnDetailedAsync(
           rootCandidates: rootCandidates.length,
           stopReason: 'early_win',
         },
-      }
+      }, session, stateMoveCount, undefined, undefined, predictedOpponentReply)
     }
   }
 
@@ -1220,6 +2027,7 @@ export async function chooseBotTurnDetailedAsync(
           visits: 0,
           totalValue: 0,
           winner: applied.winner,
+          stateKey: boardStateKey(board),
         }
         node.children.push(child)
         node = child
@@ -1256,7 +2064,8 @@ export async function chooseBotTurnDetailedAsync(
       const rootAction = rootActionFor(node)
       if (rootAction) {
         reportProgress(nodesExpanded, playouts, maxDepthTurns)
-        return {
+        const predictedOpponentReply = bestChildAction(root.children.find((child) => child.actionFromParent === rootAction) ?? null)
+        return enrichDecisionWithSession({
           moves: rootAction,
           stats: {
             mode: 'mcts',
@@ -1268,7 +2077,7 @@ export async function chooseBotTurnDetailedAsync(
             rootCandidates: rootCandidates.length,
             stopReason: 'early_win',
           },
-        }
+        }, session, stateMoveCount, undefined, undefined, predictedOpponentReply)
       }
     }
 
@@ -1288,7 +2097,7 @@ export async function chooseBotTurnDetailedAsync(
 
   if (root.children.length === 0) {
     reportProgress(nodesExpanded, playouts, maxDepthTurns)
-    return {
+    return enrichDecisionWithSession({
       moves: chooseGreedyTurnOnBoard(board, tuning, context),
       stats: {
         mode: 'mcts',
@@ -1300,18 +2109,13 @@ export async function chooseBotTurnDetailedAsync(
         rootCandidates: rootCandidates.length,
         stopReason: 'fallback',
       },
-    }
+    }, session, stateMoveCount)
   }
 
-  root.children.sort((a, b) => {
-    if (a.visits !== b.visits) return b.visits - a.visits
-    const aMean = a.visits > 0 ? a.totalValue / a.visits : Number.NEGATIVE_INFINITY
-    const bMean = b.visits > 0 ? b.totalValue / b.visits : Number.NEGATIVE_INFINITY
-    return bMean - aMean
-  })
+  sortRootChildren(root)
 
   reportProgress(nodesExpanded, playouts, maxDepthTurns)
-  return {
+  return enrichDecisionWithSession({
     moves: root.children[0].actionFromParent ?? chooseGreedyTurnOnBoard(board, tuning, context),
     stats: {
       mode: 'mcts',
@@ -1323,7 +2127,7 @@ export async function chooseBotTurnDetailedAsync(
       rootCandidates: rootCandidates.length,
       stopReason,
     },
-  }
+  }, session, stateMoveCount, undefined, undefined, bestChildAction(root.children[0] ?? null))
 }
 
 export function chooseBotTurn(
@@ -1332,6 +2136,15 @@ export function chooseBotTurn(
   partialOptions: Partial<BotSearchOptions> = {},
 ): Axial[] {
   return chooseBotTurnDetailed(state, tuning, partialOptions).moves
+}
+
+export function chooseBotTurnWithSession(
+  state: LiveLikeState,
+  session: BotSearchSession,
+  tuning: BotTuning = DEFAULT_BOT_TUNING,
+  partialOptions: Partial<BotSearchOptions> = {},
+): Axial[] {
+  return chooseBotTurnDetailedWithSession(state, session, tuning, partialOptions).moves
 }
 
 export function chooseGreedyTurn(state: LiveLikeState, tuning: BotTuning = DEFAULT_BOT_TUNING): Axial[] {

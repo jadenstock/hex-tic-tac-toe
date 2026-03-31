@@ -3,13 +3,15 @@ import './App.css'
 import {
   DEFAULT_BOT_SEARCH_OPTIONS,
   DEFAULT_BOT_TUNING,
-  chooseBotTurnDetailedAsync,
-  chooseBotTurnDetailed,
+  chooseBotTurnDetailedAsyncWithSession,
+  chooseBotTurnDetailedWithSession,
+  createBotSearchSession,
   evaluateBoardState,
   inspectBotCandidates,
   type BotCandidateSnapshot,
   type BotSearchStats,
   type BotSearchOptions,
+  type BotSearchSession,
   type BotTuning,
 } from './bot/engine'
 
@@ -1028,6 +1030,7 @@ function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const initializedRef = useRef(false)
   const wsRef = useRef<WebSocket | null>(null)
+  const botSearchSessionRef = useRef<BotSearchSession>(createBotSearchSession())
 
   const [size, setSize] = useState({ width: 0, height: 0 })
   const [camera, setCamera] = useState<Camera>({ x: 0, y: 0, zoom: 1 })
@@ -1059,6 +1062,7 @@ function App() {
   const [showThreatHighlights, setShowThreatHighlights] = useState(false)
   const [showPressureMap, setShowPressureMap] = useState(false)
   const [showBotCandidateCells, setShowBotCandidateCells] = useState(false)
+  const [showPredictedReply, setShowPredictedReply] = useState(false)
   const [autoBotEnabled, setAutoBotEnabled] = useState(false)
   const [autoBotSide, setAutoBotSide] = useState<'X' | 'O' | 'both'>('both')
   const [botThinkSeconds, setBotThinkSeconds] = useState(2)
@@ -1197,15 +1201,6 @@ function App() {
     [camera.x, camera.y, camera.zoom],
   )
 
-  const getHexAtScreen = useCallback(
-    (screenX: number, screenY: number): HoverHex => {
-      const world = screenToWorld(screenX, screenY)
-      const axial = worldToAxial(world.x, world.y, BASE_HEX_SIZE)
-      return roundAxial(axial.q, axial.r)
-    },
-    [screenToWorld],
-  )
-
   const displayState = isReplayMode ? liveState : mode === 'sandbox' ? sandboxState : liveState
   const totalLiveMoves = liveState.moves.size
   const totalSandboxMoves = sandboxState.moves.size
@@ -1213,6 +1208,20 @@ function App() {
   const autoBotForO = autoBotEnabled && (autoBotSide === 'O' || autoBotSide === 'both')
   const showConnectedStatus = joinedRoom !== null && wsStatus === 'connected'
   const canUndo = isReplayMode ? false : mode === 'sandbox' ? sandboxState.moveHistory.length > 0 : liveState.moveHistory.length > 0
+  const getHexAtScreen = useCallback(
+    (screenX: number, screenY: number): HoverHex | null => {
+      const world = screenToWorld(screenX, screenY)
+      const axial = worldToAxial(world.x, world.y, BASE_HEX_SIZE)
+      const hex = roundAxial(axial.q, axial.r)
+
+      if (hideDeadHexes && isDeadHex(displayState.moves, hex.q, hex.r)) {
+        return null
+      }
+
+      return hex
+    },
+    [displayState.moves, hideDeadHexes, screenToWorld],
+  )
   const highlightedKeys = useMemo(() => {
     if (displayState.moveHistory.length === 0) {
       return new Set<string>()
@@ -1272,7 +1281,17 @@ function App() {
   }, [currentGameId])
   const hasPlanningAnnotations = planningState.marks.size > 0 || planningState.segments.size > 0
   const liveEvaluation = useMemo(() => evaluateBoardState(displayState.moves, botTuning), [botTuning, displayState.moves])
-  const threatTargets = useMemo(() => collectThreatTargets(displayState.moves), [displayState.moves])
+  const threatTargets = useMemo(() => {
+    if (!showThreatHighlights) {
+      return {
+        x4: new Set<string>(),
+        x5: new Set<string>(),
+        o4: new Set<string>(),
+        o5: new Set<string>(),
+      }
+    }
+    return collectThreatTargets(displayState.moves)
+  }, [displayState.moves, showThreatHighlights])
   const planningSegmentAtScreen = useCallback(
     (screenX: number, screenY: number) => {
       let closestSegment: string | null = null
@@ -1342,6 +1361,7 @@ function App() {
     }
   }, [botThinkSeconds])
   const botCandidateSnapshot = useMemo<BotCandidateSnapshot | null>(() => {
+    if (!showBotCandidateCells) return null
     if (displayState.winner) return null
     return inspectBotCandidates(
       {
@@ -1353,7 +1373,7 @@ function App() {
       botTuning,
       botSearchOptions,
     )
-  }, [botSearchOptions, botTuning, displayState.moveHistory, displayState.moves, displayState.placementsLeft, displayState.turn, displayState.winner])
+  }, [botSearchOptions, botTuning, displayState.moveHistory, displayState.moves, displayState.placementsLeft, displayState.turn, displayState.winner, showBotCandidateCells])
   const botLegalCandidateKeys = useMemo(() => {
     const keys = new Set<string>()
     for (const cell of botCandidateSnapshot?.legalCells ?? []) keys.add(toKey(cell.q, cell.r))
@@ -1364,6 +1384,15 @@ function App() {
     for (const cell of botCandidateSnapshot?.topCells ?? []) keys.add(toKey(cell.q, cell.r))
     return keys
   }, [botCandidateSnapshot])
+  const predictedReplyKeys = useMemo(() => {
+    const keys = new Set<string>()
+    if (!lastBotStats?.predictedOpponentReply) return keys
+    if (lastBotStats.postMoveCount !== displayState.moveHistory.length) return keys
+    for (const cell of lastBotStats.predictedOpponentReply) {
+      keys.add(toKey(cell.q, cell.r))
+    }
+    return keys
+  }, [displayState.moveHistory.length, lastBotStats])
 
   const liveStatus = useMemo(() => {
     if (replayRecord) {
@@ -1688,13 +1717,14 @@ function App() {
       await new Promise<void>((resolve) => window.setTimeout(resolve, 0))
       const decision =
         botSearchOptions.budget.maxTimeMs > 0 && botSearchOptions.budget.maxNodes > 0
-          ? await chooseBotTurnDetailedAsync(
+          ? await chooseBotTurnDetailedAsyncWithSession(
               {
                 moves: sourceState.moves,
                 moveHistory: sourceState.moveHistory,
                 turn: sourceState.turn,
                 placementsLeft: sourceState.placementsLeft,
               },
+              botSearchSessionRef.current,
               botTuning,
               botSearchOptions,
               {
@@ -1707,13 +1737,14 @@ function App() {
                 },
               },
             )
-          : chooseBotTurnDetailed(
+          : chooseBotTurnDetailedWithSession(
               {
                 moves: sourceState.moves,
                 moveHistory: sourceState.moveHistory,
                 turn: sourceState.turn,
                 placementsLeft: sourceState.placementsLeft,
               },
+              botSearchSessionRef.current,
               botTuning,
               botSearchOptions,
             )
@@ -1895,6 +1926,9 @@ function App() {
       return dead
     }
 
+    const hiddenDeadHexKeys: string[] = []
+    const hiddenDeadHexKeySet = new Set<string>()
+
     for (let r = rMin; r <= rMax; r += 1) {
       const qMin = Math.floor(left / (BASE_HEX_SIZE * SQRT3) - r / 2) - 3
       const qMax = Math.ceil(right / (BASE_HEX_SIZE * SQRT3) - r / 2) + 3
@@ -1903,7 +1937,10 @@ function App() {
         const key = toKey(q, r)
         const occupied = displayState.moves.has(key)
         const deadCell = cachedIsDead(q, r)
-        if (hideDeadHexes && deadCell && !occupied) {
+        const hiddenDeadCell = hideDeadHexes && deadCell
+        if (hiddenDeadCell) {
+          hiddenDeadHexKeys.push(key)
+          hiddenDeadHexKeySet.add(key)
           continue
         }
 
@@ -1921,7 +1958,7 @@ function App() {
         }
         ctx.closePath()
 
-        ctx.fillStyle = deadCell ? theme.deadHexFill : fillGrid
+        ctx.fillStyle = fillGrid
         ctx.fill()
         if (showBotCandidateCells && !occupied) {
           const isLegalCandidate = botLegalCandidateKeys.has(key)
@@ -1955,10 +1992,33 @@ function App() {
             ctx.restore()
           }
         }
-        ctx.strokeStyle = deadCell ? theme.deadHexStroke : strokeGrid
+        ctx.strokeStyle = strokeGrid
         ctx.lineWidth = 1
         ctx.stroke()
       }
+    }
+
+    if (hiddenDeadHexKeys.length > 0) {
+      ctx.save()
+      ctx.fillStyle = theme.boardBackground
+      for (const key of hiddenDeadHexKeys) {
+        const { q, r } = fromKey(key)
+        const world = axialToWorld(q, r, BASE_HEX_SIZE)
+        const screen = worldToScreen(world.x, world.y)
+        const displaySize = BASE_HEX_SIZE * camera.zoom * 1.08
+
+        ctx.beginPath()
+        for (let i = 0; i < 6; i += 1) {
+          const angle = (Math.PI / 180) * (60 * i - 30)
+          const px = screen.x + displaySize * Math.cos(angle)
+          const py = screen.y + displaySize * Math.sin(angle)
+          if (i === 0) ctx.moveTo(px, py)
+          else ctx.lineTo(px, py)
+        }
+        ctx.closePath()
+        ctx.fill()
+      }
+      ctx.restore()
     }
 
     const drawPlanningSegments = (segmentKeys: Iterable<string>, dashedAlpha: number) => {
@@ -2008,7 +2068,7 @@ function App() {
 
     if (hoverHex) {
       const key = toKey(hoverHex.q, hoverHex.r)
-      const showHover = mode === 'sandbox' || (!displayState.moves.has(key) && !displayState.winner)
+      const showHover = !hiddenDeadHexKeySet.has(key) && (mode === 'sandbox' || (!displayState.moves.has(key) && !displayState.winner))
       if (showHover) {
         const world = axialToWorld(hoverHex.q, hoverHex.r, BASE_HEX_SIZE)
         const screen = worldToScreen(world.x, world.y)
@@ -2031,6 +2091,7 @@ function App() {
     }
 
     for (const [key, player] of displayState.moves.entries()) {
+      if (hiddenDeadHexKeySet.has(key)) continue
       const { q, r } = fromKey(key)
       const world = axialToWorld(q, r, BASE_HEX_SIZE)
       const screen = worldToScreen(world.x, world.y)
@@ -2113,6 +2174,7 @@ function App() {
 
     for (const [key, player] of planningState.marks.entries()) {
       if (displayState.moves.has(key)) continue
+      if (hiddenDeadHexKeySet.has(key)) continue
 
       const { q, r } = fromKey(key)
       const world = axialToWorld(q, r, BASE_HEX_SIZE)
@@ -2158,9 +2220,54 @@ function App() {
       ctx.restore()
     }
 
+    if (showPredictedReply && predictedReplyKeys.size > 0) {
+      for (const key of predictedReplyKeys) {
+        if (displayState.moves.has(key)) continue
+        if (hiddenDeadHexKeySet.has(key)) continue
+
+        const { q, r } = fromKey(key)
+        const world = axialToWorld(q, r, BASE_HEX_SIZE)
+        const screen = worldToScreen(world.x, world.y)
+        const overlaySize = BASE_HEX_SIZE * camera.zoom * 0.92
+        const overlayRadius = BASE_HEX_SIZE * camera.zoom * 0.46
+        const strokeColor = displayState.turn === 'X' ? theme.xColor : theme.oColor
+        const fillColor = displayState.turn === 'X' ? theme.xFill : theme.oFill
+
+        ctx.save()
+        ctx.globalAlpha = 0.2
+        ctx.beginPath()
+        for (let i = 0; i < 6; i += 1) {
+          const angle = (Math.PI / 180) * (60 * i - 30)
+          const px = screen.x + overlaySize * Math.cos(angle)
+          const py = screen.y + overlaySize * Math.sin(angle)
+          if (i === 0) ctx.moveTo(px, py)
+          else ctx.lineTo(px, py)
+        }
+        ctx.closePath()
+        ctx.fillStyle = fillColor
+        ctx.fill()
+
+        ctx.globalAlpha = 0.95
+        ctx.strokeStyle = strokeColor
+        ctx.lineWidth = Math.max(2, camera.zoom * 2.4)
+        ctx.setLineDash([Math.max(4, camera.zoom * 4), Math.max(4, camera.zoom * 4)])
+        ctx.beginPath()
+        ctx.arc(screen.x, screen.y, overlayRadius, 0, Math.PI * 2)
+        ctx.stroke()
+
+        ctx.setLineDash([])
+        ctx.beginPath()
+        ctx.arc(screen.x, screen.y, Math.max(2, camera.zoom * 2.6), 0, Math.PI * 2)
+        ctx.fillStyle = strokeColor
+        ctx.fill()
+        ctx.restore()
+      }
+    }
+
     if (showThreatHighlights) {
       const drawThreatDot = (key: string, fill: string, line: string, radiusScale: number) => {
         if (displayState.moves.has(key)) return
+        if (hiddenDeadHexKeySet.has(key)) return
         const { q, r } = fromKey(key)
         const world = axialToWorld(q, r, BASE_HEX_SIZE)
         const screen = worldToScreen(world.x, world.y)
@@ -2218,6 +2325,7 @@ function App() {
     camera.zoom,
     displayState.moveHistory,
     displayState.moves,
+    displayState.turn,
     displayState.winner,
     hoverHex,
     mode,
@@ -2230,10 +2338,12 @@ function App() {
     highlightedKeys,
     botLegalCandidateKeys,
     botTopCandidateKeys,
+    predictedReplyKeys,
     hideDeadHexes,
     moveNumberByKey,
     pieceStyle,
     showBotCandidateCells,
+    showPredictedReply,
     showMoveNumbers,
     showPressureMap,
     showThreatHighlights,
@@ -2294,7 +2404,7 @@ function App() {
 
     if (drag.mode === 'annotate') {
       const hex = getHexAtScreen(x, y)
-      if (drag.anchorHex) {
+      if (drag.anchorHex && hex) {
         const snappedHex = snapHexToPlanningAxis(drag.anchorHex, hex)
         const previewSegments =
           snappedHex.q === drag.anchorHex.q && snappedHex.r === drag.anchorHex.r
@@ -2325,6 +2435,9 @@ function App() {
         drag.mode === 'annotate' && drag.anchorHex
           ? (() => {
               const hex = getHexAtScreen(x, y)
+              if (!hex) {
+                return []
+              }
               const snappedHex = snapHexToPlanningAxis(drag.anchorHex as HoverHex, hex)
               if (snappedHex.q === drag.anchorHex.q && snappedHex.r === drag.anchorHex.r) {
                 return []
@@ -2335,7 +2448,9 @@ function App() {
 
       if (!drag.started && drag.mode === 'pan') {
         const hex = getHexAtScreen(x, y)
-        placeMove(hex.q, hex.r)
+        if (hex) {
+          placeMove(hex.q, hex.r)
+        }
       }
 
       if (!drag.started && drag.mode === 'annotate') {
@@ -2347,7 +2462,9 @@ function App() {
           })
         } else {
           const hex = getHexAtScreen(x, y)
-          dispatchPlanning({ type: 'cycleMark', q: hex.q, r: hex.r })
+          if (hex) {
+            dispatchPlanning({ type: 'cycleMark', q: hex.q, r: hex.r })
+          }
         }
       }
 
@@ -2366,14 +2483,12 @@ function App() {
     setHoverHex(null)
   }
 
-  const onWheel = (event: React.WheelEvent<HTMLCanvasElement>) => {
-    event.preventDefault()
+  const applyWheelZoom = useCallback((clientX: number, clientY: number, deltaY: number, target: HTMLCanvasElement) => {
+    const rect = target.getBoundingClientRect()
+    const x = clientX - rect.left
+    const y = clientY - rect.top
 
-    const rect = event.currentTarget.getBoundingClientRect()
-    const x = event.clientX - rect.left
-    const y = event.clientY - rect.top
-
-    const zoomMultiplier = Math.exp(-event.deltaY * 0.0012)
+    const zoomMultiplier = Math.exp(-deltaY * 0.0012)
 
     setCamera((prev) => {
       const oldZoom = prev.zoom
@@ -2389,7 +2504,22 @@ function App() {
         zoom: newZoom,
       }
     })
-  }
+  }, [])
+
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+
+    const handleWheel = (event: WheelEvent) => {
+      if (event.cancelable) event.preventDefault()
+      applyWheelZoom(event.clientX, event.clientY, event.deltaY, canvas)
+    }
+
+    canvas.addEventListener('wheel', handleWheel, { passive: false })
+    return () => {
+      canvas.removeEventListener('wheel', handleWheel)
+    }
+  }, [applyWheelZoom])
 
   const resetView = () => {
     setCamera((prev) => ({
@@ -2551,7 +2681,6 @@ function App() {
           onPointerUp={onPointerUp}
           onPointerCancel={onPointerUp}
           onPointerLeave={onPointerLeave}
-          onWheel={onWheel}
           aria-label="Hexagonal tic-tac-toe board"
         />
         <section className={`board-dock ${dockOpen ? 'is-open' : 'is-collapsed'}`}>
@@ -2790,9 +2919,38 @@ function App() {
                                 <div className="compute-meta">
                                   Last run: {lastBotStats.mode.toUpperCase()} | {(lastBotStats.elapsedMs / 1000).toFixed(3)}s | board evals{' '}
                                   {lastBotStats.boardEvaluations.toLocaleString()} | nodes {lastBotStats.nodesExpanded.toLocaleString()} | playouts{' '}
-                                  {lastBotStats.playouts.toLocaleString()} | tree depth {lastBotStats.maxDepthTurns} turns | root lines{' '}
+                                  {lastBotStats.playouts.toLocaleString()} | search depth {lastBotStats.maxDepthTurns} turns | candidate lines{' '}
                                   {lastBotStats.rootCandidates} | stop {lastBotStats.stopReason}
                                 </div>
+                              ) : null}
+                              {lastBotStats?.session &&
+                              (lastBotStats.session.reusedFromTree ||
+                                lastBotStats.session.currentTree.nodeCount > 0 ||
+                                lastBotStats.session.keptAfterMove ||
+                                (lastBotStats.predictedOpponentReply?.length ?? 0) > 0) ? (
+                                <>
+                                  <div className="compute-meta">
+                                    Forcing line: {lastBotStats.session.reusedFromTree ? 'reused' : 'fresh'}
+                                    {lastBotStats.session.reusedCurrentRoot ? ' (same root)' : ''} | prev tree{' '}
+                                    {lastBotStats.session.previousTreeNodes.toLocaleString()} | retained{' '}
+                                    {lastBotStats.session.retainedTreeNodes.toLocaleString()} | trimmed{' '}
+                                    {lastBotStats.session.trimmedTreeNodes.toLocaleString()} | kept after move{' '}
+                                    {lastBotStats.session.keptAfterMove ? 'yes' : 'no'}
+                                  </div>
+                                  {lastBotStats.session.currentTree.nodeCount > 0 ? (
+                                    <div className="compute-meta">
+                                    Current forcing tree: nodes {lastBotStats.session.currentTree.nodeCount.toLocaleString()} | leaves{' '}
+                                    {lastBotStats.session.currentTree.leafCount.toLocaleString()} | max depth{' '}
+                                    {lastBotStats.session.currentTree.maxDepth} | avg depth {lastBotStats.session.currentTree.averageDepth.toFixed(2)} | avg leaf{' '}
+                                    {lastBotStats.session.currentTree.averageLeafDepth.toFixed(2)}
+                                    </div>
+                                  ) : null}
+                                  {lastBotStats.predictedOpponentReply && lastBotStats.predictedOpponentReply.length > 0 ? (
+                                    <div className="compute-meta">
+                                      Predicted reply {lastBotStats.predictedOpponentReply.map((cell) => `(${cell.q},${cell.r})`).join(' ')}
+                                    </div>
+                                  ) : null}
+                                </>
                               ) : null}
                               {isBotThinking ? (
                                 <div className="compute-meta">
@@ -2977,6 +3135,14 @@ function App() {
                           type="checkbox"
                           checked={showBotCandidateCells}
                           onChange={(event) => setShowBotCandidateCells(event.target.checked)}
+                        />
+                      </label>
+                      <label className="play-as">
+                        Highlight predicted reply
+                        <input
+                          type="checkbox"
+                          checked={showPredictedReply}
+                          onChange={(event) => setShowPredictedReply(event.target.checked)}
                         />
                       </label>
                       <div className="auto-bot-group" role="group" aria-label="Color palette options">

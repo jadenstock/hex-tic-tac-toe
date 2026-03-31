@@ -85,6 +85,33 @@ export type BotSearchOptions = {
 
 export type BotSearchMode = 'greedy' | 'mcts'
 
+export type BotSearchTreeStats = {
+  nodeCount: number
+  leafCount: number
+  maxDepth: number
+  averageDepth: number
+  averageLeafDepth: number
+}
+
+export type BotSearchSessionStats = {
+  reusedCurrentRoot: boolean
+  reusedFromTree: boolean
+  previousTreeNodes: number
+  retainedTreeNodes: number
+  trimmedTreeNodes: number
+  keptAfterMove: boolean
+  currentTree: BotSearchTreeStats
+  evaluationCacheSize: number
+  candidateCacheSize: number
+  forcingCacheSize: number
+  evaluationCacheHits: number
+  evaluationCacheMisses: number
+  candidateCacheHits: number
+  candidateCacheMisses: number
+  forcingCacheHits: number
+  forcingCacheMisses: number
+}
+
 export type BotSearchStats = {
   mode: BotSearchMode
   elapsedMs: number
@@ -94,6 +121,9 @@ export type BotSearchStats = {
   maxDepthTurns: number
   rootCandidates: number
   stopReason: 'budget_zero' | 'time' | 'nodes' | 'terminal' | 'no_candidates' | 'fallback' | 'early_win'
+  session?: BotSearchSessionStats
+  predictedOpponentReply?: Axial[]
+  postMoveCount?: number
 }
 
 export type BotTurnDecision = {
