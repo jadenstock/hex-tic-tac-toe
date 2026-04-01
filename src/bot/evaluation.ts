@@ -26,6 +26,12 @@ type ThreatProfile = {
   totalPressure: number
 }
 
+function threatCountExponent(threat: number): number {
+  if (threat >= 4) return 3
+  if (threat === 3) return 2
+  return 1.5
+}
+
 function countStones(board: SearchBoard, player: Player): number {
   let count = 0
   for (const mark of board.moves.values()) {
@@ -243,7 +249,8 @@ function pressureForThreatLevel(windows: ThreatWindow[], threat: number, tuning:
   const resilience = residualWindowRatioAfterBestBlock(cutSets)
   const directionCount = new Set(levelWindows.map((window) => window.directionIndex)).size
   const weight = tuning.threatWeights[threat] ?? 0
-  const pressure = weight * windowCount * windowCount * Math.max(1, blockerBurden) * (0.5 + 0.5 * resilience)
+  const countPressure = Math.pow(windowCount, threatCountExponent(threat))
+  const pressure = weight * countPressure * Math.max(1, blockerBurden) * (0.5 + 0.5 * resilience)
 
   return {
     windowCount,
