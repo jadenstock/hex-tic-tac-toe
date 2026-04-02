@@ -17,6 +17,7 @@
     "bot:opt:gen": "node --experimental-strip-types bot-optimizer/generate-challengers.ts",
     "bot:opt:promote": "node --experimental-strip-types bot-optimizer/promote-best.ts",
     "bot:api": "node --experimental-strip-types bot-api/server.ts",
+    "bot:wasm:build": "bash -lc 'source \"$HOME/.cargo/env\" && wasm-pack build wasm-bot --target web --out-dir ../public/wasm-bot --out-name hex_ttt_wasm'",
     "infra:install": "npm --prefix infra install",
     "infra:build": "npm --prefix infra run build",
     "infra:synth": "npm --prefix infra run synth",

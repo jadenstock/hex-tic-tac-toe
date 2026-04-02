@@ -7,7 +7,13 @@ import {
   chooseBotTurnDetailedWithSession,
   createBotSearchSession,
   evaluateBoardState,
+  getEffectiveBotBackend,
+  getPreferredBotBackend,
+  getWasmBotRuntimeStatus,
   inspectBotCandidates,
+  setPreferredBotBackend,
+  warmupWasmBot,
+  type BotBackend,
   type BotCandidateSnapshot,
   type BotSearchStats,
   type BotSearchOptions,
@@ -1166,6 +1172,8 @@ function App() {
   const [lastBotStats, setLastBotStats] = useState<BotSearchStats | null>(null)
   const [botTelemetryEnabled, setBotTelemetryEnabled] = useState(false)
   const [botTelemetryEntries, setBotTelemetryEntries] = useState<BotTelemetryEntry[]>([])
+  const [botBackend, setBotBackend] = useState<BotBackend>(() => getPreferredBotBackend())
+  const [botBackendNotice, setBotBackendNotice] = useState<string | null>(null)
   const [showRulesModal, setShowRulesModal] = useState(false)
   const [dockOpen, setDockOpen] = useState(true)
   const [replayRecord, setReplayRecord] = useState<ReplayRecord | null>(null)
@@ -1195,6 +1203,22 @@ function App() {
       wsRef.current?.close()
     }
   }, [])
+
+  useEffect(() => {
+    if (botBackend !== 'wasm') return
+
+    let cancelled = false
+    setBotBackendNotice('Loading Rust/WASM runtime…')
+
+    void warmupWasmBot().then((ready) => {
+      if (cancelled) return
+      setBotBackendNotice(ready ? 'Rust/WASM backend ready.' : 'Rust/WASM unavailable. JS fallback active.')
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [botBackend])
 
   useEffect(() => {
     if (!isReplayMode || !replayGameId) return
@@ -1361,6 +1385,8 @@ function App() {
   const modeLabel = useMemo(() => {
     return mode === 'live' ? 'Game' : 'Sandbox'
   }, [mode])
+  const effectiveBotBackend = getEffectiveBotBackend()
+  const wasmBotRuntimeStatus = getWasmBotRuntimeStatus()
   const currentParticipants = useMemo(() => {
     if (replayRecord) return replayRecord.participants
     if (trackedParticipants) return trackedParticipants
@@ -1936,6 +1962,21 @@ function App() {
     mode,
     trackedGameId,
   ])
+
+  const handleBotBackendChange = useCallback((nextBackend: BotBackend) => {
+    setPreferredBotBackend(nextBackend)
+    setBotBackend(nextBackend)
+
+    if (nextBackend !== 'wasm') {
+      setBotBackendNotice('Using TypeScript bot backend.')
+      return
+    }
+
+    setBotBackendNotice('Loading Rust/WASM runtime…')
+    void warmupWasmBot().then((ready) => {
+      setBotBackendNotice(ready ? 'Rust/WASM backend ready.' : 'Rust/WASM unavailable. JS fallback active.')
+    })
+  }, [])
 
   const setThreatWeight = (idx: number, value: number) => {
     setBotTuning((prev) => {
@@ -3026,6 +3067,19 @@ function App() {
                               </button>
                             </div>
                             <div className="compute-panel">
+                              <div className="button-row">
+                                <label className="play-as">
+                                  Bot backend
+                                  <select value={botBackend} onChange={(event) => handleBotBackendChange(event.target.value as BotBackend)}>
+                                    <option value="js">TypeScript (current)</option>
+                                    <option value="wasm">Rust WASM (preview)</option>
+                                  </select>
+                                </label>
+                                <div className="compute-meta">
+                                  Active: {effectiveBotBackend === 'wasm' ? 'Rust WASM' : 'TypeScript'} | WASM runtime {wasmBotRuntimeStatus}
+                                </div>
+                              </div>
+                              {botBackendNotice ? <div className="compute-meta">{botBackendNotice}</div> : null}
                               <div className="button-row">
                                 <label className="compute-meta">
                                   <input

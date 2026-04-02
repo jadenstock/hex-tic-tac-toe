@@ -12,6 +12,7 @@ export type {
   Player,
 } from './types.ts'
 export type { BotCandidateSnapshot, BotSearchSession } from './search.ts'
+export type { BotBackend, WasmBotRuntimeStatus } from './wasm-backend.ts'
 
 export { DEFAULT_BOT_SEARCH_OPTIONS, DEFAULT_BOT_TUNING, WIN_DIRECTIONS, WIN_LENGTH } from './types.ts'
 export { evaluateBoardState } from './evaluation.ts'
@@ -24,6 +25,14 @@ export {
   chooseBotTurnDetailedWithSession,
   chooseBotTurnWithSession,
   chooseGreedyTurn,
+  getEffectiveBotBackend,
+  getPreferredBotBackend,
+  getWasmBotRuntimeMessage,
+  getWasmBotRuntimeStatus,
+  setPreferredBotBackend,
+  warmupWasmBot,
+} from './wasm-backend.ts'
+export {
   createBotSearchSession,
   inspectBotCandidates,
   resetBotSearchSession,

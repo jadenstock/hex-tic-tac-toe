@@ -19,6 +19,8 @@ dist-ssr
 infra/node_modules
 infra/dist
 infra/cdk.out
+wasm-bot/target
+public/wasm-bot
 
 # Editor directories and files
 .vscode/*

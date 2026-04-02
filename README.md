@@ -104,6 +104,22 @@ For diagnostics and recovery steps, see `infra/RUNBOOK.md`.
 - `npm run infra:synth`
 - `npm run infra:deploy`
 - `npm run bot:api`
+- `npm run bot:wasm:build`
+
+## Rust/WASM bot backend (preview)
+
+The app now supports an additive bot backend path:
+
+- Existing TypeScript bot remains the default.
+- Optional Rust/WebAssembly bot can be selected in the in-app **Bot** panel.
+
+Build the Rust/WASM artifacts:
+
+```bash
+npm run bot:wasm:build
+```
+
+Generated files are written to `public/wasm-bot/`.
 
 ## Stateless bot API (for external bot platforms)
 
