@@ -56,8 +56,13 @@ type WasmTurnRequest = {
     top_k_first_moves: number
   }
   search_options: {
+    exploration_c: number
     turn_candidate_count: number
     child_turn_candidate_count: number
+    max_simulation_turns: number
+    simulation_turn_candidate_count: number
+    simulation_radius: number
+    simulation_top_k_first_moves: number
   }
   moves: Array<{
     q: number
@@ -71,6 +76,7 @@ type WasmTurnResponse = {
   mode?: string
   stop_reason?: string
   nodes_expanded?: number
+  playouts?: number
   board_evaluations?: number
   root_candidates?: number
   max_depth_turns?: number
@@ -205,8 +211,13 @@ function toWasmTurnRequest(state: LiveLikeState, options: BotSearchOptions, tuni
       top_k_first_moves: Math.max(1, Math.floor(tuning.topKFirstMoves)),
     },
     search_options: {
+      exploration_c: options.explorationC,
       turn_candidate_count: Math.max(1, Math.floor(options.turnCandidateCount)),
       child_turn_candidate_count: Math.max(1, Math.floor(options.childTurnCandidateCount)),
+      max_simulation_turns: Math.max(1, Math.floor(options.maxSimulationTurns)),
+      simulation_turn_candidate_count: Math.max(1, Math.floor(options.simulationTurnCandidateCount)),
+      simulation_radius: Math.max(1, Math.floor(options.simulationRadius)),
+      simulation_top_k_first_moves: Math.max(1, Math.floor(options.simulationTopKFirstMoves)),
     },
     moves: toOrderedMoveArray(state),
   }
@@ -242,9 +253,9 @@ function buildWasmDecision(
   elapsedMs: number,
 ): BotTurnDecision | null {
   const moves = normalizeWasmMoves(response.moves, state)
-  if (moves.length === 0) return null
 
   const nodesExpandedRaw = Number(response.nodes_expanded)
+  const playoutsRaw = Number(response.playouts)
   const boardEvaluationsRaw = Number(response.board_evaluations)
   const rootCandidatesRaw = Number(response.root_candidates)
   const maxDepthTurnsRaw = Number(response.max_depth_turns)
@@ -253,6 +264,7 @@ function buildWasmDecision(
   const boardEvaluations = Number.isFinite(boardEvaluationsRaw)
     ? Math.max(0, Math.floor(boardEvaluationsRaw))
     : nodesExpanded
+  const playouts = Number.isFinite(playoutsRaw) ? Math.max(0, Math.floor(playoutsRaw)) : nodesExpanded
   const rootCandidates = Number.isFinite(rootCandidatesRaw)
     ? Math.max(1, Math.floor(rootCandidatesRaw))
     : moves.length
@@ -260,19 +272,32 @@ function buildWasmDecision(
     ? Math.max(0, Math.floor(maxDepthTurnsRaw))
     : 0
 
+  const modeRaw = response.mode
+  const mode: BotSearchStats['mode'] = modeRaw === 'mcts' || modeRaw === 'greedy' || modeRaw === 'beam' ? modeRaw : 'beam'
+
   return {
     moves,
     stats: {
-      mode: 'beam',
+      mode,
       elapsedMs,
       nodesExpanded,
-      playouts: 0,
+      playouts,
       boardEvaluations,
       maxDepthTurns,
       rootCandidates,
       stopReason: normalizeStopReason(response.stop_reason),
     },
   }
+}
+
+function shouldUseStrictWasmPath(): boolean {
+  return preferredBotBackend === 'wasm'
+}
+
+function createWasmUnavailableError(): Error {
+  const runtimeMessage = wasmRuntimeMessage?.trim()
+  if (runtimeMessage) return new Error(`WASM backend unavailable: ${runtimeMessage}`)
+  return new Error('WASM backend unavailable.')
 }
 
 async function loadWasmModule(): Promise<WasmGlueModule | null> {
@@ -341,11 +366,20 @@ function tryChooseTurnFromLoadedWasm(
   try {
     const raw = wasmModuleRef.choose_turn_json(JSON.stringify(request))
     const parsed = JSON.parse(raw) as WasmTurnResponse
-    if (parsed.error) return null
+    if (parsed.error) {
+      wasmRuntimeStatus = 'failed'
+      wasmRuntimeMessage = parsed.error
+      return null
+    }
     return buildWasmDecision(state, parsed, Math.max(0, nowMs() - startMs))
-  } catch {
+  } catch (error) {
     wasmRuntimeStatus = 'failed'
-    wasmRuntimeMessage = 'WASM bot execution failed. Falling back to JS bot.'
+    if (error instanceof Error) {
+      wasmRuntimeMessage = `WASM bot execution failed: ${error.message}`
+    } else {
+      wasmRuntimeMessage = `WASM bot execution failed: ${String(error)}`
+    }
+    console.error('[WASM bot] sync execution error', error)
     return null
   }
 }
@@ -373,9 +407,14 @@ async function tryChooseTurnFromWasm(
       return null
     }
     return buildWasmDecision(state, parsed, Math.max(0, nowMs() - startMs))
-  } catch {
+  } catch (error) {
     wasmRuntimeStatus = 'failed'
-    wasmRuntimeMessage = 'WASM bot execution failed. Falling back to JS bot.'
+    if (error instanceof Error) {
+      wasmRuntimeMessage = `WASM bot execution failed: ${error.message}`
+    } else {
+      wasmRuntimeMessage = `WASM bot execution failed: ${String(error)}`
+    }
+    console.error('[WASM bot] execution error', error)
     return null
   }
 }
@@ -397,8 +436,7 @@ export function setPreferredBotBackend(backend: BotBackend): void {
 }
 
 export function getEffectiveBotBackend(): BotBackend {
-  if (preferredBotBackend !== 'wasm') return 'js'
-  return wasmRuntimeStatus === 'ready' ? 'wasm' : 'js'
+  return preferredBotBackend
 }
 
 export function getWasmBotRuntimeStatus(): WasmBotRuntimeStatus {
@@ -425,6 +463,10 @@ export function chooseBotTurnDetailedWithSession(
 ): BotTurnDecision {
   const wasmDecision = tryChooseTurnFromLoadedWasm(state, tuning, partialOptions)
   if (wasmDecision) return wasmDecision
+
+  if (shouldUseStrictWasmPath()) {
+    throw createWasmUnavailableError()
+  }
 
   return chooseBotTurnDetailedWithSessionJs(state, session, tuning, partialOptions)
 }
@@ -454,6 +496,10 @@ export async function chooseBotTurnDetailedAsyncWithSession(
       maxDepthTurns: wasmDecision.stats.maxDepthTurns,
     })
     return wasmDecision
+  }
+
+  if (shouldUseStrictWasmPath()) {
+    throw createWasmUnavailableError()
   }
 
   return chooseBotTurnDetailedAsyncWithSessionJs(state, session, tuning, partialOptions, progressOptions)
@@ -486,7 +532,7 @@ export function chooseBotTurnWithSession(
 }
 
 export function chooseGreedyTurn(state: LiveLikeState, tuning: BotTuning = DEFAULT_BOT_TUNING): Axial[] {
-  if (getEffectiveBotBackend() === 'wasm') {
+  if (preferredBotBackend === 'wasm') {
     const decision = chooseBotTurnDetailed(state, tuning, {
       budget: {
         maxTimeMs: 0,

@@ -111,6 +111,11 @@ struct EngineParams {
     top_k_first_moves: usize,
     turn_candidate_count: usize,
     child_turn_candidate_count: usize,
+    exploration_c: f64,
+    max_simulation_turns: usize,
+    simulation_turn_candidate_count: usize,
+    simulation_radius: i32,
+    simulation_top_k_first_moves: usize,
 }
 
 #[derive(Default, Debug)]
@@ -128,8 +133,13 @@ struct MoveCell {
 
 #[derive(Debug, Deserialize, Default)]
 struct SearchOptionsInput {
+    exploration_c: Option<f64>,
     turn_candidate_count: Option<usize>,
     child_turn_candidate_count: Option<usize>,
+    max_simulation_turns: Option<usize>,
+    simulation_turn_candidate_count: Option<usize>,
+    simulation_radius: Option<i32>,
+    simulation_top_k_first_moves: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -167,6 +177,7 @@ struct ChooseTurnResponse {
     mode: &'static str,
     stop_reason: &'static str,
     nodes_expanded: u32,
+    playouts: u32,
     board_evaluations: u32,
     root_candidates: u32,
     max_depth_turns: u32,
@@ -198,6 +209,19 @@ struct ThreatProfile {
     total_pressure: f64,
 }
 
+#[derive(Clone, Debug)]
+struct MctsNode {
+    parent: Option<usize>,
+    action_from_parent: Vec<Coord>,
+    player_to_move: Player,
+    depth_turns: u32,
+    children: Vec<usize>,
+    unexpanded_actions: Option<Vec<Vec<Coord>>>,
+    visits: u32,
+    total_value: f64,
+    terminal_winner: Option<Player>,
+}
+
 fn to_error_json(message: impl Into<String>) -> String {
     serde_json::to_string(&ErrorResponse {
         error: message.into(),
@@ -225,6 +249,10 @@ fn parse_coord_key(key: &str) -> Option<Coord> {
         return None;
     }
     Some((q, r))
+}
+
+fn now_ms() -> f64 {
+    js_sys::Date::now()
 }
 
 fn turn_state_from_move_count(total_moves: usize) -> (Player, u8) {
@@ -280,6 +308,40 @@ fn normalize_params(request: &ChooseTurnRequest) -> EngineParams {
         .max(1)
         .min(64);
 
+    let exploration_c = request
+        .search_options
+        .exploration_c
+        .unwrap_or(1.15)
+        .max(0.0);
+
+    let max_simulation_turns = request
+        .search_options
+        .max_simulation_turns
+        .unwrap_or(3)
+        .max(1)
+        .min(12);
+
+    let simulation_turn_candidate_count = request
+        .search_options
+        .simulation_turn_candidate_count
+        .unwrap_or(4)
+        .max(1)
+        .min(24);
+
+    let simulation_radius = request
+        .search_options
+        .simulation_radius
+        .unwrap_or(3)
+        .max(1)
+        .min(8);
+
+    let simulation_top_k_first_moves = request
+        .search_options
+        .simulation_top_k_first_moves
+        .unwrap_or(2)
+        .max(1)
+        .min(12);
+
     EngineParams {
         threat_weights,
         defense_weight: request.tuning.defense_weight.unwrap_or(1.1).max(0.0),
@@ -289,6 +351,11 @@ fn normalize_params(request: &ChooseTurnRequest) -> EngineParams {
         top_k_first_moves,
         turn_candidate_count,
         child_turn_candidate_count,
+        exploration_c,
+        max_simulation_turns,
+        simulation_turn_candidate_count,
+        simulation_radius,
+        simulation_top_k_first_moves,
     }
 }
 
@@ -1653,6 +1720,526 @@ fn choose_greedy_turn(board: &BoardState, params: &EngineParams, stats: &mut Eng
         .unwrap_or_default()
 }
 
+fn broaden_turn_actions(
+    board: &BoardState,
+    player: Player,
+    params: &EngineParams,
+    target_count: usize,
+    stats: &mut EngineStats,
+) -> Vec<Vec<Coord>> {
+    if board.placements_left == 0 {
+        return Vec::new();
+    }
+
+    let target = target_count.max(2).min(64);
+    let mut broad_params = params.clone();
+    broad_params.candidate_radius = params.candidate_radius.max(params.simulation_radius).max(2);
+    broad_params.top_k_first_moves = params
+        .top_k_first_moves
+        .max(params.simulation_top_k_first_moves)
+        .max(6);
+
+    let legal_cells =
+        collect_legal_candidates(board, player, &broad_params, target.saturating_mul(3));
+    if legal_cells.is_empty() {
+        return Vec::new();
+    }
+
+    if board.placements_left <= 1 {
+        return legal_cells
+            .into_iter()
+            .take(target)
+            .map(|cell| vec![cell])
+            .collect();
+    }
+
+    let top_cells: Vec<Coord> = legal_cells.into_iter().take((target + 4).min(24)).collect();
+    if top_cells.is_empty() {
+        return Vec::new();
+    }
+
+    let mut ranked = Vec::new();
+    let mut seen = HashSet::new();
+
+    for first_idx in 0..top_cells.len() {
+        let first = top_cells[first_idx];
+        let (after_first, first_winner) = match apply_move_copy(board, first, player) {
+            Some(value) => value,
+            None => continue,
+        };
+
+        if first_winner == Some(player) {
+            let key = canonical_line_key(&[first]);
+            if seen.insert(key) {
+                ranked.push(score_applied_turn(
+                    &after_first,
+                    player,
+                    vec![first],
+                    first_winner,
+                    &broad_params,
+                    stats,
+                ));
+            }
+            continue;
+        }
+
+        for second_idx in (first_idx + 1)..top_cells.len() {
+            let second = top_cells[second_idx];
+            let key = canonical_line_key(&[first, second]);
+            if !seen.insert(key) {
+                continue;
+            }
+
+            let (after_second, second_winner) = match apply_move_copy(&after_first, second, player) {
+                Some(value) => value,
+                None => continue,
+            };
+
+            ranked.push(score_applied_turn(
+                &after_second,
+                player,
+                vec![first, second],
+                second_winner,
+                &broad_params,
+                stats,
+            ));
+        }
+    }
+
+    if ranked.is_empty() {
+        return top_cells.first().copied().map(|cell| vec![vec![cell]]).unwrap_or_default();
+    }
+
+    sort_ranked_lines(&mut ranked);
+    ranked
+        .into_iter()
+        .take(target)
+        .map(|entry| entry.line)
+        .collect()
+}
+
+fn simulation_search_policy(params: &EngineParams) -> CandidatePolicy {
+    CandidatePolicy {
+        top_cell_count: widened_top_cell_count(
+            params.simulation_top_k_first_moves.max(1),
+            params.simulation_turn_candidate_count.max(1),
+            1,
+        ),
+        max_line_count: params.simulation_turn_candidate_count.max(1).min(16),
+    }
+}
+
+fn terminal_value_for_root(winner: Option<Player>, root_player: Player) -> f64 {
+    match winner {
+        Some(player) if player == root_player => 1.0,
+        Some(_) => -1.0,
+        None => 0.0,
+    }
+}
+
+fn rollout_leaf_value(
+    board: &BoardState,
+    root_player: Player,
+    params: &EngineParams,
+    stats: &mut EngineStats,
+    start_depth_turns: u32,
+    max_depth_turns: &mut u32,
+) -> f64 {
+    if let Some(winner) = find_winner(&board.moves) {
+        return terminal_value_for_root(Some(winner), root_player);
+    }
+
+    let mut simulation_board = board.clone();
+    let mut sim_depth = 0_u32;
+    let mut simulation_params = params.clone();
+    simulation_params.candidate_radius = params.simulation_radius;
+    simulation_params.top_k_first_moves = params.simulation_top_k_first_moves.max(1);
+
+    while sim_depth < params.max_simulation_turns as u32 {
+        if simulation_board.placements_left == 0 {
+            break;
+        }
+
+        let player = simulation_board.turn;
+        let policy = simulation_search_policy(&simulation_params);
+        let mut lines = enumerate_turn_candidates(
+            &simulation_board,
+            player,
+            &simulation_params,
+            policy,
+            stats,
+        );
+        if lines.is_empty() {
+            break;
+        }
+
+        sort_ranked_lines(&mut lines);
+        let selected_line = lines[0].line.clone();
+        let (after_turn, _, winner) = apply_turn_line(&simulation_board, &selected_line, player);
+        simulation_board = after_turn;
+        sim_depth = sim_depth.saturating_add(1);
+        *max_depth_turns = (*max_depth_turns).max(start_depth_turns.saturating_add(sim_depth));
+
+        if winner.is_some() {
+            return terminal_value_for_root(winner, root_player);
+        }
+    }
+
+    let eval_result = evaluate_board_summary(&simulation_board, params, stats);
+    let value = objective_for_player(&eval_result, root_player, params);
+    if value.is_finite() {
+        value.clamp(-1.0, 1.0)
+    } else if value.is_sign_positive() {
+        1.0
+    } else {
+        -1.0
+    }
+}
+
+fn select_uct_child(
+    nodes: &[MctsNode],
+    parent_idx: usize,
+    root_player: Player,
+    exploration_c: f64,
+) -> Option<usize> {
+    let parent = &nodes[parent_idx];
+    if parent.children.is_empty() {
+        return None;
+    }
+
+    let parent_visits = parent.visits.max(1) as f64;
+    let maximize_root_objective = parent.player_to_move == root_player;
+    let c = exploration_c.max(0.0);
+
+    let mut best_child = None;
+    let mut best_score = f64::NEG_INFINITY;
+
+    for &child_idx in &parent.children {
+        let child = &nodes[child_idx];
+        let score = if child.visits == 0 {
+            f64::INFINITY
+        } else {
+            let mean = child.total_value / child.visits as f64;
+            let oriented_mean = if maximize_root_objective { mean } else { -mean };
+            let exploration = c * ((parent_visits.ln() / child.visits as f64).sqrt());
+            oriented_mean + exploration
+        };
+
+        if score > best_score {
+            best_score = score;
+            best_child = Some(child_idx);
+        }
+    }
+
+    best_child
+}
+
+fn ensure_node_actions(
+    nodes: &mut [MctsNode],
+    node_idx: usize,
+    board: &BoardState,
+    params: &EngineParams,
+    stats: &mut EngineStats,
+) {
+    if nodes[node_idx].unexpanded_actions.is_some() {
+        return;
+    }
+
+    let policy = if nodes[node_idx].parent.is_none() {
+        root_search_policy(params)
+    } else {
+        child_search_policy(params)
+    };
+    let player = nodes[node_idx].player_to_move;
+    let mut actions = enumerate_turn_candidates(board, player, params, policy, stats)
+        .into_iter()
+        .map(|entry| entry.line)
+        .collect::<Vec<_>>();
+
+    if actions.len() <= 1 {
+        let broaden_target = if nodes[node_idx].parent.is_none() {
+            params.turn_candidate_count.max(8).min(40)
+        } else {
+            params.child_turn_candidate_count.max(6).min(20)
+        };
+        let broadened = broaden_turn_actions(board, player, params, broaden_target, stats);
+        if broadened.len() > actions.len() {
+            actions = broadened;
+        }
+    }
+
+    actions.reverse();
+
+    nodes[node_idx].unexpanded_actions = Some(actions);
+}
+
+fn select_expand_path(
+    root_board: &BoardState,
+    nodes: &mut Vec<MctsNode>,
+    root_player: Player,
+    params: &EngineParams,
+    stats: &mut EngineStats,
+    depth_cap: u32,
+    max_depth_turns: &mut u32,
+) -> (Vec<usize>, BoardState, bool) {
+    let mut board = root_board.clone();
+    let mut path = vec![0_usize];
+    let mut node_idx = 0_usize;
+    let mut expanded = false;
+
+    loop {
+        let node_depth = nodes[node_idx].depth_turns;
+        *max_depth_turns = (*max_depth_turns).max(node_depth);
+
+        if nodes[node_idx].terminal_winner.is_some() || node_depth >= depth_cap {
+            break;
+        }
+
+        ensure_node_actions(nodes, node_idx, &board, params, stats);
+
+        let mut expanded_here = false;
+        loop {
+            let action_opt = {
+                let actions = nodes[node_idx]
+                    .unexpanded_actions
+                    .as_mut()
+                    .expect("actions should be initialized");
+                actions.pop()
+            };
+
+            let Some(action) = action_opt else {
+                break;
+            };
+
+            let player = nodes[node_idx].player_to_move;
+            let (next_board, applied, winner) = apply_turn_line(&board, &action, player);
+            if applied.is_empty() {
+                continue;
+            }
+
+            let child_idx = nodes.len();
+            let child_depth = nodes[node_idx].depth_turns.saturating_add(1);
+            nodes.push(MctsNode {
+                parent: Some(node_idx),
+                action_from_parent: applied.clone(),
+                player_to_move: next_board.turn,
+                depth_turns: child_depth,
+                children: Vec::new(),
+                unexpanded_actions: None,
+                visits: 0,
+                total_value: 0.0,
+                terminal_winner: winner.or_else(|| find_winner(&next_board.moves)),
+            });
+            nodes[node_idx].children.push(child_idx);
+
+            board = next_board;
+            node_idx = child_idx;
+            path.push(child_idx);
+            *max_depth_turns = (*max_depth_turns).max(child_depth);
+            expanded = true;
+            expanded_here = true;
+            break;
+        }
+
+        if expanded_here {
+            break;
+        }
+
+        let Some(child_idx) = select_uct_child(nodes, node_idx, root_player, params.exploration_c) else {
+            break;
+        };
+
+        let player = nodes[node_idx].player_to_move;
+        let action = nodes[child_idx].action_from_parent.clone();
+        let (next_board, applied, winner) = apply_turn_line(&board, &action, player);
+        if applied.is_empty() {
+            break;
+        }
+        if nodes[child_idx].terminal_winner.is_none() && winner.is_some() {
+            nodes[child_idx].terminal_winner = winner;
+        }
+
+        board = next_board;
+        node_idx = child_idx;
+        path.push(child_idx);
+    }
+
+    (path, board, expanded)
+}
+
+fn choose_mcts_turn(
+    board: &BoardState,
+    params: &EngineParams,
+    max_time_ms: u32,
+    max_nodes: u32,
+    stats: &mut EngineStats,
+) -> (Vec<Coord>, usize, &'static str, u32, u32) {
+    if board.placements_left == 0 {
+        return (Vec::new(), 0, "terminal", 0, 0);
+    }
+
+    let root_player = board.turn;
+    let root_policy = root_search_policy(params);
+    let mut root_actions = enumerate_turn_candidates(board, root_player, params, root_policy, stats)
+        .into_iter()
+        .map(|entry| entry.line)
+        .collect::<Vec<_>>();
+
+    if root_actions.len() <= 1 {
+        let broadened = broaden_turn_actions(
+            board,
+            root_player,
+            params,
+            params.turn_candidate_count.max(10).min(48),
+            stats,
+        );
+        if broadened.len() > root_actions.len() {
+            root_actions = broadened;
+        }
+    }
+
+    if root_actions.is_empty() {
+        return (Vec::new(), 0, "no_candidates", 0, 0);
+    }
+
+    let seed_move = root_actions.first().cloned().unwrap_or_default();
+
+    if root_actions.len() == 1 {
+        return (root_actions[0].clone(), 1, "single_candidate", 1, 0);
+    }
+
+    let root_candidates = root_actions.len();
+    root_actions.reverse();
+
+    let mut nodes = vec![MctsNode {
+        parent: None,
+        action_from_parent: Vec::new(),
+        player_to_move: root_player,
+        depth_turns: 0,
+        children: Vec::new(),
+        unexpanded_actions: Some(root_actions),
+        visits: 0,
+        total_value: 0.0,
+        terminal_winner: find_winner(&board.moves),
+    }];
+
+    let started_at_ms = now_ms();
+    let budget_ms = (max_time_ms as f64).max(1.0);
+    let node_budget = max_nodes.max(1).min(2_000_000);
+    let depth_cap = (params.max_simulation_turns as u32).saturating_add(4).max(4).min(24);
+
+    let mut playouts = 0_u32;
+    let mut max_depth_turns = 0_u32;
+    let mut stop_reason: &'static str = "time";
+
+    while playouts < node_budget {
+        if now_ms() - started_at_ms >= budget_ms {
+            stop_reason = "time";
+            break;
+        }
+        if nodes.len() as u32 >= node_budget {
+            stop_reason = "nodes";
+            break;
+        }
+
+        let (path, leaf_board, _expanded) = select_expand_path(
+            board,
+            &mut nodes,
+            root_player,
+            params,
+            stats,
+            depth_cap,
+            &mut max_depth_turns,
+        );
+
+        if path.is_empty() {
+            stop_reason = "fallback";
+            break;
+        }
+
+        let leaf_idx = *path.last().unwrap_or(&0);
+        let value = if let Some(winner) = nodes[leaf_idx].terminal_winner {
+            terminal_value_for_root(Some(winner), root_player)
+        } else {
+            rollout_leaf_value(
+                &leaf_board,
+                root_player,
+                params,
+                stats,
+                nodes[leaf_idx].depth_turns,
+                &mut max_depth_turns,
+            )
+        };
+
+        for node_on_path in path {
+            let node = &mut nodes[node_on_path];
+            node.visits = node.visits.saturating_add(1);
+            node.total_value += value;
+        }
+
+        playouts = playouts.saturating_add(1);
+    }
+
+    if playouts >= node_budget || nodes.len() as u32 >= node_budget {
+        stop_reason = "nodes";
+    } else if now_ms() - started_at_ms >= budget_ms {
+        stop_reason = "time";
+    } else if playouts == 0 {
+        stop_reason = "fallback";
+    }
+
+    stats.nodes_expanded = stats
+        .nodes_expanded
+        .saturating_add(nodes.len().saturating_sub(1) as u32);
+
+    let root = &nodes[0];
+    if root.children.is_empty() {
+        return (
+            seed_move,
+            root_candidates,
+            if playouts == 0 { "fallback" } else { stop_reason },
+            max_depth_turns,
+            playouts,
+        );
+    }
+
+    let mut best_child_idx = root.children[0];
+    for &candidate_idx in &root.children[1..] {
+        let best = &nodes[best_child_idx];
+        let candidate = &nodes[candidate_idx];
+
+        if candidate.visits > best.visits {
+            best_child_idx = candidate_idx;
+            continue;
+        }
+        if candidate.visits == best.visits {
+            let best_mean = if best.visits == 0 {
+                f64::NEG_INFINITY
+            } else {
+                best.total_value / best.visits as f64
+            };
+            let candidate_mean = if candidate.visits == 0 {
+                f64::NEG_INFINITY
+            } else {
+                candidate.total_value / candidate.visits as f64
+            };
+            if candidate_mean > best_mean {
+                best_child_idx = candidate_idx;
+            }
+        }
+    }
+
+    let best_line = nodes[best_child_idx].action_from_parent.clone();
+    let best_depth = nodes[best_child_idx].depth_turns;
+    (
+        best_line,
+        root_candidates,
+        stop_reason,
+        max_depth_turns.max(best_depth),
+        playouts,
+    )
+}
+
 fn sanitize_selected_moves(board: &BoardState, proposed: &[Coord]) -> Vec<Coord> {
     let mut occupied = board.moves.clone();
     let mut deduped = HashSet::new();
@@ -1710,6 +2297,7 @@ fn choose_turn_internal(request: ChooseTurnRequest) -> Result<ChooseTurnResponse
             mode: "beam",
             stop_reason: "terminal",
             nodes_expanded: 0,
+            playouts: 0,
             board_evaluations: 0,
             root_candidates: 0,
             max_depth_turns: 0,
@@ -1730,37 +2318,35 @@ fn choose_turn_internal(request: ChooseTurnRequest) -> Result<ChooseTurnResponse
             mode: "beam",
             stop_reason: "terminal",
             nodes_expanded: stats.nodes_expanded,
+            playouts: 0,
             board_evaluations: stats.board_evaluations,
             root_candidates: 0,
             max_depth_turns: 0,
         });
     }
 
-    let (proposed_moves, root_candidates, stop_reason, mode, max_depth_turns) = if max_time_ms == 0 || max_nodes == 0 {
+    let (proposed_moves, root_candidates, stop_reason, mode, max_depth_turns, playouts) = if max_time_ms == 0 || max_nodes == 0 {
         (
             choose_greedy_turn(&board, &params, &mut stats),
             0,
             "budget_zero",
             "greedy",
             0,
+            0,
         )
     } else {
-        let (moves, root_candidates, reason) = choose_deterministic_root_decision(&board, &params, &mut stats);
-        if moves.is_empty() {
+        let (moves, root_candidates, reason, depth_turns, playout_count) =
+            choose_mcts_turn(&board, &params, max_time_ms, max_nodes, &mut stats);
+        if !moves.is_empty() {
+            (moves, root_candidates, reason, "mcts", depth_turns, playout_count)
+        } else {
             (
                 choose_greedy_turn(&board, &params, &mut stats),
                 root_candidates,
-                if root_candidates == 0 { "no_candidates" } else { reason },
-                "beam",
-                if root_candidates > 0 { 2 } else { 0 },
-            )
-        } else {
-            (
-                moves,
-                root_candidates,
-                reason,
-                "beam",
-                if root_candidates > 0 { 2 } else { 0 },
+                if root_candidates == 0 { "no_candidates" } else { "fallback" },
+                "mcts",
+                depth_turns,
+                playout_count,
             )
         }
     };
@@ -1775,6 +2361,7 @@ fn choose_turn_internal(request: ChooseTurnRequest) -> Result<ChooseTurnResponse
         mode,
         stop_reason,
         nodes_expanded: stats.nodes_expanded,
+        playouts,
         board_evaluations: stats.board_evaluations,
         root_candidates: root_candidates as u32,
         max_depth_turns,

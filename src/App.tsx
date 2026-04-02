@@ -9,6 +9,7 @@ import {
   evaluateBoardState,
   getEffectiveBotBackend,
   getPreferredBotBackend,
+  getWasmBotRuntimeMessage,
   getWasmBotRuntimeStatus,
   inspectBotCandidates,
   setPreferredBotBackend,
@@ -250,6 +251,19 @@ const WIN_DIRECTIONS: Array<[number, number]> = [
   [0, 1],
   [1, -1],
 ]
+const FIXED_WASM_SEARCH_OPTIONS: BotSearchOptions = {
+  ...DEFAULT_BOT_SEARCH_OPTIONS,
+  budget: {
+    maxTimeMs: 2000,
+    maxNodes: 175000,
+  },
+  turnCandidateCount: 24,
+  childTurnCandidateCount: 18,
+  maxSimulationTurns: 6,
+  simulationTurnCandidateCount: 8,
+  simulationRadius: 6,
+  simulationTopKFirstMoves: 6,
+}
 const THEMES: Record<PaletteId, ThemePalette> = {
   spruce: {
     dark: false,
@@ -1212,7 +1226,8 @@ function App() {
 
     void warmupWasmBot().then((ready) => {
       if (cancelled) return
-      setBotBackendNotice(ready ? 'Rust/WASM backend ready.' : 'Rust/WASM unavailable. JS fallback active.')
+      const runtimeMessage = getWasmBotRuntimeMessage()
+      setBotBackendNotice(ready ? 'Rust/WASM backend ready.' : runtimeMessage ?? 'Rust/WASM unavailable.')
     })
 
     return () => {
@@ -1479,6 +1494,9 @@ function App() {
       simulationTopKFirstMoves: Math.max(2, Math.min(6, 2 + Math.floor(normalized * 4))),
     }
   }, [botThinkSeconds])
+  const activeBotSearchOptions = useMemo<BotSearchOptions>(() => {
+    return botBackend === 'wasm' ? FIXED_WASM_SEARCH_OPTIONS : botSearchOptions
+  }, [botBackend, botSearchOptions])
   const botCandidateSnapshot = useMemo<BotCandidateSnapshot | null>(() => {
     if (!showBotCandidateCells) return null
     if (displayState.winner) return null
@@ -1490,9 +1508,9 @@ function App() {
         placementsLeft: displayState.placementsLeft,
       },
       botTuning,
-      botSearchOptions,
+      activeBotSearchOptions,
     )
-  }, [botSearchOptions, botTuning, displayState.moveHistory, displayState.moves, displayState.placementsLeft, displayState.turn, displayState.winner, showBotCandidateCells])
+  }, [activeBotSearchOptions, botTuning, displayState.moveHistory, displayState.moves, displayState.placementsLeft, displayState.turn, displayState.winner, showBotCandidateCells])
   const botLegalCandidateKeys = useMemo(() => {
     const keys = new Set<string>()
     for (const cell of botCandidateSnapshot?.legalCells ?? []) keys.add(toKey(cell.q, cell.r))
@@ -1832,14 +1850,17 @@ function App() {
               placementsLeft: sourceState.placementsLeft,
             },
             botTuning,
-            botSearchOptions,
+            activeBotSearchOptions,
           )
         : null
       const evaluationBefore = botTelemetryEnabled ? summarizeEvaluation(evaluateBoardState(sourceState.moves, botTuning)) : null
 
       await new Promise<void>((resolve) => window.setTimeout(resolve, 0))
+      const shouldUseAsyncSearch =
+        botBackend === 'wasm' ||
+        (activeBotSearchOptions.budget.maxTimeMs > 0 && activeBotSearchOptions.budget.maxNodes > 0)
       const decision =
-        botSearchOptions.budget.maxTimeMs > 0 && botSearchOptions.budget.maxNodes > 0
+        shouldUseAsyncSearch
           ? await chooseBotTurnDetailedAsyncWithSession(
               {
                 moves: sourceState.moves,
@@ -1849,7 +1870,7 @@ function App() {
               },
               botSearchSessionRef.current,
               botTuning,
-              botSearchOptions,
+              activeBotSearchOptions,
               {
                 yieldEveryMs: 16,
                 onProgress: (progress) => {
@@ -1869,7 +1890,7 @@ function App() {
               },
               botSearchSessionRef.current,
               botTuning,
-              botSearchOptions,
+              activeBotSearchOptions,
             )
 
       setLastBotStats(decision.stats)
@@ -1912,7 +1933,7 @@ function App() {
               executedMoveCount,
             },
             stats: JSON.parse(JSON.stringify(decision.stats)) as BotSearchStats,
-            searchOptions: JSON.parse(JSON.stringify(botSearchOptions)) as BotSearchOptions,
+            searchOptions: JSON.parse(JSON.stringify(activeBotSearchOptions)) as BotSearchOptions,
             tuning: JSON.parse(JSON.stringify(botTuning)) as BotTuning,
             evaluationBefore,
             evaluationAfter: executedMoveCount > 0 ? summarizeEvaluation(evaluateBoardState(nextMoves, botTuning)) : null,
@@ -1948,11 +1969,19 @@ function App() {
       for (const move of plannedMoves) {
         dispatchLive({ type: 'place', q: move.q, r: move.r })
       }
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Bot turn failed.'
+      setNetworkError(message)
+      if (botBackend === 'wasm') {
+        const runtimeMessage = getWasmBotRuntimeMessage()
+        setBotBackendNotice(runtimeMessage ?? message)
+      }
     } finally {
       setIsBotThinking(false)
     }
   }, [
-    botSearchOptions,
+    activeBotSearchOptions,
+    botBackend,
     botTelemetryEnabled,
     botTuning,
     isBotThinking,
@@ -1974,7 +2003,8 @@ function App() {
 
     setBotBackendNotice('Loading Rust/WASM runtime…')
     void warmupWasmBot().then((ready) => {
-      setBotBackendNotice(ready ? 'Rust/WASM backend ready.' : 'Rust/WASM unavailable. JS fallback active.')
+      const runtimeMessage = getWasmBotRuntimeMessage()
+      setBotBackendNotice(ready ? 'Rust/WASM backend ready.' : runtimeMessage ?? 'Rust/WASM unavailable.')
     })
   }, [])
 
@@ -3103,7 +3133,9 @@ function App() {
                                 </div>
                               ) : null}
                               <label className="compute-label" htmlFor="bot-compute-slider">
-                                Search time limit: {botThinkSeconds.toFixed(1)}s
+                                {botBackend === 'wasm'
+                                  ? 'Search time limit: fixed at 2.0s (WASM)'
+                                  : `Search time limit: ${botThinkSeconds.toFixed(1)}s`}
                                 <HintPill text="0.0s uses greedy only. Higher values run budgeted MCTS with guided (non-random) simulation and larger node caps." />
                               </label>
                               <input
@@ -3113,12 +3145,15 @@ function App() {
                                 max={12}
                                 step={0.1}
                                 value={botThinkSeconds}
+                                disabled={botBackend === 'wasm'}
                                 onChange={(event) => setBotThinkSeconds(Math.max(0, Math.min(12, Number(event.target.value) || 0)))}
                               />
                               <div className="compute-meta">
-                                {botThinkSeconds <= 0
+                                {botBackend === 'wasm'
+                                  ? `Mode: MCTS | Fixed WASM budget: ${activeBotSearchOptions.budget.maxTimeMs}ms or ${activeBotSearchOptions.budget.maxNodes.toLocaleString()} nodes`
+                                  : botThinkSeconds <= 0
                                   ? 'Mode: Greedy (no search)'
-                                  : `Mode: MCTS | Budget: ${botSearchOptions.budget.maxTimeMs}ms or ${botSearchOptions.budget.maxNodes.toLocaleString()} nodes`}
+                                  : `Mode: MCTS | Budget: ${activeBotSearchOptions.budget.maxTimeMs}ms or ${activeBotSearchOptions.budget.maxNodes.toLocaleString()} nodes`}
                               </div>
                               {lastBotStats ? (
                                 <div className="compute-meta">
