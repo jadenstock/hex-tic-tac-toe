@@ -7,6 +7,11 @@ const MAX_THREAT_INDEX: usize = WIN_LENGTH as usize;
 const CANDIDATE_RADIUS_FALLBACK: i32 = 2;
 const MIN_SCORED_CANDIDATE_POINTS: i32 = 3;
 const SINGLE_THREAT_MAX_DISTANCE: i32 = 2;
+const FORCING_SOLVER_DEPTH: u8 = 8;
+const FORCING_DEFENDER_BRANCH_CAP: usize = 15;
+const FORCING_PROVEN_WIN_SCORE: f64 = 2.0;
+const FORCING_PROVEN_LOSS_SCORE: f64 = -2.0;
+const FORCING_STATUS_SCORE_BOUNDARY: f64 = 1.5;
 const DIRECTIONS: [(i32, i32); 3] = [(1, 0), (0, 1), (1, -1)];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -181,6 +186,12 @@ struct ChooseTurnResponse {
     board_evaluations: u32,
     root_candidates: u32,
     max_depth_turns: u32,
+    forcing_status: &'static str,
+    forcing_nodes: u32,
+    forcing_cache_hits: u32,
+    forcing_cache_misses: u32,
+    forcing_elapsed_ms: u32,
+    forcing_root_candidates: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -220,6 +231,95 @@ struct MctsNode {
     visits: u32,
     total_value: f64,
     terminal_winner: Option<Player>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ForcingProofBudget {
+    deadline_ms: f64,
+    max_nodes: u32,
+    nodes_visited: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ForcingStatus {
+    Win,
+    Loss,
+    Unknown,
+}
+
+impl ForcingStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Win => "win",
+            Self::Loss => "loss",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ForcingCacheEntry {
+    status: ForcingStatus,
+    score: f64,
+}
+
+#[derive(Clone, Debug)]
+struct ForcingLineScore {
+    line: Vec<Coord>,
+    score: f64,
+}
+
+#[derive(Clone, Debug)]
+struct ForcingNodeResult {
+    status: ForcingStatus,
+    score: f64,
+    best_action: Option<Vec<Coord>>,
+}
+
+#[derive(Clone, Debug)]
+struct ForcingSolveResult {
+    status: ForcingStatus,
+    best_action: Option<Vec<Coord>>,
+    root_line_scores: Vec<ForcingLineScore>,
+}
+
+#[derive(Clone, Debug)]
+struct ForcingSearchContext {
+    budget: ForcingProofBudget,
+    cache: HashMap<String, ForcingCacheEntry>,
+    cache_hits: u32,
+    cache_misses: u32,
+    start_depth: u8,
+    max_depth_turns: u32,
+    root_candidates: usize,
+    root_line_scores: Vec<ForcingLineScore>,
+}
+
+#[derive(Clone, Debug)]
+struct ForcingTelemetry {
+    attempted: bool,
+    status: ForcingStatus,
+    nodes: u32,
+    cache_hits: u32,
+    cache_misses: u32,
+    elapsed_ms: u32,
+    root_candidates: usize,
+    max_depth_turns: u32,
+}
+
+impl Default for ForcingTelemetry {
+    fn default() -> Self {
+        Self {
+            attempted: false,
+            status: ForcingStatus::Unknown,
+            nodes: 0,
+            cache_hits: 0,
+            cache_misses: 0,
+            elapsed_ms: 0,
+            root_candidates: 0,
+            max_depth_turns: 0,
+        }
+    }
 }
 
 fn to_error_json(message: impl Into<String>) -> String {
@@ -600,6 +700,169 @@ fn collect_one_turn_finish_cells(features: &BoardFeatures, player: Player) -> Ha
     }
 
     finish
+}
+
+fn threat_group_pairs(features: &BoardFeatures, player: Player) -> Vec<(Coord, Option<Coord>)> {
+    let mut pairs = Vec::new();
+    let groups = one_turn_groups(features, player);
+
+    for key in groups.keys() {
+        if let Some((first_raw, second_raw)) = key.split_once('|') {
+            let Some(first) = parse_coord_key(first_raw) else {
+                continue;
+            };
+            let Some(second) = parse_coord_key(second_raw) else {
+                continue;
+            };
+            pairs.push((first, Some(second)));
+            continue;
+        }
+
+        if let Some(first) = parse_coord_key(key) {
+            pairs.push((first, None));
+        }
+    }
+
+    pairs
+}
+
+fn pair_covered_by_cells(pair: &(Coord, Option<Coord>), first: Coord, second: Option<Coord>) -> bool {
+    if pair.0 == first || second == Some(pair.0) {
+        return true;
+    }
+    if let Some(other) = pair.1 {
+        return other == first || second == Some(other);
+    }
+    false
+}
+
+fn minimum_blockers_required_from_pairs(pairs: &[(Coord, Option<Coord>)]) -> usize {
+    if pairs.is_empty() {
+        return 0;
+    }
+
+    let mut unique_cells = Vec::new();
+    let mut seen = HashSet::new();
+    for (first, second) in pairs {
+        if seen.insert(*first) {
+            unique_cells.push(*first);
+        }
+        if let Some(cell) = second {
+            if seen.insert(*cell) {
+                unique_cells.push(*cell);
+            }
+        }
+    }
+
+    for &cell in &unique_cells {
+        if pairs
+            .iter()
+            .all(|pair| pair_covered_by_cells(pair, cell, None))
+        {
+            return 1;
+        }
+    }
+
+    for first_idx in 0..unique_cells.len() {
+        for second_idx in (first_idx + 1)..unique_cells.len() {
+            let first = unique_cells[first_idx];
+            let second = unique_cells[second_idx];
+            if pairs
+                .iter()
+                .all(|pair| pair_covered_by_cells(pair, first, Some(second)))
+            {
+                return 2;
+            }
+        }
+    }
+
+    3
+}
+
+fn one_turn_blockers_required(features: &BoardFeatures, player: Player) -> usize {
+    let pairs = threat_group_pairs(features, player);
+    minimum_blockers_required_from_pairs(&pairs)
+}
+
+fn has_immediate_threats(features: &BoardFeatures) -> bool {
+    !features.x_one_turn_groups.is_empty() || !features.o_one_turn_groups.is_empty()
+}
+
+fn enumerate_covering_move_sets(
+    pairs: &[(Coord, Option<Coord>)],
+    placements_available: usize,
+) -> Vec<Vec<Coord>> {
+    if pairs.is_empty() || placements_available == 0 {
+        return Vec::new();
+    }
+
+    let mut unique_cells = Vec::new();
+    let mut seen = HashSet::new();
+    for (first, second) in pairs {
+        if seen.insert(*first) {
+            unique_cells.push(*first);
+        }
+        if let Some(cell) = second {
+            if seen.insert(*cell) {
+                unique_cells.push(*cell);
+            }
+        }
+    }
+
+    let mut sets = Vec::new();
+
+    for &cell in &unique_cells {
+        if pairs
+            .iter()
+            .all(|pair| pair_covered_by_cells(pair, cell, None))
+        {
+            sets.push(vec![cell]);
+        }
+    }
+
+    if placements_available >= 2 {
+        for first_idx in 0..unique_cells.len() {
+            for second_idx in (first_idx + 1)..unique_cells.len() {
+                let first = unique_cells[first_idx];
+                let second = unique_cells[second_idx];
+                if pairs
+                    .iter()
+                    .all(|pair| pair_covered_by_cells(pair, first, Some(second)))
+                {
+                    sets.push(vec![first, second]);
+                }
+            }
+        }
+    }
+
+    sets
+}
+
+fn exact_blocking_responses(board: &BoardState, attacker: Player) -> Vec<Vec<Coord>> {
+    if board.placements_left == 0 {
+        return Vec::new();
+    }
+
+    let features = collect_features(&board.moves);
+    let pairs = threat_group_pairs(&features, attacker);
+    let raw_sets = enumerate_covering_move_sets(&pairs, board.placements_left as usize);
+    if raw_sets.is_empty() {
+        return Vec::new();
+    }
+
+    let mut deduped = HashSet::new();
+    let mut lines = Vec::new();
+
+    for mut line in raw_sets {
+        line.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let key = canonical_line_key(&line);
+        if key.is_empty() || !deduped.insert(key) {
+            continue;
+        }
+        lines.push(line);
+    }
+
+    lines
 }
 
 fn threat_count_exponent(threat: usize) -> f64 {
@@ -1829,6 +2092,519 @@ fn simulation_search_policy(params: &EngineParams) -> CandidatePolicy {
     }
 }
 
+fn player_mark(player: Player) -> char {
+    match player {
+        Player::X => 'X',
+        Player::O => 'O',
+    }
+}
+
+fn board_state_signature(board: &BoardState) -> String {
+    let mut stones: Vec<(i32, i32, Player)> = board
+        .moves
+        .iter()
+        .map(|(&(q, r), &mark)| (q, r, mark))
+        .collect();
+    stones.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    let mut out = String::new();
+    out.push('t');
+    out.push(':');
+    out.push(player_mark(board.turn));
+    out.push('|');
+    out.push('p');
+    out.push(':');
+    out.push_str(&board.placements_left.to_string());
+    out.push('|');
+
+    for (q, r, mark) in stones {
+        out.push_str(&q.to_string());
+        out.push(',');
+        out.push_str(&r.to_string());
+        out.push(',');
+        out.push(player_mark(mark));
+        out.push(';');
+    }
+
+    out
+}
+
+fn build_forcing_proof_budget(max_time_ms: u32, max_nodes: u32, start_ms: f64) -> ForcingProofBudget {
+    let max_time = max_time_ms.max(1);
+    let max_node_count = max_nodes.max(1);
+
+    let time_slice = ((max_time as f64) * 0.2).round() as u32;
+    let slice_ms = time_slice.max(40).min(500).min(max_time);
+
+    let node_slice = ((max_node_count as f64) * 0.02).round() as u32;
+    let slice_nodes = node_slice.max(64).min(5_000).min(max_node_count);
+
+    ForcingProofBudget {
+        deadline_ms: start_ms + slice_ms as f64,
+        max_nodes: slice_nodes,
+        nodes_visited: 0,
+    }
+}
+
+fn forcing_status_from_score(score: f64) -> ForcingStatus {
+    if score >= FORCING_STATUS_SCORE_BOUNDARY {
+        ForcingStatus::Win
+    } else if score <= -FORCING_STATUS_SCORE_BOUNDARY {
+        ForcingStatus::Loss
+    } else {
+        ForcingStatus::Unknown
+    }
+}
+
+fn forcing_heuristic_score(
+    board: &BoardState,
+    attacker: Player,
+    params: &EngineParams,
+    stats: &mut EngineStats,
+) -> f64 {
+    if let Some(winner) = find_winner(&board.moves) {
+        return if winner == attacker {
+            FORCING_PROVEN_WIN_SCORE
+        } else {
+            FORCING_PROVEN_LOSS_SCORE
+        };
+    }
+
+    let eval = evaluate_board_summary(board, params, stats);
+    let value = objective_for_player(&eval, attacker, params);
+    if value.is_finite() {
+        value.clamp(-1.0, 1.0)
+    } else if value.is_sign_positive() {
+        1.0
+    } else {
+        -1.0
+    }
+}
+
+fn should_attempt_forcing_solve(board: &BoardState, attacker: Player) -> bool {
+    let features = collect_features(&board.moves);
+    if !has_immediate_threats(&features) {
+        return false;
+    }
+    one_turn_blockers_required(&features, attacker) >= 2
+}
+
+fn opponent_can_win_immediately(board: &BoardState, player: Player, params: &EngineParams) -> bool {
+    !collect_winning_turn_lines(board, player, params).is_empty()
+}
+
+fn forcing_candidate_lines(
+    board: &BoardState,
+    attacker: Player,
+    params: &EngineParams,
+    stats: &mut EngineStats,
+) -> Vec<Vec<Coord>> {
+    if board.placements_left == 0 || board.turn != attacker {
+        return Vec::new();
+    }
+
+    let mut policy = child_search_policy(params);
+    policy.top_cell_count = widened_top_cell_count(
+        params.top_k_first_moves,
+        params.child_turn_candidate_count.max(10).min(24),
+        3,
+    );
+    policy.max_line_count = params.child_turn_candidate_count.max(10).min(24);
+
+    let mut candidates = enumerate_turn_candidates(board, attacker, params, policy, stats)
+        .into_iter()
+        .map(|entry| entry.line)
+        .collect::<Vec<_>>();
+
+    if candidates.len() <= 2 {
+        let broadened = broaden_turn_actions(
+            board,
+            attacker,
+            params,
+            params.child_turn_candidate_count.max(10).min(24),
+            stats,
+        );
+        if broadened.len() > candidates.len() {
+            candidates = broadened;
+        }
+    }
+
+    let mut seen = HashSet::new();
+    let mut forcing = Vec::new();
+
+    for line in candidates {
+        let (after_turn, applied, winner) = apply_turn_line(board, &line, attacker);
+        if applied.is_empty() {
+            continue;
+        }
+
+        let key = canonical_line_key(&applied);
+        if key.is_empty() || !seen.insert(key) {
+            continue;
+        }
+
+        let keep = if winner == Some(attacker) {
+            true
+        } else {
+            let features = collect_features(&after_turn.moves);
+            let blockers_required = one_turn_blockers_required(&features, attacker);
+            let forcing_threshold = after_turn.placements_left.max(1).min(2) as usize;
+            blockers_required >= forcing_threshold
+        };
+
+        if keep {
+            forcing.push(applied);
+        }
+    }
+
+    forcing
+}
+
+fn forcing_child_terminal_result(winner: Option<Player>, attacker: Player) -> ForcingNodeResult {
+    match winner {
+        Some(player) if player == attacker => ForcingNodeResult {
+            status: ForcingStatus::Win,
+            score: FORCING_PROVEN_WIN_SCORE,
+            best_action: None,
+        },
+        Some(_) => ForcingNodeResult {
+            status: ForcingStatus::Loss,
+            score: FORCING_PROVEN_LOSS_SCORE,
+            best_action: None,
+        },
+        None => ForcingNodeResult {
+            status: ForcingStatus::Unknown,
+            score: 0.0,
+            best_action: None,
+        },
+    }
+}
+
+fn forcing_unknown_result(
+    board: &BoardState,
+    attacker: Player,
+    params: &EngineParams,
+    stats: &mut EngineStats,
+) -> ForcingNodeResult {
+    ForcingNodeResult {
+        status: ForcingStatus::Unknown,
+        score: forcing_heuristic_score(board, attacker, params, stats),
+        best_action: None,
+    }
+}
+
+fn forcing_solve_node(
+    board: &BoardState,
+    attacker: Player,
+    params: &EngineParams,
+    stats: &mut EngineStats,
+    context: &mut ForcingSearchContext,
+    depth_remaining: u8,
+    alpha: f64,
+    beta: f64,
+    is_root: bool,
+) -> ForcingNodeResult {
+    let depth_used = context.start_depth.saturating_sub(depth_remaining) as u32;
+    context.max_depth_turns = context.max_depth_turns.max(depth_used);
+
+    let cache_key = if is_root {
+        None
+    } else {
+        Some(format!(
+            "{}|a:{}|d:{}",
+            board_state_signature(board),
+            player_mark(attacker),
+            depth_remaining
+        ))
+    };
+
+    if let Some(key) = &cache_key {
+        if let Some(cached) = context.cache.get(key) {
+            context.cache_hits = context.cache_hits.saturating_add(1);
+            return ForcingNodeResult {
+                status: cached.status,
+                score: cached.score,
+                best_action: None,
+            };
+        }
+        context.cache_misses = context.cache_misses.saturating_add(1);
+    }
+
+    if context.budget.nodes_visited >= context.budget.max_nodes || now_ms() >= context.budget.deadline_ms {
+        return forcing_unknown_result(board, attacker, params, stats);
+    }
+    context.budget.nodes_visited = context.budget.nodes_visited.saturating_add(1);
+
+    if let Some(winner) = find_winner(&board.moves) {
+        return forcing_child_terminal_result(Some(winner), attacker);
+    }
+    if depth_remaining == 0 {
+        return forcing_unknown_result(board, attacker, params, stats);
+    }
+
+    let current_player = board.turn;
+    let defender = attacker.opponent();
+
+    if current_player == defender && opponent_can_win_immediately(board, defender, params) {
+        return ForcingNodeResult {
+            status: ForcingStatus::Loss,
+            score: FORCING_PROVEN_LOSS_SCORE,
+            best_action: None,
+        };
+    }
+
+    let features = collect_features(&board.moves);
+    let blockers_required = one_turn_blockers_required(&features, attacker);
+    let forcing_threshold = board.placements_left.max(1).min(2) as usize;
+
+    if current_player == defender && blockers_required >= board.placements_left as usize + 1 {
+        return ForcingNodeResult {
+            status: ForcingStatus::Win,
+            score: FORCING_PROVEN_WIN_SCORE,
+            best_action: None,
+        };
+    }
+
+    let result = if current_player == attacker {
+        let forcing_lines = forcing_candidate_lines(board, attacker, params, stats);
+        if is_root {
+            context.root_candidates = forcing_lines.len();
+            context.root_line_scores.clear();
+        }
+
+        if forcing_lines.is_empty() {
+            forcing_unknown_result(board, attacker, params, stats)
+        } else {
+            let mut best_score = f64::NEG_INFINITY;
+            let mut best_status = ForcingStatus::Unknown;
+            let mut best_action: Option<Vec<Coord>> = None;
+            let mut local_alpha = alpha;
+
+            for line in forcing_lines {
+                let (after_turn, applied, winner) = apply_turn_line(board, &line, attacker);
+                if applied.is_empty() {
+                    continue;
+                }
+
+                let child = if winner.is_some() {
+                    forcing_child_terminal_result(winner, attacker)
+                } else {
+                    forcing_solve_node(
+                        &after_turn,
+                        attacker,
+                        params,
+                        stats,
+                        context,
+                        depth_remaining.saturating_sub(1),
+                        local_alpha,
+                        beta,
+                        false,
+                    )
+                };
+
+                if is_root {
+                    context.root_line_scores.push(ForcingLineScore {
+                        line: applied.clone(),
+                        score: child.score,
+                    });
+                }
+
+                let should_take = child.score > best_score
+                    || (child.score == best_score && child.status == ForcingStatus::Win && best_status != ForcingStatus::Win);
+                if should_take {
+                    best_score = child.score;
+                    best_status = child.status;
+                    best_action = Some(applied);
+                }
+
+                local_alpha = local_alpha.max(best_score);
+                if local_alpha >= beta || best_score >= FORCING_PROVEN_WIN_SCORE {
+                    break;
+                }
+            }
+
+            if best_action.is_none() {
+                forcing_unknown_result(board, attacker, params, stats)
+            } else {
+                let mut status = forcing_status_from_score(best_score);
+                if status == ForcingStatus::Unknown {
+                    status = best_status;
+                }
+                ForcingNodeResult {
+                    status,
+                    score: best_score,
+                    best_action,
+                }
+            }
+        }
+    } else {
+        if blockers_required < forcing_threshold {
+            forcing_unknown_result(board, attacker, params, stats)
+        } else if blockers_required >= board.placements_left as usize + 1 {
+            ForcingNodeResult {
+                status: ForcingStatus::Win,
+                score: FORCING_PROVEN_WIN_SCORE,
+                best_action: None,
+            }
+        } else {
+            let blocking_lines = exact_blocking_responses(board, attacker);
+            if blocking_lines.is_empty() {
+                ForcingNodeResult {
+                    status: ForcingStatus::Win,
+                    score: FORCING_PROVEN_WIN_SCORE,
+                    best_action: None,
+                }
+            } else if blocking_lines.len() > FORCING_DEFENDER_BRANCH_CAP {
+                forcing_unknown_result(board, attacker, params, stats)
+            } else {
+                let mut best_score = f64::INFINITY;
+                let mut best_status = ForcingStatus::Unknown;
+                let mut local_beta = beta;
+
+                for line in blocking_lines {
+                    let (after_turn, applied, _) = apply_turn_line(board, &line, current_player);
+                    if applied.is_empty() {
+                        continue;
+                    }
+
+                    let child = forcing_solve_node(
+                        &after_turn,
+                        attacker,
+                        params,
+                        stats,
+                        context,
+                        depth_remaining.saturating_sub(1),
+                        alpha,
+                        local_beta,
+                        false,
+                    );
+
+                    let should_take = child.score < best_score
+                        || (child.score == best_score && child.status == ForcingStatus::Loss && best_status != ForcingStatus::Loss);
+                    if should_take {
+                        best_score = child.score;
+                        best_status = child.status;
+                    }
+
+                    local_beta = local_beta.min(best_score);
+                    if alpha >= local_beta || best_score <= FORCING_PROVEN_LOSS_SCORE {
+                        break;
+                    }
+                }
+
+                if best_score == f64::INFINITY {
+                    forcing_unknown_result(board, attacker, params, stats)
+                } else {
+                    let mut status = forcing_status_from_score(best_score);
+                    if status == ForcingStatus::Unknown {
+                        status = best_status;
+                    }
+                    ForcingNodeResult {
+                        status,
+                        score: best_score,
+                        best_action: None,
+                    }
+                }
+            }
+        }
+    };
+
+    if let Some(key) = cache_key {
+        context.cache.insert(
+            key,
+            ForcingCacheEntry {
+                status: result.status,
+                score: result.score,
+            },
+        );
+    }
+
+    result
+}
+
+fn solve_forcing_proof(
+    board: &BoardState,
+    attacker: Player,
+    params: &EngineParams,
+    stats: &mut EngineStats,
+    max_time_ms: u32,
+    max_nodes: u32,
+) -> (ForcingSolveResult, ForcingTelemetry) {
+    let started_at = now_ms();
+    let budget = build_forcing_proof_budget(max_time_ms, max_nodes, started_at);
+    let mut context = ForcingSearchContext {
+        budget,
+        cache: HashMap::new(),
+        cache_hits: 0,
+        cache_misses: 0,
+        start_depth: FORCING_SOLVER_DEPTH,
+        max_depth_turns: 0,
+        root_candidates: 0,
+        root_line_scores: Vec::new(),
+    };
+
+    let root = forcing_solve_node(
+        board,
+        attacker,
+        params,
+        stats,
+        &mut context,
+        FORCING_SOLVER_DEPTH,
+        FORCING_PROVEN_LOSS_SCORE,
+        FORCING_PROVEN_WIN_SCORE,
+        true,
+    );
+
+    let elapsed_ms = (now_ms() - started_at).max(0.0).round() as u32;
+    let telemetry = ForcingTelemetry {
+        attempted: true,
+        status: root.status,
+        nodes: context.budget.nodes_visited,
+        cache_hits: context.cache_hits,
+        cache_misses: context.cache_misses,
+        elapsed_ms,
+        root_candidates: context.root_candidates,
+        max_depth_turns: context.max_depth_turns,
+    };
+
+    (
+        ForcingSolveResult {
+            status: root.status,
+            best_action: root.best_action,
+            root_line_scores: context.root_line_scores,
+        },
+        telemetry,
+    )
+}
+
+fn sort_root_actions_by_forcing_scores(actions: &mut [Vec<Coord>], line_scores: &[ForcingLineScore]) {
+    if actions.is_empty() || line_scores.is_empty() {
+        return;
+    }
+
+    let mut score_by_key: HashMap<String, f64> = HashMap::new();
+    for entry in line_scores {
+        let key = canonical_line_key(&entry.line);
+        if key.is_empty() {
+            continue;
+        }
+        let previous = score_by_key.get(&key).copied().unwrap_or(f64::NEG_INFINITY);
+        if entry.score > previous {
+            score_by_key.insert(key, entry.score);
+        }
+    }
+
+    actions.sort_by(|a, b| {
+        let a_key = canonical_line_key(a);
+        let b_key = canonical_line_key(b);
+        let a_score = score_by_key.get(&a_key).copied().unwrap_or(f64::NEG_INFINITY);
+        let b_score = score_by_key.get(&b_key).copied().unwrap_or(f64::NEG_INFINITY);
+        b_score
+            .total_cmp(&a_score)
+            .then_with(|| a_key.cmp(&b_key))
+    });
+}
+
 fn terminal_value_for_root(winner: Option<Player>, root_player: Player) -> f64 {
     match winner {
         Some(player) if player == root_player => 1.0,
@@ -2072,12 +2848,37 @@ fn choose_mcts_turn(
     max_time_ms: u32,
     max_nodes: u32,
     stats: &mut EngineStats,
-) -> (Vec<Coord>, usize, &'static str, u32, u32) {
+) -> (Vec<Coord>, usize, &'static str, u32, u32, ForcingTelemetry) {
     if board.placements_left == 0 {
-        return (Vec::new(), 0, "terminal", 0, 0);
+        return (Vec::new(), 0, "terminal", 0, 0, ForcingTelemetry::default());
     }
 
     let root_player = board.turn;
+    let mut forcing_telemetry = ForcingTelemetry::default();
+    let mut forcing_line_scores = Vec::new();
+
+    if should_attempt_forcing_solve(board, root_player) {
+        let (forcing_result, telemetry) =
+            solve_forcing_proof(board, root_player, params, stats, max_time_ms, max_nodes);
+        forcing_line_scores = forcing_result.root_line_scores;
+        forcing_telemetry = telemetry;
+
+        if forcing_result.status == ForcingStatus::Win {
+            if let Some(best_action) = forcing_result.best_action {
+                if !best_action.is_empty() {
+                    return (
+                        best_action,
+                        forcing_telemetry.root_candidates.max(1),
+                        "early_win",
+                        forcing_telemetry.max_depth_turns.max(1),
+                        0,
+                        forcing_telemetry,
+                    );
+                }
+            }
+        }
+    }
+
     let root_policy = root_search_policy(params);
     let mut root_actions = enumerate_turn_candidates(board, root_player, params, root_policy, stats)
         .into_iter()
@@ -2097,18 +2898,35 @@ fn choose_mcts_turn(
         }
     }
 
+    if !forcing_line_scores.is_empty() {
+        sort_root_actions_by_forcing_scores(&mut root_actions, &forcing_line_scores);
+    }
+
     if root_actions.is_empty() {
-        return (Vec::new(), 0, "no_candidates", 0, 0);
+        return (Vec::new(), 0, "no_candidates", 0, 0, forcing_telemetry);
     }
 
     let seed_move = root_actions.first().cloned().unwrap_or_default();
 
     if root_actions.len() == 1 {
-        return (root_actions[0].clone(), 1, "single_candidate", 1, 0);
+        return (root_actions[0].clone(), 1, "single_candidate", 1, 0, forcing_telemetry);
     }
 
     let root_candidates = root_actions.len();
     root_actions.reverse();
+
+    let remaining_time_ms = max_time_ms.saturating_sub(forcing_telemetry.elapsed_ms);
+    let remaining_node_budget = max_nodes.saturating_sub(forcing_telemetry.nodes);
+    if remaining_time_ms == 0 || remaining_node_budget == 0 {
+        return (
+            seed_move,
+            root_candidates,
+            if remaining_time_ms == 0 { "time" } else { "nodes" },
+            forcing_telemetry.max_depth_turns,
+            0,
+            forcing_telemetry,
+        );
+    }
 
     let mut nodes = vec![MctsNode {
         parent: None,
@@ -2123,12 +2941,12 @@ fn choose_mcts_turn(
     }];
 
     let started_at_ms = now_ms();
-    let budget_ms = (max_time_ms as f64).max(1.0);
-    let node_budget = max_nodes.max(1).min(2_000_000);
+    let budget_ms = (remaining_time_ms as f64).max(1.0);
+    let node_budget = remaining_node_budget.max(1).min(2_000_000);
     let depth_cap = (params.max_simulation_turns as u32).saturating_add(4).max(4).min(24);
 
     let mut playouts = 0_u32;
-    let mut max_depth_turns = 0_u32;
+    let mut max_depth_turns = forcing_telemetry.max_depth_turns;
     let mut stop_reason: &'static str = "time";
 
     while playouts < node_budget {
@@ -2199,6 +3017,7 @@ fn choose_mcts_turn(
             if playouts == 0 { "fallback" } else { stop_reason },
             max_depth_turns,
             playouts,
+            forcing_telemetry,
         );
     }
 
@@ -2236,6 +3055,7 @@ fn choose_mcts_turn(
         stop_reason,
         max_depth_turns.max(best_depth),
         playouts,
+        forcing_telemetry,
     )
 }
 
@@ -2300,6 +3120,12 @@ fn choose_turn_internal(request: ChooseTurnRequest) -> Result<ChooseTurnResponse
             board_evaluations: 0,
             root_candidates: 0,
             max_depth_turns: 0,
+            forcing_status: "not_attempted",
+            forcing_nodes: 0,
+            forcing_cache_hits: 0,
+            forcing_cache_misses: 0,
+            forcing_elapsed_ms: 0,
+            forcing_root_candidates: 0,
         });
     }
 
@@ -2321,10 +3147,16 @@ fn choose_turn_internal(request: ChooseTurnRequest) -> Result<ChooseTurnResponse
             board_evaluations: stats.board_evaluations,
             root_candidates: 0,
             max_depth_turns: 0,
+            forcing_status: "not_attempted",
+            forcing_nodes: 0,
+            forcing_cache_hits: 0,
+            forcing_cache_misses: 0,
+            forcing_elapsed_ms: 0,
+            forcing_root_candidates: 0,
         });
     }
 
-    let (proposed_moves, root_candidates, stop_reason, mode, max_depth_turns, playouts) = if max_time_ms == 0 || max_nodes == 0 {
+    let (proposed_moves, root_candidates, stop_reason, mode, max_depth_turns, playouts, forcing) = if max_time_ms == 0 || max_nodes == 0 {
         (
             choose_greedy_turn(&board, &params, &mut stats),
             0,
@@ -2332,12 +3164,13 @@ fn choose_turn_internal(request: ChooseTurnRequest) -> Result<ChooseTurnResponse
             "greedy",
             0,
             0,
+            ForcingTelemetry::default(),
         )
     } else {
-        let (moves, root_candidates, reason, depth_turns, playout_count) =
+        let (moves, root_candidates, reason, depth_turns, playout_count, forcing) =
             choose_mcts_turn(&board, &params, max_time_ms, max_nodes, &mut stats);
         if !moves.is_empty() {
-            (moves, root_candidates, reason, "mcts", depth_turns, playout_count)
+            (moves, root_candidates, reason, "mcts", depth_turns, playout_count, forcing)
         } else {
             (
                 choose_greedy_turn(&board, &params, &mut stats),
@@ -2346,6 +3179,7 @@ fn choose_turn_internal(request: ChooseTurnRequest) -> Result<ChooseTurnResponse
                 "mcts",
                 depth_turns,
                 playout_count,
+                forcing,
             )
         }
     };
@@ -2364,6 +3198,16 @@ fn choose_turn_internal(request: ChooseTurnRequest) -> Result<ChooseTurnResponse
         board_evaluations: stats.board_evaluations,
         root_candidates: root_candidates as u32,
         max_depth_turns,
+        forcing_status: if forcing.attempted {
+            forcing.status.as_str()
+        } else {
+            "not_attempted"
+        },
+        forcing_nodes: forcing.nodes,
+        forcing_cache_hits: forcing.cache_hits,
+        forcing_cache_misses: forcing.cache_misses,
+        forcing_elapsed_ms: forcing.elapsed_ms,
+        forcing_root_candidates: forcing.root_candidates as u32,
     };
 
     Ok(response)
