@@ -368,17 +368,15 @@ function tryChooseTurnFromLoadedWasm(
     const parsed = JSON.parse(raw) as WasmTurnResponse
     if (parsed.error) {
       wasmRuntimeStatus = 'failed'
-      wasmRuntimeMessage = parsed.error
+      wasmRuntimeMessage = `WASM bot error: ${parsed.error} (moves=${request.moves.length}, turn=${request.turn}, placements=${request.placements_left}, budget=${request.max_time_ms}ms/${request.max_nodes}n)`
       return null
     }
     return buildWasmDecision(state, parsed, Math.max(0, nowMs() - startMs))
   } catch (error) {
     wasmRuntimeStatus = 'failed'
-    if (error instanceof Error) {
-      wasmRuntimeMessage = `WASM bot execution failed: ${error.message}`
-    } else {
-      wasmRuntimeMessage = `WASM bot execution failed: ${String(error)}`
-    }
+    const errMsg = error instanceof Error ? error.message : String(error)
+    wasmRuntimeMessage =
+      `WASM bot execution failed: ${errMsg} (moves=${request.moves.length}, turn=${request.turn}, placements=${request.placements_left}, budget=${request.max_time_ms}ms/${request.max_nodes}n)`
     console.error('[WASM bot] sync execution error', error)
     return null
   }
@@ -403,17 +401,15 @@ async function tryChooseTurnFromWasm(
     const parsed = JSON.parse(raw) as WasmTurnResponse
     if (parsed.error) {
       wasmRuntimeStatus = 'failed'
-      wasmRuntimeMessage = parsed.error
+      wasmRuntimeMessage = `WASM bot error: ${parsed.error} (moves=${request.moves.length}, turn=${request.turn}, placements=${request.placements_left}, budget=${request.max_time_ms}ms/${request.max_nodes}n)`
       return null
     }
     return buildWasmDecision(state, parsed, Math.max(0, nowMs() - startMs))
   } catch (error) {
     wasmRuntimeStatus = 'failed'
-    if (error instanceof Error) {
-      wasmRuntimeMessage = `WASM bot execution failed: ${error.message}`
-    } else {
-      wasmRuntimeMessage = `WASM bot execution failed: ${String(error)}`
-    }
+    const errMsg = error instanceof Error ? error.message : String(error)
+    wasmRuntimeMessage =
+      `WASM bot execution failed: ${errMsg} (moves=${request.moves.length}, turn=${request.turn}, placements=${request.placements_left}, budget=${request.max_time_ms}ms/${request.max_nodes}n)`
     console.error('[WASM bot] execution error', error)
     return null
   }
