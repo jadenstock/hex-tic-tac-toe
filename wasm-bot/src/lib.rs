@@ -2000,10 +2000,9 @@ fn select_expand_path(
         let mut expanded_here = false;
         loop {
             let action_opt = {
-                let actions = nodes[node_idx]
-                    .unexpanded_actions
-                    .as_mut()
-                    .expect("actions should be initialized");
+                let Some(actions) = nodes[node_idx].unexpanded_actions.as_mut() else {
+                    break;
+                };
                 actions.pop()
             };
 
