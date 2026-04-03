@@ -11,6 +11,7 @@
     "data:hexo:archive": "node --experimental-strip-types scripts/hexo-archive/fetch-archive-metadata.ts",
     "data:hexo:metadata": "node --experimental-strip-types scripts/hexo-archive/build-clean-metadata.ts",
     "data:hexo:replays": "node --experimental-strip-types scripts/hexo-archive/export-replay-subset.ts",
+    "bot:arena": "node --experimental-strip-types scripts/bot/arena-compare.ts",
     "bot:wasm:build": "bash -lc 'source \"$HOME/.cargo/env\" && wasm-pack build wasm-bot --target web --out-dir ../public/wasm-bot --out-name hex_ttt_wasm'",
     "infra:install": "npm --prefix infra install",
     "infra:build": "npm --prefix infra run build",
