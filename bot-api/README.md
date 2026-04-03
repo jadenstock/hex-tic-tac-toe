@@ -1,6 +1,6 @@
 # Stateless Bot API Adapter
 
-HTTP wrapper around the existing in-repo bot engine, compatible with `/v1-alpha/turn`.
+HTTP wrapper around the existing in-repo bot engine, compatible with `htttx-bot-api` stateless `v1-alpha`.
 
 ## Run locally
 
@@ -17,10 +17,28 @@ Health check:
 curl -sS http://localhost:8080/healthz
 ```
 
+Capabilities:
+
+```bash
+curl -sS http://localhost:8080/v1/capabilities.json
+```
+
+Main move endpoint (from capabilities `api_root`):
+
+```bash
+curl -sS -X POST http://localhost:8080/v1/stateless/v1-alpha/turn \
+  -H 'content-type: application/json' \
+  -d '{"board":{"to_move":"x","cells":[]}}'
+```
+
+Backward-compatible alias is also available:
+
+`POST /v1-alpha/turn`
+
 ## Request example
 
 ```bash
-curl -sS -X POST http://localhost:8080/v1-alpha/turn \
+curl -sS -X POST http://localhost:8080/v1/stateless/v1-alpha/turn \
   -H 'content-type: application/json' \
   -d '{
     "board": {
@@ -33,6 +51,20 @@ curl -sS -X POST http://localhost:8080/v1-alpha/turn \
     },
     "time_limit": 1.5
   }'
+```
+
+Example response shape:
+
+```json
+{
+  "move": {
+    "pieces": [{"q": -1, "r": 0}, {"q": 0, "r": -1}],
+    "evaluation": {
+      "heuristic": 0.42,
+      "win_in": 1
+    }
+  }
+}
 ```
 
 ## Docker

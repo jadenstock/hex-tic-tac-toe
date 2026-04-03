@@ -125,7 +125,9 @@ Generated files are written to `public/wasm-bot/`.
 
 This repo includes a stateless HTTP bot adapter at `bot-api/server.ts`.
 
-- Endpoint: `POST /v1-alpha/turn`
+- Capabilities: `GET /v1/capabilities.json` (also served at `/capabilities.json`)
+- Primary endpoint: `POST /v1/stateless/v1-alpha/turn`
+- Backward-compatible alias: `POST /v1-alpha/turn`
 - Health: `GET /healthz`
 - Local run: `npm run bot:api`
 - Dockerfile: `bot-api/Dockerfile`

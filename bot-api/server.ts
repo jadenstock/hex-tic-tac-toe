@@ -5,6 +5,8 @@ import {
   DEFAULT_BOT_TUNING,
   evaluateBoardState,
   type Player,
+  WIN_DIRECTIONS,
+  WIN_LENGTH,
 } from '../src/bot/engine.ts'
 
 type Coord = { q: number; r: number }
@@ -18,8 +20,48 @@ type MoveRequest = {
   time_limit?: number
 }
 
+type Capabilities = {
+  meta: {
+    name: string
+    description: string
+    version: string
+    tags: string[]
+  }
+  stateless: {
+    versions: {
+      'v1-alpha': {
+        api_root: string
+        move_time_limit: true
+      }
+    }
+  }
+}
+
 type ErrorBody = {
   error: string
+}
+
+const TURN_ENDPOINT_PATHS = new Set([
+  '/v1-alpha/turn',
+  '/stateless/v1-alpha/turn',
+  '/v1/stateless/v1-alpha/turn',
+])
+
+const CAPABILITIES: Capabilities = {
+  meta: {
+    name: 'hex-ttt',
+    description: 'Hexagonal tic-tac-toe bot adapter using the in-repo search engine.',
+    version: process.env.BOT_VERSION ?? process.env.npm_package_version ?? '0.0.0',
+    tags: ['hex-ttt', 'stateless', 'typescript', 'mcts', 'wasm'],
+  },
+  stateless: {
+    versions: {
+      'v1-alpha': {
+        api_root: 'stateless/v1-alpha',
+        move_time_limit: true,
+      },
+    },
+  },
 }
 
 function toKey(q: number, r: number): string {
@@ -136,6 +178,47 @@ function error(res: import('node:http').ServerResponse, statusCode: number, mess
   writeJson(res, statusCode, { error: message } satisfies ErrorBody)
 }
 
+function countDirectional(
+  boardMap: Map<string, Player>,
+  q: number,
+  r: number,
+  dq: number,
+  dr: number,
+  player: Player,
+): number {
+  let count = 0
+  let cq = q + dq
+  let cr = r + dr
+  while (boardMap.get(toKey(cq, cr)) === player) {
+    count += 1
+    cq += dq
+    cr += dr
+  }
+  return count
+}
+
+function isWinningPlacement(boardMap: Map<string, Player>, q: number, r: number, player: Player): boolean {
+  for (const [dq, dr] of WIN_DIRECTIONS) {
+    const forward = countDirectional(boardMap, q, r, dq, dr, player)
+    const backward = countDirectional(boardMap, q, r, -dq, -dr, player)
+    if (1 + forward + backward >= WIN_LENGTH) {
+      return true
+    }
+  }
+  return false
+}
+
+function immediateWinInIfAny(boardMap: Map<string, Player>, playerJustMoved: Player): number | undefined {
+  for (const [key, mark] of boardMap.entries()) {
+    if (mark !== playerJustMoved) continue
+    const [q, r] = key.split(',').map(Number)
+    if (isWinningPlacement(boardMap, q, r, mark)) {
+      return playerJustMoved === 'X' ? 1 : -1
+    }
+  }
+  return undefined
+}
+
 function applyMove(
   boardMap: Map<string, Player>,
   line: Coord[],
@@ -159,15 +242,21 @@ const server = createServer(async (req, res) => {
     return error(res, 400, 'Bad request.')
   }
 
+  const url = new URL(req.url, `http://${req.headers.host ?? 'localhost'}`)
+
   if (req.method === 'OPTIONS') {
     return writeJson(res, 200, { ok: true })
   }
 
-  if (req.method === 'GET' && req.url === '/healthz') {
+  if (req.method === 'GET' && url.pathname === '/healthz') {
     return writeJson(res, 200, { ok: true })
   }
 
-  if (req.method !== 'POST' || req.url !== '/v1-alpha/turn') {
+  if (req.method === 'GET' && (url.pathname === '/capabilities.json' || url.pathname === '/v1/capabilities.json')) {
+    return writeJson(res, 200, CAPABILITIES)
+  }
+
+  if (req.method !== 'POST' || !TURN_ENDPOINT_PATHS.has(url.pathname)) {
     return error(res, 404, 'Not found.')
   }
 
@@ -211,7 +300,11 @@ const server = createServer(async (req, res) => {
     }
 
     const evalResult = evaluateBoardState(legalBoard.next, DEFAULT_BOT_TUNING)
-    const evaluation = requestedTurn === 'X' ? evalResult.objectiveForX : -evalResult.objectiveForX
+    const heuristic = evalResult.objectiveForX
+    const winIn = immediateWinInIfAny(legalBoard.next, requestedTurn)
+    const evaluation = winIn === undefined
+      ? { heuristic }
+      : { heuristic, win_in: winIn }
 
     return writeJson(res, 200, {
       move: {
