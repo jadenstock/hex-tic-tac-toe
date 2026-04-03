@@ -1823,7 +1823,7 @@ fn enumerate_turn_candidates(
 
 fn root_candidate_line_limit(params: &EngineParams) -> usize {
     let requested = params.turn_candidate_count.max(1);
-    requested.max(3).min(16)
+    requested.max(4).min(32)
 }
 
 fn root_search_policy(params: &EngineParams) -> CandidatePolicy {

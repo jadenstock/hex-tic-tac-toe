@@ -581,6 +581,28 @@
   color: var(--ink-soft);
 }
 
+.compute-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--line);
+  background: #ffffff;
+  border-radius: 999px;
+  padding: 5px 10px;
+  font-size: 0.86rem;
+  color: var(--ink-soft);
+}
+
+.compute-control input[type='number'] {
+  width: 5rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 3px 8px;
+  background: #ffffff;
+  color: var(--ink);
+  font-size: 0.85rem;
+}
+
 .compute-panel input[type='range'] {
   width: 100%;
 }
@@ -695,6 +717,7 @@
 .app-shell.theme-dark .quick-bot,
 .app-shell.theme-dark .button-row button,
 .app-shell.theme-dark .play-as,
+.app-shell.theme-dark .compute-control,
 .app-shell.theme-dark .play-as select,
 .app-shell.theme-dark .auto-bot-group,
 .app-shell.theme-dark .compute-panel,
@@ -722,6 +745,12 @@
 }
 
 .app-shell.theme-dark .tuning-grid input {
+  background: color-mix(in oklab, var(--panel), black 22%);
+  color: var(--ink);
+  border-color: var(--line);
+}
+
+.app-shell.theme-dark .compute-control input[type='number'] {
   background: color-mix(in oklab, var(--panel), black 22%);
   color: var(--ink);
   border-color: var(--line);

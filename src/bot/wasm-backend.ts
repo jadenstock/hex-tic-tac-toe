@@ -377,6 +377,7 @@ export function getPreferredBotBackend(): BotBackend {
 }
 
 export function setPreferredBotBackend(_backend: BotBackend): void {
+  void _backend
   // WASM is always enforced.
 }
 

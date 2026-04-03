@@ -212,15 +212,15 @@ const WIN_DIRECTIONS: Array<[number, number]> = [
   [0, 1],
   [1, -1],
 ]
-const FIXED_WASM_SEARCH_OPTIONS: BotSearchOptions = {
+const DEFAULT_BOT_THINK_SECONDS = 2
+const BOT_THINK_SECONDS_MIN = 0.25
+const BOT_THINK_SECONDS_MAX = 10
+const BOT_NODE_BUDGET_PER_SECOND = 87_500
+const LIVE_WASM_SEARCH_OPTIONS: BotSearchOptions = {
   ...DEFAULT_BOT_SEARCH_OPTIONS,
-  budget: {
-    maxTimeMs: 2000,
-    maxNodes: 175000,
-  },
   turnCandidateCount: 24,
   childTurnCandidateCount: 18,
-  maxSimulationTurns: 6,
+  maxSimulationTurns: 4,
   simulationTurnCandidateCount: 8,
   simulationRadius: 6,
   simulationTopKFirstMoves: 6,
@@ -1120,6 +1120,7 @@ function App() {
   const [liveBotPlayouts, setLiveBotPlayouts] = useState(0)
   const [liveBotBoardEvals, setLiveBotBoardEvals] = useState(0)
   const [liveBotElapsedMs, setLiveBotElapsedMs] = useState(0)
+  const [botThinkSeconds, setBotThinkSeconds] = useState(DEFAULT_BOT_THINK_SECONDS)
   const [lastBotStats, setLastBotStats] = useState<BotSearchStats | null>(null)
   const [botTelemetryEnabled, setBotTelemetryEnabled] = useState(false)
   const [botTelemetryEntries, setBotTelemetryEntries] = useState<BotTelemetryEntry[]>([])
@@ -1401,7 +1402,17 @@ function App() {
     if (tags.length === 0) return null
     return `${key}: ${tags.join(' | ')}`
   }, [displayState.moves, hideDeadHexes, hoverHex, showThreatHighlights, threatTargets])
-  const activeBotSearchOptions = FIXED_WASM_SEARCH_OPTIONS
+  const activeBotSearchOptions = useMemo<BotSearchOptions>(() => {
+    const thinkSeconds = clampValue(botThinkSeconds, BOT_THINK_SECONDS_MIN, BOT_THINK_SECONDS_MAX)
+
+    return {
+      ...LIVE_WASM_SEARCH_OPTIONS,
+      budget: {
+        maxTimeMs: Math.round(thinkSeconds * 1000),
+        maxNodes: Math.max(1, Math.round(thinkSeconds * BOT_NODE_BUDGET_PER_SECOND)),
+      },
+    }
+  }, [botThinkSeconds])
   const liveStatus = useMemo(() => {
     if (replayRecord) {
       return `Replay move ${replayStep}/${replayRecord.moveHistory.length}`
@@ -2853,6 +2864,24 @@ function App() {
                               <div className="button-row">
                                 <div className="compute-meta">Engine: Rust WASM</div>
                               </div>
+                              <div className="button-row">
+                                <label className="compute-control">
+                                  Seconds to think
+                                  <input
+                                    type="number"
+                                    min={BOT_THINK_SECONDS_MIN}
+                                    max={BOT_THINK_SECONDS_MAX}
+                                    step={0.25}
+                                    inputMode="decimal"
+                                    value={botThinkSeconds}
+                                    onChange={(event) =>
+                                      setBotThinkSeconds(
+                                        clampValue(Number(event.target.value) || 0, BOT_THINK_SECONDS_MIN, BOT_THINK_SECONDS_MAX),
+                                      )
+                                    }
+                                  />
+                                </label>
+                              </div>
                               {botBackendNotice ? <div className="compute-meta">{botBackendNotice}</div> : null}
                               <div className="button-row">
                                 <label className="compute-meta">
@@ -2877,7 +2906,10 @@ function App() {
                                 </div>
                               ) : null}
                               <div className="compute-meta">
-                                {`Mode: MCTS | Fixed WASM budget: ${activeBotSearchOptions.budget.maxTimeMs}ms or ${activeBotSearchOptions.budget.maxNodes.toLocaleString()} nodes`}
+                                {`Mode: MCTS | WASM budget: ${botThinkSeconds.toFixed(2)}s or ${activeBotSearchOptions.budget.maxNodes.toLocaleString()} nodes`}
+                              </div>
+                              <div className="compute-meta">
+                                {`Search profile: root target ${activeBotSearchOptions.turnCandidateCount} | child target ${activeBotSearchOptions.childTurnCandidateCount} | rollout cap ${activeBotSearchOptions.maxSimulationTurns} turns`}
                               </div>
                               {lastBotStats ? (
                                 <div className="compute-meta">

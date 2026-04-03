@@ -108,8 +108,6 @@ export type BotSearchOptions = {
   simulationTurnCandidateCount: number
   simulationRadius: number
   simulationTopKFirstMoves: number
-  progressiveWideningBase: number
-  progressiveWideningScale: number
 }
 
 export type BotSearchMode = 'greedy' | 'mcts' | 'beam'
@@ -240,6 +238,4 @@ export const DEFAULT_BOT_SEARCH_OPTIONS: BotSearchOptions = {
   simulationTurnCandidateCount: 4,
   simulationRadius: 3,
   simulationTopKFirstMoves: 2,
-  progressiveWideningBase: 2,
-  progressiveWideningScale: 1.75,
 }
