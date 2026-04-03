@@ -103,15 +103,11 @@ For diagnostics and recovery steps, see `infra/RUNBOOK.md`.
 - `npm run infra:build`
 - `npm run infra:synth`
 - `npm run infra:deploy`
-- `npm run bot:api`
 - `npm run bot:wasm:build`
 
-## Rust/WASM bot backend (preview)
+## Rust/WASM bot backend
 
-The app now supports an additive bot backend path:
-
-- Existing TypeScript bot remains the default.
-- Optional Rust/WebAssembly bot can be selected in the in-app **Bot** panel.
+The app bot engine is Rust compiled to WebAssembly.
 
 Build the Rust/WASM artifacts:
 
@@ -120,19 +116,6 @@ npm run bot:wasm:build
 ```
 
 Generated files are written to `public/wasm-bot/`.
-
-## Stateless bot API (for external bot platforms)
-
-This repo includes a stateless HTTP bot adapter at `bot-api/server.ts`.
-
-- Capabilities: `GET /v1/capabilities.json` (also served at `/capabilities.json`)
-- Primary endpoint: `POST /v1/stateless/v1-alpha/turn`
-- Backward-compatible alias: `POST /v1-alpha/turn`
-- Health: `GET /healthz`
-- Local run: `npm run bot:api`
-- Dockerfile: `bot-api/Dockerfile`
-
-See `bot-api/README.md` for request/response examples.
 
 ## Notes
 

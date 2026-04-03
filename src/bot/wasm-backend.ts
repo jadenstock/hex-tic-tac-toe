@@ -1,11 +1,3 @@
-import type { BotSearchSession } from './search.ts'
-import {
-  chooseBotTurn as chooseBotTurnJs,
-  chooseBotTurnDetailedAsyncWithSession as chooseBotTurnDetailedAsyncWithSessionJs,
-  chooseBotTurnDetailedWithSession as chooseBotTurnDetailedWithSessionJs,
-  createBotSearchSession,
-  chooseGreedyTurn as chooseGreedyTurnJs,
-} from './search.ts'
 import {
   DEFAULT_BOT_SEARCH_OPTIONS,
   DEFAULT_BOT_TUNING,
@@ -19,12 +11,12 @@ import {
   type Player,
 } from './types.ts'
 
-export type BotBackend = 'js' | 'wasm'
+export type BotBackend = 'wasm'
 export type WasmBotRuntimeStatus = 'idle' | 'loading' | 'ready' | 'failed'
 
-const BOT_BACKEND_STORAGE_KEY = 'hex-ttt.bot.backend'
-const WASM_MODULE_URL = '/wasm-bot/hex_ttt_wasm.js'
-const WASM_BINARY_URL = '/wasm-bot/hex_ttt_wasm_bg.wasm'
+export type BotSearchSession = {
+  runs: number
+}
 
 type ProgressOptions = {
   onProgress?: (progress: {
@@ -95,7 +87,9 @@ const STOP_REASONS: ReadonlySet<BotSearchStats['stopReason']> = new Set([
   'deterministic',
 ])
 
-let preferredBotBackend: BotBackend = resolveInitialPreferredBackend()
+const WASM_MODULE_URL = '/wasm-bot/hex_ttt_wasm.js'
+const WASM_BINARY_URL = '/wasm-bot/hex_ttt_wasm_bg.wasm'
+
 let wasmRuntimeStatus: WasmBotRuntimeStatus = 'idle'
 let wasmRuntimeMessage: string | null = null
 let wasmModuleRef: WasmGlueModule | null = null
@@ -112,36 +106,6 @@ function resolvePublicAssetUrl(path: string): string {
   const baseUrl = new URL(base, window.location.href)
   const normalizedPath = path.startsWith('/') ? path.slice(1) : path
   return new URL(normalizedPath, baseUrl).toString()
-}
-
-function readBackendFromEnv(): string {
-  const meta = import.meta as ImportMeta & { env?: Record<string, string | undefined> }
-  const fromVite = meta.env?.VITE_BOT_BACKEND
-  if (typeof fromVite === 'string') return fromVite
-
-  const fromProcess = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env
-    ?.VITE_BOT_BACKEND
-  if (typeof fromProcess === 'string') return fromProcess
-
-  return ''
-}
-
-function resolveInitialPreferredBackend(): BotBackend {
-  const envValue = readBackendFromEnv().trim().toLowerCase()
-  let backend: BotBackend = envValue === 'wasm' ? 'wasm' : 'js'
-
-  if (typeof window !== 'undefined') {
-    try {
-      const stored = window.localStorage.getItem(BOT_BACKEND_STORAGE_KEY)
-      if (stored === 'wasm' || stored === 'js') {
-        backend = stored
-      }
-    } catch {
-      // Ignore storage access errors and keep env/default value.
-    }
-  }
-
-  return backend
 }
 
 function nowMs(): number {
@@ -290,10 +254,6 @@ function buildWasmDecision(
   }
 }
 
-function shouldUseStrictWasmPath(): boolean {
-  return preferredBotBackend === 'wasm'
-}
-
 function createWasmUnavailableError(): Error {
   const runtimeMessage = wasmRuntimeMessage?.trim()
   if (runtimeMessage) return new Error(`WASM backend unavailable: ${runtimeMessage}`)
@@ -347,16 +307,11 @@ async function loadWasmModule(): Promise<WasmGlueModule | null> {
   return wasmLoadPromise
 }
 
-function shouldAttemptWasmBackend(): boolean {
-  return preferredBotBackend === 'wasm' && canUseBrowserWasm()
-}
-
 function tryChooseTurnFromLoadedWasm(
   state: LiveLikeState,
   tuning: BotTuning,
   partialOptions: Partial<BotSearchOptions>,
 ): BotTurnDecision | null {
-  if (!shouldAttemptWasmBackend()) return null
   if (!wasmModuleRef?.choose_turn_json) return null
 
   const options = normalizeSearchOptions(partialOptions)
@@ -387,8 +342,6 @@ async function tryChooseTurnFromWasm(
   tuning: BotTuning,
   partialOptions: Partial<BotSearchOptions>,
 ): Promise<BotTurnDecision | null> {
-  if (!shouldAttemptWasmBackend()) return null
-
   const module = await loadWasmModule()
   if (!module?.choose_turn_json) return null
 
@@ -415,24 +368,20 @@ async function tryChooseTurnFromWasm(
   }
 }
 
-export function getPreferredBotBackend(): BotBackend {
-  return preferredBotBackend
+export function createBotSearchSession(): BotSearchSession {
+  return { runs: 0 }
 }
 
-export function setPreferredBotBackend(backend: BotBackend): void {
-  preferredBotBackend = backend
+export function getPreferredBotBackend(): BotBackend {
+  return 'wasm'
+}
 
-  if (typeof window !== 'undefined') {
-    try {
-      window.localStorage.setItem(BOT_BACKEND_STORAGE_KEY, backend)
-    } catch {
-      // Ignore storage errors.
-    }
-  }
+export function setPreferredBotBackend(_backend: BotBackend): void {
+  // WASM is always enforced.
 }
 
 export function getEffectiveBotBackend(): BotBackend {
-  return preferredBotBackend
+  return 'wasm'
 }
 
 export function getWasmBotRuntimeStatus(): WasmBotRuntimeStatus {
@@ -444,9 +393,6 @@ export function getWasmBotRuntimeMessage(): string | null {
 }
 
 export async function warmupWasmBot(): Promise<boolean> {
-  if (!shouldAttemptWasmBackend()) {
-    return false
-  }
   const module = await loadWasmModule()
   return Boolean(module?.choose_turn_json)
 }
@@ -458,13 +404,11 @@ export function chooseBotTurnDetailedWithSession(
   partialOptions: Partial<BotSearchOptions> = {},
 ): BotTurnDecision {
   const wasmDecision = tryChooseTurnFromLoadedWasm(state, tuning, partialOptions)
-  if (wasmDecision) return wasmDecision
-
-  if (shouldUseStrictWasmPath()) {
+  if (!wasmDecision) {
     throw createWasmUnavailableError()
   }
-
-  return chooseBotTurnDetailedWithSessionJs(state, session, tuning, partialOptions)
+  session.runs += 1
+  return wasmDecision
 }
 
 export function chooseBotTurnDetailed(
@@ -483,22 +427,18 @@ export async function chooseBotTurnDetailedAsyncWithSession(
   progressOptions: ProgressOptions = {},
 ): Promise<BotTurnDecision> {
   const wasmDecision = await tryChooseTurnFromWasm(state, tuning, partialOptions)
-  if (wasmDecision) {
-    progressOptions.onProgress?.({
-      elapsedMs: wasmDecision.stats.elapsedMs,
-      nodesExpanded: wasmDecision.stats.nodesExpanded,
-      playouts: wasmDecision.stats.playouts,
-      boardEvaluations: wasmDecision.stats.boardEvaluations,
-      maxDepthTurns: wasmDecision.stats.maxDepthTurns,
-    })
-    return wasmDecision
-  }
-
-  if (shouldUseStrictWasmPath()) {
+  if (!wasmDecision) {
     throw createWasmUnavailableError()
   }
-
-  return chooseBotTurnDetailedAsyncWithSessionJs(state, session, tuning, partialOptions, progressOptions)
+  session.runs += 1
+  progressOptions.onProgress?.({
+    elapsedMs: wasmDecision.stats.elapsedMs,
+    nodesExpanded: wasmDecision.stats.nodesExpanded,
+    playouts: wasmDecision.stats.playouts,
+    boardEvaluations: wasmDecision.stats.boardEvaluations,
+    maxDepthTurns: wasmDecision.stats.maxDepthTurns,
+  })
+  return wasmDecision
 }
 
 export async function chooseBotTurnDetailedAsync(
@@ -528,17 +468,12 @@ export function chooseBotTurnWithSession(
 }
 
 export function chooseGreedyTurn(state: LiveLikeState, tuning: BotTuning = DEFAULT_BOT_TUNING): Axial[] {
-  if (preferredBotBackend === 'wasm') {
-    const decision = chooseBotTurnDetailed(state, tuning, {
-      budget: {
-        maxTimeMs: 0,
-        maxNodes: 0,
-      },
-    })
-    return decision.moves
-  }
-
-  return chooseGreedyTurnJs(state, tuning)
+  return chooseBotTurnDetailed(state, tuning, {
+    budget: {
+      maxTimeMs: 0,
+      maxNodes: 0,
+    },
+  }).moves
 }
 
 export function chooseBotTurnWithJsFallback(
@@ -546,5 +481,5 @@ export function chooseBotTurnWithJsFallback(
   tuning: BotTuning = DEFAULT_BOT_TUNING,
   partialOptions: Partial<BotSearchOptions> = {},
 ): Axial[] {
-  return chooseBotTurnJs(state, tuning, partialOptions)
+  return chooseBotTurn(state, tuning, partialOptions)
 }

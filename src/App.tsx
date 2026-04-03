@@ -4,23 +4,13 @@ import {
   DEFAULT_BOT_SEARCH_OPTIONS,
   DEFAULT_BOT_TUNING,
   chooseBotTurnDetailedAsyncWithSession,
-  chooseBotTurnDetailedWithSession,
   createBotSearchSession,
-  evaluateBoardState,
-  getEffectiveBotBackend,
-  getPreferredBotBackend,
   getWasmBotRuntimeMessage,
-  getWasmBotRuntimeStatus,
-  inspectBotCandidates,
-  setPreferredBotBackend,
   warmupWasmBot,
-  type BotBackend,
-  type BotCandidateSnapshot,
   type BotSearchStats,
   type BotSearchOptions,
   type BotSearchSession,
   type BotTuning,
-  type EvaluationResult,
 } from './bot/engine'
 
 type Player = 'X' | 'O'
@@ -78,26 +68,6 @@ type ReplayRecord = {
   finalBoard: Record<string, Player>
 }
 
-type TelemetryEvaluationSnapshot = Pick<
-  EvaluationResult,
-  | 'xScore'
-  | 'oScore'
-  | 'objectiveForX'
-  | 'objectiveForO'
-  | 'xOneTurnWins'
-  | 'oOneTurnWins'
-  | 'xThreats'
-  | 'oThreats'
-  | 'xOffense'
-  | 'oOffense'
-  | 'xThreat3DirectionCount'
-  | 'oThreat3DirectionCount'
-  | 'xThreat3BlockerBurden'
-  | 'oThreat3BlockerBurden'
-  | 'xThreat3StructureSeverity'
-  | 'oThreat3StructureSeverity'
->
-
 type BotTelemetryEntry = {
   id: number
   recordedAt: string
@@ -109,13 +79,6 @@ type BotTelemetryEntry = {
     placementsLeft: number
     moveCount: number
   }
-  candidateSummary: {
-    legalCellCount: number
-    topCellCount: number
-    candidateLineCount: number
-    singlePlacementLineCount: number
-    doublePlacementLineCount: number
-  }
   decisionSummary: {
     plannedMoveCount: number
     executedMoveCount: number
@@ -123,8 +86,6 @@ type BotTelemetryEntry = {
   stats: BotSearchStats
   searchOptions: BotSearchOptions
   tuning: BotTuning
-  evaluationBefore: TelemetryEvaluationSnapshot
-  evaluationAfter: TelemetryEvaluationSnapshot | null
 }
 
 type BotTelemetryFile = {
@@ -974,7 +935,7 @@ function buildParticipants(autoBotEnabled: boolean, autoBotSide: 'X' | 'O' | 'bo
       return {
         type: 'bot',
         label: 'Hex Bot',
-        botId: 'local-engine',
+        botId: 'local-wasm-engine',
       }
     }
 
@@ -1103,27 +1064,6 @@ function clampValue(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value))
 }
 
-function summarizeEvaluation(result: EvaluationResult): TelemetryEvaluationSnapshot {
-  return {
-    xScore: result.xScore,
-    oScore: result.oScore,
-    objectiveForX: result.objectiveForX,
-    objectiveForO: result.objectiveForO,
-    xOneTurnWins: result.xOneTurnWins,
-    oOneTurnWins: result.oOneTurnWins,
-    xThreats: [...result.xThreats],
-    oThreats: [...result.oThreats],
-    xOffense: result.xOffense,
-    oOffense: result.oOffense,
-    xThreat3DirectionCount: result.xThreat3DirectionCount,
-    oThreat3DirectionCount: result.oThreat3DirectionCount,
-    xThreat3BlockerBurden: result.xThreat3BlockerBurden,
-    oThreat3BlockerBurden: result.oThreat3BlockerBurden,
-    xThreat3StructureSeverity: result.xThreat3StructureSeverity,
-    oThreat3StructureSeverity: result.oThreat3StructureSeverity,
-  }
-}
-
 function createBotTelemetryDownload(filename: string, payload: BotTelemetryFile): void {
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
   const url = URL.createObjectURL(blob)
@@ -1172,11 +1112,8 @@ function App() {
   })
   const [hideDeadHexes, setHideDeadHexes] = useState(false)
   const [showThreatHighlights, setShowThreatHighlights] = useState(false)
-  const [showPressureMap, setShowPressureMap] = useState(false)
-  const [showBotCandidateCells, setShowBotCandidateCells] = useState(false)
   const [autoBotEnabled, setAutoBotEnabled] = useState(false)
   const [autoBotSide, setAutoBotSide] = useState<'X' | 'O' | 'both'>('both')
-  const [botThinkSeconds, setBotThinkSeconds] = useState(2)
   const [botTuning, setBotTuning] = useState<BotTuning>(DEFAULT_BOT_TUNING)
   const [isBotThinking, setIsBotThinking] = useState(false)
   const [liveBotNodes, setLiveBotNodes] = useState(0)
@@ -1186,7 +1123,6 @@ function App() {
   const [lastBotStats, setLastBotStats] = useState<BotSearchStats | null>(null)
   const [botTelemetryEnabled, setBotTelemetryEnabled] = useState(false)
   const [botTelemetryEntries, setBotTelemetryEntries] = useState<BotTelemetryEntry[]>([])
-  const [botBackend, setBotBackend] = useState<BotBackend>(() => getPreferredBotBackend())
   const [botBackendNotice, setBotBackendNotice] = useState<string | null>(null)
   const [showRulesModal, setShowRulesModal] = useState(false)
   const [dockOpen, setDockOpen] = useState(true)
@@ -1219,21 +1155,19 @@ function App() {
   }, [])
 
   useEffect(() => {
-    if (botBackend !== 'wasm') return
-
     let cancelled = false
     setBotBackendNotice('Loading Rust/WASM runtime…')
 
     void warmupWasmBot().then((ready) => {
       if (cancelled) return
       const runtimeMessage = getWasmBotRuntimeMessage()
-      setBotBackendNotice(ready ? 'Rust/WASM backend ready.' : runtimeMessage ?? 'Rust/WASM unavailable.')
+      setBotBackendNotice(ready ? null : runtimeMessage ?? 'Rust/WASM unavailable.')
     })
 
     return () => {
       cancelled = true
     }
-  }, [botBackend])
+  }, [])
 
   useEffect(() => {
     if (!isReplayMode || !replayGameId) return
@@ -1400,8 +1334,6 @@ function App() {
   const modeLabel = useMemo(() => {
     return mode === 'live' ? 'Game' : 'Sandbox'
   }, [mode])
-  const effectiveBotBackend = getEffectiveBotBackend()
-  const wasmBotRuntimeStatus = getWasmBotRuntimeStatus()
   const currentParticipants = useMemo(() => {
     if (replayRecord) return replayRecord.participants
     if (trackedParticipants) return trackedParticipants
@@ -1414,7 +1346,6 @@ function App() {
     return `${window.location.origin}/games/${currentGameId}`
   }, [currentGameId])
   const hasPlanningAnnotations = planningState.marks.size > 0 || planningState.segments.size > 0
-  const liveEvaluation = useMemo(() => evaluateBoardState(displayState.moves, botTuning), [botTuning, displayState.moves])
   const threatTargets = useMemo(() => {
     if (!showThreatHighlights) {
       return {
@@ -1470,57 +1401,7 @@ function App() {
     if (tags.length === 0) return null
     return `${key}: ${tags.join(' | ')}`
   }, [displayState.moves, hideDeadHexes, hoverHex, showThreatHighlights, threatTargets])
-  const botSearchOptions = useMemo<BotSearchOptions>(() => {
-    if (botThinkSeconds <= 0) {
-      return {
-        ...DEFAULT_BOT_SEARCH_OPTIONS,
-        budget: { maxTimeMs: 0, maxNodes: 0 },
-      }
-    }
-
-    const seconds = Math.max(0.1, Math.min(12, botThinkSeconds))
-    const normalized = seconds / 12
-
-    return {
-      ...DEFAULT_BOT_SEARCH_OPTIONS,
-      budget: {
-        maxTimeMs: Math.round(seconds * 1000),
-        maxNodes: Math.round(50000 + normalized * 750000),
-      },
-      turnCandidateCount: Math.max(12, Math.min(24, 12 + Math.floor(normalized * 12))),
-      childTurnCandidateCount: Math.max(10, Math.min(18, 10 + Math.floor(normalized * 8))),
-      maxSimulationTurns: Math.max(2, Math.min(6, 2 + Math.floor(normalized * 4))),
-      simulationRadius: Math.max(2, Math.min(6, 2 + Math.floor(normalized * 4))),
-      simulationTopKFirstMoves: Math.max(2, Math.min(6, 2 + Math.floor(normalized * 4))),
-    }
-  }, [botThinkSeconds])
-  const activeBotSearchOptions = useMemo<BotSearchOptions>(() => {
-    return botBackend === 'wasm' ? FIXED_WASM_SEARCH_OPTIONS : botSearchOptions
-  }, [botBackend, botSearchOptions])
-  const botCandidateSnapshot = useMemo<BotCandidateSnapshot | null>(() => {
-    if (!showBotCandidateCells) return null
-    if (displayState.winner) return null
-    return inspectBotCandidates(
-      {
-        moves: displayState.moves,
-        moveHistory: displayState.moveHistory,
-        turn: displayState.turn,
-        placementsLeft: displayState.placementsLeft,
-      },
-      botTuning,
-      activeBotSearchOptions,
-    )
-  }, [activeBotSearchOptions, botTuning, displayState.moveHistory, displayState.moves, displayState.placementsLeft, displayState.turn, displayState.winner, showBotCandidateCells])
-  const botLegalCandidateKeys = useMemo(() => {
-    const keys = new Set<string>()
-    for (const cell of botCandidateSnapshot?.legalCells ?? []) keys.add(toKey(cell.q, cell.r))
-    return keys
-  }, [botCandidateSnapshot])
-  const botTopCandidateKeys = useMemo(() => {
-    const keys = new Set<string>()
-    for (const cell of botCandidateSnapshot?.topCells ?? []) keys.add(toKey(cell.q, cell.r))
-    return keys
-  }, [botCandidateSnapshot])
+  const activeBotSearchOptions = FIXED_WASM_SEARCH_OPTIONS
   const liveStatus = useMemo(() => {
     if (replayRecord) {
       return `Replay move ${replayStep}/${replayRecord.moveHistory.length}`
@@ -1841,72 +1722,37 @@ function App() {
     setLiveBotElapsedMs(0)
 
     try {
-      const candidateSnapshot = botTelemetryEnabled
-        ? inspectBotCandidates(
-            {
-              moves: sourceState.moves,
-              moveHistory: sourceState.moveHistory,
-              turn: sourceState.turn,
-              placementsLeft: sourceState.placementsLeft,
-            },
-            botTuning,
-            activeBotSearchOptions,
-          )
-        : null
-      const evaluationBefore = botTelemetryEnabled ? summarizeEvaluation(evaluateBoardState(sourceState.moves, botTuning)) : null
-
       await new Promise<void>((resolve) => window.setTimeout(resolve, 0))
-      const shouldUseAsyncSearch =
-        botBackend === 'wasm' ||
-        (activeBotSearchOptions.budget.maxTimeMs > 0 && activeBotSearchOptions.budget.maxNodes > 0)
-      const decision =
-        shouldUseAsyncSearch
-          ? await chooseBotTurnDetailedAsyncWithSession(
-              {
-                moves: sourceState.moves,
-                moveHistory: sourceState.moveHistory,
-                turn: sourceState.turn,
-                placementsLeft: sourceState.placementsLeft,
-              },
-              botSearchSessionRef.current,
-              botTuning,
-              activeBotSearchOptions,
-              {
-                yieldEveryMs: 16,
-                onProgress: (progress) => {
-                  setLiveBotNodes(progress.nodesExpanded)
-                  setLiveBotPlayouts(progress.playouts)
-                  setLiveBotBoardEvals(progress.boardEvaluations)
-                  setLiveBotElapsedMs(progress.elapsedMs)
-                },
-              },
-            )
-          : chooseBotTurnDetailedWithSession(
-              {
-                moves: sourceState.moves,
-                moveHistory: sourceState.moveHistory,
-                turn: sourceState.turn,
-                placementsLeft: sourceState.placementsLeft,
-              },
-              botSearchSessionRef.current,
-              botTuning,
-              activeBotSearchOptions,
-            )
+      const decision = await chooseBotTurnDetailedAsyncWithSession(
+        {
+          moves: sourceState.moves,
+          moveHistory: sourceState.moveHistory,
+          turn: sourceState.turn,
+          placementsLeft: sourceState.placementsLeft,
+        },
+        botSearchSessionRef.current,
+        botTuning,
+        activeBotSearchOptions,
+        {
+          yieldEveryMs: 16,
+          onProgress: (progress) => {
+            setLiveBotNodes(progress.nodesExpanded)
+            setLiveBotPlayouts(progress.playouts)
+            setLiveBotBoardEvals(progress.boardEvaluations)
+            setLiveBotElapsedMs(progress.elapsedMs)
+          },
+        },
+      )
 
       setLastBotStats(decision.stats)
       const plannedMoves = decision.moves
-      if (botTelemetryEnabled && candidateSnapshot && evaluationBefore) {
-        const nextMoves = new Map(sourceState.moves)
+      if (botTelemetryEnabled) {
         let executedMoveCount = 0
         for (const move of plannedMoves) {
           if (executedMoveCount >= sourceState.placementsLeft) break
-          const key = toKey(move.q, move.r)
-          if (nextMoves.has(key)) continue
-          nextMoves.set(key, sourceState.turn)
+          if (sourceState.moves.has(toKey(move.q, move.r))) continue
           executedMoveCount += 1
         }
-        const singlePlacementLineCount = candidateSnapshot.candidateLines.filter((line) => line.length === 1).length
-        const doublePlacementLineCount = candidateSnapshot.candidateLines.filter((line) => line.length >= 2).length
 
         setBotTelemetryEntries((prev) => [
           ...prev,
@@ -1921,13 +1767,6 @@ function App() {
               placementsLeft: sourceState.placementsLeft,
               moveCount: sourceState.moveHistory.length,
             },
-            candidateSummary: {
-              legalCellCount: candidateSnapshot.legalCells.length,
-              topCellCount: candidateSnapshot.topCells.length,
-              candidateLineCount: candidateSnapshot.candidateLines.length,
-              singlePlacementLineCount,
-              doublePlacementLineCount,
-            },
             decisionSummary: {
               plannedMoveCount: plannedMoves.length,
               executedMoveCount,
@@ -1935,8 +1774,6 @@ function App() {
             stats: JSON.parse(JSON.stringify(decision.stats)) as BotSearchStats,
             searchOptions: JSON.parse(JSON.stringify(activeBotSearchOptions)) as BotSearchOptions,
             tuning: JSON.parse(JSON.stringify(botTuning)) as BotTuning,
-            evaluationBefore,
-            evaluationAfter: executedMoveCount > 0 ? summarizeEvaluation(evaluateBoardState(nextMoves, botTuning)) : null,
           },
         ])
       }
@@ -1972,16 +1809,13 @@ function App() {
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : 'Bot turn failed.'
       setNetworkError(message)
-      if (botBackend === 'wasm') {
-        const runtimeMessage = getWasmBotRuntimeMessage()
-        setBotBackendNotice(runtimeMessage ?? message)
-      }
+      const runtimeMessage = getWasmBotRuntimeMessage()
+      setBotBackendNotice(runtimeMessage ?? message)
     } finally {
       setIsBotThinking(false)
     }
   }, [
     activeBotSearchOptions,
-    botBackend,
     botTelemetryEnabled,
     botTuning,
     isBotThinking,
@@ -1991,22 +1825,6 @@ function App() {
     mode,
     trackedGameId,
   ])
-
-  const handleBotBackendChange = useCallback((nextBackend: BotBackend) => {
-    setPreferredBotBackend(nextBackend)
-    setBotBackend(nextBackend)
-
-    if (nextBackend !== 'wasm') {
-      setBotBackendNotice('Using TypeScript bot backend.')
-      return
-    }
-
-    setBotBackendNotice('Loading Rust/WASM runtime…')
-    void warmupWasmBot().then((ready) => {
-      const runtimeMessage = getWasmBotRuntimeMessage()
-      setBotBackendNotice(ready ? 'Rust/WASM backend ready.' : runtimeMessage ?? 'Rust/WASM unavailable.')
-    })
-  }, [])
 
   const setThreatWeight = (idx: number, value: number) => {
     setBotTuning((prev) => {
@@ -2166,7 +1984,6 @@ function App() {
 
       for (let q = qMin; q <= qMax; q += 1) {
         const key = toKey(q, r)
-        const occupied = displayState.moves.has(key)
         const deadCell = cachedIsDead(q, r)
         const hiddenDeadCell = hideDeadHexes && deadCell
         if (hiddenDeadCell) {
@@ -2191,38 +2008,6 @@ function App() {
 
         ctx.fillStyle = fillGrid
         ctx.fill()
-        if (showBotCandidateCells && !occupied) {
-          const isLegalCandidate = botLegalCandidateKeys.has(key)
-          const isTopCandidate = botTopCandidateKeys.has(key)
-          if (isLegalCandidate || isTopCandidate) {
-            ctx.save()
-            ctx.globalAlpha = isTopCandidate ? 0.22 : 0.1
-            ctx.fillStyle = displayState.turn === 'X' ? theme.xFill : theme.oFill
-            ctx.fill()
-            if (isTopCandidate) {
-              ctx.globalAlpha = 1
-              ctx.strokeStyle = displayState.turn === 'X' ? theme.xColor : theme.oColor
-              ctx.lineWidth = 2
-              ctx.stroke()
-            }
-            ctx.restore()
-          }
-        }
-        if (showPressureMap && !occupied) {
-          const xPressure = liveEvaluation.xPressureMap.get(key) ?? 0
-          const oPressure = liveEvaluation.oPressureMap.get(key) ?? 0
-          const xNorm = liveEvaluation.xPressureMax > 0 ? xPressure / liveEvaluation.xPressureMax : 0
-          const oNorm = liveEvaluation.oPressureMax > 0 ? oPressure / liveEvaluation.oPressureMax : 0
-          const net = xNorm - oNorm
-          const intensity = Math.max(0, Math.min(1, Math.abs(net)))
-          if (intensity > 0.025) {
-            ctx.save()
-            ctx.globalAlpha = 0.12 + 0.36 * intensity
-            ctx.fillStyle = net >= 0 ? theme.xFill : theme.oFill
-            ctx.fill()
-            ctx.restore()
-          }
-        }
         ctx.strokeStyle = strokeGrid
         ctx.lineWidth = 1
         ctx.stroke()
@@ -2516,21 +2301,13 @@ function App() {
     displayState.winner,
     hoverHex,
     mode,
-    liveEvaluation.oPressureMap,
-    liveEvaluation.oPressureMax,
-    liveEvaluation.xPressureMap,
-    liveEvaluation.xPressureMax,
     size.height,
     size.width,
     highlightedKeys,
-    botLegalCandidateKeys,
-    botTopCandidateKeys,
     hideDeadHexes,
     moveNumberByKey,
     pieceStyle,
-    showBotCandidateCells,
     showMoveNumbers,
-    showPressureMap,
     showThreatHighlights,
     threatTargets,
     theme,
@@ -3067,30 +2844,6 @@ function App() {
                                 {`Bot will place ${displayState.placementsLeft} mark${displayState.placementsLeft === 1 ? '' : 's'} from ${mode}`}
                               </div>
                             </div>
-                            <div className="bot-metrics">
-                              <div className="stat">
-                                <span>X Threats</span>
-                                <strong className="threat-line-x">
-                                  1:{liveEvaluation.xThreats[1]} 2:{liveEvaluation.xThreats[2]} 3:{liveEvaluation.xThreats[3]} 4:
-                                  {liveEvaluation.xThreats[4]} 5:{liveEvaluation.xThreats[5]}
-                                </strong>
-                              </div>
-                              <div className="stat">
-                                <span>O Threats</span>
-                                <strong className="threat-line-o">
-                                  1:{liveEvaluation.oThreats[1]} 2:{liveEvaluation.oThreats[2]} 3:{liveEvaluation.oThreats[3]} 4:
-                                  {liveEvaluation.oThreats[4]} 5:{liveEvaluation.oThreats[5]}
-                                </strong>
-                              </div>
-                              <div className="stat">
-                                <span>X One-turn wins</span>
-                                <strong>{liveEvaluation.xOneTurnWins}</strong>
-                              </div>
-                              <div className="stat">
-                                <span>O One-turn wins</span>
-                                <strong>{liveEvaluation.oOneTurnWins}</strong>
-                              </div>
-                            </div>
                             <div className="button-row">
                               <button onClick={() => void runBotTurn()} type="button" disabled={!!displayState.winner || isBotThinking}>
                                 {isBotThinking ? 'Bot thinking…' : `Play bot turn (${displayState.turn})`}
@@ -3098,16 +2851,7 @@ function App() {
                             </div>
                             <div className="compute-panel">
                               <div className="button-row">
-                                <label className="play-as">
-                                  Bot backend
-                                  <select value={botBackend} onChange={(event) => handleBotBackendChange(event.target.value as BotBackend)}>
-                                    <option value="js">TypeScript (current)</option>
-                                    <option value="wasm">Rust WASM (preview)</option>
-                                  </select>
-                                </label>
-                                <div className="compute-meta">
-                                  Active: {effectiveBotBackend === 'wasm' ? 'Rust WASM' : 'TypeScript'} | WASM runtime {wasmBotRuntimeStatus}
-                                </div>
+                                <div className="compute-meta">Engine: Rust WASM</div>
                               </div>
                               {botBackendNotice ? <div className="compute-meta">{botBackendNotice}</div> : null}
                               <div className="button-row">
@@ -3129,31 +2873,11 @@ function App() {
                               </div>
                               {botTelemetryEnabled ? (
                                 <div className="compute-meta">
-                                  Each bot run logs the pre-move state, candidate snapshot, search stats, and post-move evaluation into an in-memory JSON log.
+                                  Each bot run logs the pre-move state, chosen moves, search stats, and selected tuning into an in-memory JSON log.
                                 </div>
                               ) : null}
-                              <label className="compute-label" htmlFor="bot-compute-slider">
-                                {botBackend === 'wasm'
-                                  ? 'Search time limit: fixed at 2.0s (WASM)'
-                                  : `Search time limit: ${botThinkSeconds.toFixed(1)}s`}
-                                <HintPill text="0.0s uses greedy only. Higher values run budgeted MCTS with guided (non-random) simulation and larger node caps." />
-                              </label>
-                              <input
-                                id="bot-compute-slider"
-                                type="range"
-                                min={0}
-                                max={12}
-                                step={0.1}
-                                value={botThinkSeconds}
-                                disabled={botBackend === 'wasm'}
-                                onChange={(event) => setBotThinkSeconds(Math.max(0, Math.min(12, Number(event.target.value) || 0)))}
-                              />
                               <div className="compute-meta">
-                                {botBackend === 'wasm'
-                                  ? `Mode: MCTS | Fixed WASM budget: ${activeBotSearchOptions.budget.maxTimeMs}ms or ${activeBotSearchOptions.budget.maxNodes.toLocaleString()} nodes`
-                                  : botThinkSeconds <= 0
-                                  ? 'Mode: Greedy (no search)'
-                                  : `Mode: MCTS | Budget: ${activeBotSearchOptions.budget.maxTimeMs}ms or ${activeBotSearchOptions.budget.maxNodes.toLocaleString()} nodes`}
+                                {`Mode: MCTS | Fixed WASM budget: ${activeBotSearchOptions.budget.maxTimeMs}ms or ${activeBotSearchOptions.budget.maxNodes.toLocaleString()} nodes`}
                               </div>
                               {lastBotStats ? (
                                 <div className="compute-meta">
@@ -3206,24 +2930,6 @@ function App() {
                                   ) : null}
                                 </>
                               ) : null}
-                              <div className="button-row">
-                                <label className="play-as">
-                                  Show pressure map
-                                  <input
-                                    type="checkbox"
-                                    checked={showPressureMap}
-                                    onChange={(event) => setShowPressureMap(event.target.checked)}
-                                  />
-                                </label>
-                                <label className="play-as">
-                                  Show bot candidates
-                                  <input
-                                    type="checkbox"
-                                    checked={showBotCandidateCells}
-                                    onChange={(event) => setShowBotCandidateCells(event.target.checked)}
-                                  />
-                                </label>
-                              </div>
                               {isBotThinking ? (
                                 <div className="compute-meta">
                                   Thinking now: {(liveBotElapsedMs / 1000).toFixed(2)}s | board evals {liveBotBoardEvals.toLocaleString()} | nodes{' '}
@@ -3232,7 +2938,7 @@ function App() {
                               ) : null}
                             </div>
                             <details className="tuning-panel">
-                              <summary>Advanced tuning (window pressure model)</summary>
+                              <summary>Advanced tuning (WASM)</summary>
                               <div className="tuning-grid">
                                 <label>
                                   <span className="tuning-label-text">
@@ -3451,11 +3157,6 @@ function App() {
                           Arena
                         </button>
                       </div>
-                      {showBotCandidateCells ? (
-                        <div className="drag-readout">
-                          {`Bot candidates: ${botLegalCandidateKeys.size} legal, ${botTopCandidateKeys.size} top-K`}
-                        </div>
-                      ) : null}
                       {hoverTrainingLabel ? <div className="drag-readout">{hoverTrainingLabel}</div> : null}
                     </div>
                   </section>
