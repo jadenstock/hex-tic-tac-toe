@@ -1,5 +1,6 @@
 export type {
   Axial,
+  BotPositionEvaluation,
   BotSearchMode,
   BotSearchOptions,
   BotSearchStats,
@@ -20,6 +21,7 @@ export {
   chooseBotTurnDetailedWithSession,
   chooseBotTurnWithSession,
   chooseGreedyTurn,
+  evaluateBotPosition,
   getEffectiveBotBackend,
   getPreferredBotBackend,
   getWasmBotRuntimeMessage,

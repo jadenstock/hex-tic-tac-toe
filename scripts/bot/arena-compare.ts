@@ -76,6 +76,18 @@ const DEFAULT_SEARCH_OPTIONS: Pick<
   | 'explorationC'
   | 'turnCandidateCount'
   | 'childTurnCandidateCount'
+  | 'rootWideningBase'
+  | 'rootWideningAlpha'
+  | 'rootWideningMultiplier'
+  | 'childWideningBase'
+  | 'childWideningAlpha'
+  | 'childWideningMultiplier'
+  | 'muFpuEnabled'
+  | 'quiescenceEnabled'
+  | 'quiescenceMaxExtraTurns'
+  | 'useStaticLeafEval'
+  | 'transpositionsEnabled'
+  | 'forcingSolverEnabled'
   | 'maxSimulationTurns'
   | 'simulationTurnCandidateCount'
   | 'simulationRadius'
@@ -84,6 +96,18 @@ const DEFAULT_SEARCH_OPTIONS: Pick<
   explorationC: 1.15,
   turnCandidateCount: 24,
   childTurnCandidateCount: 18,
+  rootWideningBase: 4,
+  rootWideningAlpha: 0.5,
+  rootWideningMultiplier: 1.5,
+  childWideningBase: 3,
+  childWideningAlpha: 0.5,
+  childWideningMultiplier: 1.25,
+  muFpuEnabled: true,
+  quiescenceEnabled: true,
+  quiescenceMaxExtraTurns: 2,
+  useStaticLeafEval: true,
+  transpositionsEnabled: false,
+  forcingSolverEnabled: true,
   maxSimulationTurns: 4,
   simulationTurnCandidateCount: 8,
   simulationRadius: 6,
@@ -97,6 +121,10 @@ const SEARCH_PROFILES = {
       maxNodes: 175000,
     },
     ...DEFAULT_SEARCH_OPTIONS,
+    turnCandidateCount: 48,
+    childTurnCandidateCount: 18,
+    quiescenceMaxExtraTurns: 4,
+    transpositionsEnabled: true,
     maxSimulationTurns: 4,
   },
   'previous-live': {
@@ -412,6 +440,18 @@ function chooseMoves(bot: BotModule, state: LiveState, options: BotSearchOptions
       exploration_c: options.explorationC,
       turn_candidate_count: options.turnCandidateCount,
       child_turn_candidate_count: options.childTurnCandidateCount,
+      root_widening_base: options.rootWideningBase,
+      root_widening_alpha: options.rootWideningAlpha,
+      root_widening_multiplier: options.rootWideningMultiplier,
+      child_widening_base: options.childWideningBase,
+      child_widening_alpha: options.childWideningAlpha,
+      child_widening_multiplier: options.childWideningMultiplier,
+      mu_fpu_enabled: options.muFpuEnabled,
+      quiescence_enabled: options.quiescenceEnabled,
+      quiescence_max_extra_turns: options.quiescenceMaxExtraTurns,
+      use_static_leaf_eval: options.useStaticLeafEval,
+      transpositions_enabled: options.transpositionsEnabled,
+      forcing_solver_enabled: options.forcingSolverEnabled,
       max_simulation_turns: options.maxSimulationTurns,
       simulation_turn_candidate_count: options.simulationTurnCandidateCount,
       simulation_radius: options.simulationRadius,

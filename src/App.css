@@ -612,6 +612,65 @@
   font-size: 0.82rem;
 }
 
+.eval-trace-card {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #ffffff;
+  padding: 10px;
+  display: grid;
+  gap: 8px;
+}
+
+.eval-trace-chart {
+  width: 100%;
+  overflow: hidden;
+}
+
+.eval-trace-chart svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.eval-trace-zero,
+.eval-trace-active-line {
+  stroke: color-mix(in oklab, var(--line), var(--ink-soft) 18%);
+  stroke-width: 1;
+}
+
+.eval-trace-active-line {
+  stroke-dasharray: 5 5;
+}
+
+.eval-trace-line {
+  fill: none;
+  stroke-width: 3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.eval-trace-line.is-x {
+  stroke: var(--x-color);
+}
+
+.eval-trace-line.is-o {
+  stroke: var(--o-color);
+}
+
+.eval-trace-line.is-accent {
+  stroke: var(--accent);
+}
+
+.eval-trace-point {
+  fill: color-mix(in oklab, var(--panel), var(--ink) 22%);
+}
+
+.eval-trace-current-point {
+  fill: var(--panel);
+  stroke: var(--accent);
+  stroke-width: 2.5;
+}
+
 .tuning-panel {
   border: 1px solid var(--line);
   border-radius: 10px;
@@ -721,6 +780,7 @@
 .app-shell.theme-dark .play-as select,
 .app-shell.theme-dark .auto-bot-group,
 .app-shell.theme-dark .compute-panel,
+.app-shell.theme-dark .eval-trace-card,
 .app-shell.theme-dark .tuning-panel,
 .app-shell.theme-dark .hint-pill {
   background: color-mix(in oklab, var(--panel), black 20%);

@@ -61,6 +61,19 @@ export type EvaluationResult = {
   oWillWinNextTurn: boolean
 }
 
+export type BotPositionEvaluation = {
+  xScore: number
+  oScore: number
+  xNextTurnFinishGroups: number
+  oNextTurnFinishGroups: number
+  xNextTurnBlockersRequired: number
+  oNextTurnBlockersRequired: number
+  xForcedNextTurn: boolean
+  oForcedNextTurn: boolean
+  objectiveForX: number
+  objectiveForO: number
+}
+
 export const WIN_LENGTH = 6
 export const WIN_DIRECTIONS: Array<[number, number]> = [
   [1, 0],
@@ -106,10 +119,36 @@ export type BotSearchOptions = {
   explorationC: number
   turnCandidateCount: number
   childTurnCandidateCount: number
+  rootWideningBase: number
+  rootWideningAlpha: number
+  rootWideningMultiplier: number
+  childWideningBase: number
+  childWideningAlpha: number
+  childWideningMultiplier: number
+  muFpuEnabled: boolean
+  quiescenceEnabled: boolean
+  quiescenceMaxExtraTurns: number
+  useStaticLeafEval: boolean
+  transpositionsEnabled: boolean
+  forcingSolverEnabled: boolean
   maxSimulationTurns: number
   simulationTurnCandidateCount: number
   simulationRadius: number
   simulationTopKFirstMoves: number
+}
+
+export type BotSearchTelemetry = {
+  rootPriorTopShare: number
+  rootBestVisitShare: number
+  wideningUnlockCount: number
+  muFpuSelectionCount: number
+  quiescenceCallCount: number
+  quiescenceExtensionCount: number
+  transpositionHits: number
+  transpositionMisses: number
+  transpositionStores: number
+  transpositionReuses: number
+  transpositionTableSize: number
 }
 
 export type BotSearchMode = 'greedy' | 'mcts' | 'beam'
@@ -197,6 +236,7 @@ export type BotSearchStats = {
   stopReason: 'budget_zero' | 'time' | 'nodes' | 'terminal' | 'no_candidates' | 'fallback' | 'early_win' | 'single_candidate' | 'deterministic'
   session?: BotSearchSessionStats
   debug?: BotSearchDebugStats
+  telemetry?: BotSearchTelemetry
   predictedOpponentReply?: Axial[]
   postMoveCount?: number
 }
@@ -238,6 +278,18 @@ export const DEFAULT_BOT_SEARCH_OPTIONS: BotSearchOptions = {
   explorationC: 1.15,
   turnCandidateCount: 8,
   childTurnCandidateCount: 8,
+  rootWideningBase: 4,
+  rootWideningAlpha: 0.5,
+  rootWideningMultiplier: 1.5,
+  childWideningBase: 3,
+  childWideningAlpha: 0.5,
+  childWideningMultiplier: 1.25,
+  muFpuEnabled: true,
+  quiescenceEnabled: true,
+  quiescenceMaxExtraTurns: 2,
+  useStaticLeafEval: true,
+  transpositionsEnabled: false,
+  forcingSolverEnabled: true,
   maxSimulationTurns: 3,
   simulationTurnCandidateCount: 4,
   simulationRadius: 3,

@@ -91,13 +91,11 @@ struct RankedLine {
 }
 
 #[derive(Clone, Debug)]
-struct ResidualRankedLine {
+struct MctsAction {
     line: Vec<Coord>,
-    objective: f64,
-    own_score: f64,
-    immediate_win: bool,
-    initial_rank: usize,
-    residual_objective: f64,
+    prior: f64,
+    heuristic_value: f64,
+    child_idx: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -126,6 +124,18 @@ struct EngineParams {
     turn_candidate_count: usize,
     child_turn_candidate_count: usize,
     exploration_c: f64,
+    root_widening_base: usize,
+    root_widening_alpha: f64,
+    root_widening_multiplier: f64,
+    child_widening_base: usize,
+    child_widening_alpha: f64,
+    child_widening_multiplier: f64,
+    mu_fpu_enabled: bool,
+    quiescence_enabled: bool,
+    quiescence_max_extra_turns: u32,
+    use_static_leaf_eval: bool,
+    transpositions_enabled: bool,
+    forcing_solver_enabled: bool,
     max_simulation_turns: usize,
     simulation_turn_candidate_count: usize,
     simulation_radius: i32,
@@ -136,6 +146,21 @@ struct EngineParams {
 struct EngineStats {
     nodes_expanded: u32,
     board_evaluations: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+struct SearchTelemetry {
+    root_prior_top_share: f64,
+    root_best_visit_share: f64,
+    widening_unlock_count: u32,
+    mu_fpu_selection_count: u32,
+    quiescence_call_count: u32,
+    quiescence_extension_count: u32,
+    transposition_hits: u32,
+    transposition_misses: u32,
+    transposition_stores: u32,
+    transposition_reuses: u32,
+    transposition_table_size: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,6 +175,18 @@ struct SearchOptionsInput {
     exploration_c: Option<f64>,
     turn_candidate_count: Option<usize>,
     child_turn_candidate_count: Option<usize>,
+    root_widening_base: Option<usize>,
+    root_widening_alpha: Option<f64>,
+    root_widening_multiplier: Option<f64>,
+    child_widening_base: Option<usize>,
+    child_widening_alpha: Option<f64>,
+    child_widening_multiplier: Option<f64>,
+    mu_fpu_enabled: Option<bool>,
+    quiescence_enabled: Option<bool>,
+    quiescence_max_extra_turns: Option<u32>,
+    use_static_leaf_eval: Option<bool>,
+    transpositions_enabled: Option<bool>,
+    forcing_solver_enabled: Option<bool>,
     max_simulation_turns: Option<usize>,
     simulation_turn_candidate_count: Option<usize>,
     simulation_radius: Option<i32>,
@@ -217,6 +254,7 @@ struct ChooseTurnResponse {
     forcing_cache_misses: u32,
     forcing_elapsed_ms: u32,
     forcing_root_candidates: u32,
+    telemetry: SearchTelemetry,
 }
 
 #[derive(Debug, Serialize)]
@@ -263,14 +301,29 @@ struct ThreatProfile {
 #[derive(Clone, Debug)]
 struct MctsNode {
     parent: Option<usize>,
+    signature: String,
     action_from_parent: Vec<Coord>,
     player_to_move: Player,
     depth_turns: u32,
     children: Vec<usize>,
-    unexpanded_actions: Option<Vec<Vec<Coord>>>,
+    actions: Option<Vec<MctsAction>>,
+    widened_action_count: usize,
     visits: u32,
     total_value: f64,
+    static_value: Option<f64>,
     terminal_winner: Option<Player>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TranspositionEntry {
+    visits: u32,
+    total_value: f64,
+}
+
+#[derive(Debug, Default)]
+struct MctsSearchContext {
+    transpositions: HashMap<String, TranspositionEntry>,
+    telemetry: SearchTelemetry,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -460,6 +513,52 @@ fn normalize_params(tuning: &BotTuningInput, search_options: Option<&SearchOptio
         .unwrap_or(1.15)
         .max(0.0);
 
+    let root_widening_base = search_options
+        .root_widening_base
+        .unwrap_or(4)
+        .max(1)
+        .min(64);
+
+    let root_widening_alpha = search_options
+        .root_widening_alpha
+        .unwrap_or(0.5)
+        .max(0.0)
+        .min(1.5);
+
+    let root_widening_multiplier = search_options
+        .root_widening_multiplier
+        .unwrap_or(1.5)
+        .max(0.0)
+        .min(16.0);
+
+    let child_widening_base = search_options
+        .child_widening_base
+        .unwrap_or(3)
+        .max(1)
+        .min(64);
+
+    let child_widening_alpha = search_options
+        .child_widening_alpha
+        .unwrap_or(0.5)
+        .max(0.0)
+        .min(1.5);
+
+    let child_widening_multiplier = search_options
+        .child_widening_multiplier
+        .unwrap_or(1.25)
+        .max(0.0)
+        .min(16.0);
+
+    let mu_fpu_enabled = search_options.mu_fpu_enabled.unwrap_or(true);
+    let quiescence_enabled = search_options.quiescence_enabled.unwrap_or(true);
+    let quiescence_max_extra_turns = search_options
+        .quiescence_max_extra_turns
+        .unwrap_or(2)
+        .min(8);
+    let use_static_leaf_eval = search_options.use_static_leaf_eval.unwrap_or(true);
+    let transpositions_enabled = search_options.transpositions_enabled.unwrap_or(false);
+    let forcing_solver_enabled = search_options.forcing_solver_enabled.unwrap_or(true);
+
     let max_simulation_turns = search_options
         .max_simulation_turns
         .unwrap_or(3)
@@ -503,6 +602,18 @@ fn normalize_params(tuning: &BotTuningInput, search_options: Option<&SearchOptio
         turn_candidate_count,
         child_turn_candidate_count,
         exploration_c,
+        root_widening_base,
+        root_widening_alpha,
+        root_widening_multiplier,
+        child_widening_base,
+        child_widening_alpha,
+        child_widening_multiplier,
+        mu_fpu_enabled,
+        quiescence_enabled,
+        quiescence_max_extra_turns,
+        use_static_leaf_eval,
+        transpositions_enabled,
+        forcing_solver_enabled,
         max_simulation_turns,
         simulation_turn_candidate_count,
         simulation_radius,
@@ -1699,6 +1810,67 @@ fn sort_ranked_lines(lines: &mut [RankedLine]) {
     });
 }
 
+fn heuristic_value_from_ranked_line(line: &RankedLine) -> f64 {
+    if line.immediate_win {
+        return 1.0;
+    }
+
+    if line.objective.is_finite() {
+        line.objective.clamp(-1.0, 1.0)
+    } else if line.objective.is_sign_positive() {
+        1.0
+    } else {
+        -1.0
+    }
+}
+
+fn build_mcts_actions(lines: Vec<RankedLine>) -> Vec<MctsAction> {
+    if lines.is_empty() {
+        return Vec::new();
+    }
+
+    let logits: Vec<f64> = lines
+        .iter()
+        .map(|line| {
+            let heuristic = heuristic_value_from_ranked_line(line);
+            let defensive_bonus = if line.opp_one_turn_wins == 0 { 0.15 } else { 0.0 };
+            let own_score_bias = (line.own_score - 0.5).clamp(-0.25, 0.25);
+            heuristic * 3.0 + defensive_bonus + own_score_bias
+        })
+        .collect();
+
+    let max_logit = logits
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    let weights: Vec<f64> = logits
+        .iter()
+        .map(|logit| (logit - max_logit).exp())
+        .collect();
+
+    let weight_sum: f64 = weights.iter().sum();
+    let fallback_prior = 1.0 / lines.len() as f64;
+
+    lines
+        .into_iter()
+        .zip(weights)
+        .map(|(line, weight)| {
+            let heuristic_value = heuristic_value_from_ranked_line(&line);
+            MctsAction {
+                line: line.line,
+                prior: if weight_sum > 0.0 {
+                    weight / weight_sum
+                } else {
+                    fallback_prior
+                },
+                heuristic_value,
+                child_idx: None,
+            }
+        })
+        .collect()
+}
+
 fn prune_defensively_critical_lines(lines: Vec<RankedLine>, baseline_opp_wins: usize) -> Vec<RankedLine> {
     if baseline_opp_wins == 0 {
         return lines;
@@ -1983,7 +2155,7 @@ fn enumerate_turn_candidates(
 
 fn root_candidate_line_limit(params: &EngineParams) -> usize {
     let requested = params.turn_candidate_count.max(1);
-    requested.max(4).min(32)
+    requested.max(4).min(48)
 }
 
 fn root_search_policy(params: &EngineParams) -> CandidatePolicy {
@@ -2001,123 +2173,6 @@ fn child_search_policy(params: &EngineParams) -> CandidatePolicy {
         top_cell_count: widened_top_cell_count(params.top_k_first_moves, params.child_turn_candidate_count, 2),
         max_line_count: params.child_turn_candidate_count.min(20).max(6),
     }
-}
-
-fn choose_best_deterministic_reply(
-    board: &BoardState,
-    params: &EngineParams,
-    stats: &mut EngineStats,
-) -> (Option<Vec<Coord>>, f64) {
-    let reply_player = board.turn;
-
-    if board.placements_left == 0 {
-        let eval = evaluate_board_summary(board, params, stats);
-        return (None, objective_for_player(&eval, reply_player, params));
-    }
-
-    let reply_limit = params.child_turn_candidate_count.max(3).min(6);
-    let mut reply_policy = child_search_policy(params);
-    reply_policy.top_cell_count = widened_top_cell_count(params.top_k_first_moves, reply_limit, 2);
-
-    let reply_lines = enumerate_turn_candidates(board, reply_player, params, reply_policy, stats);
-    if reply_lines.is_empty() {
-        let eval = evaluate_board_summary(board, params, stats);
-        return (None, objective_for_player(&eval, reply_player, params));
-    }
-
-    let mut best_line = None;
-    let mut best_objective = f64::NEG_INFINITY;
-    let mut best_own = f64::NEG_INFINITY;
-
-    for candidate in reply_lines {
-        let (after_reply, _, winner) = apply_turn_line(board, &candidate.line, reply_player);
-        let eval = evaluate_board_summary(&after_reply, params, stats);
-
-        let objective = if winner == Some(reply_player) {
-            f64::INFINITY
-        } else {
-            objective_for_player(&eval, reply_player, params)
-        };
-
-        let own_score = score_for_player(&eval, reply_player);
-
-        if objective > best_objective || (objective == best_objective && own_score > best_own) {
-            best_line = Some(candidate.line.clone());
-            best_objective = objective;
-            best_own = own_score;
-        }
-    }
-
-    (best_line, best_objective)
-}
-
-fn choose_deterministic_root_decision(
-    board: &BoardState,
-    params: &EngineParams,
-    stats: &mut EngineStats,
-) -> (Vec<Coord>, usize, &'static str) {
-    let root_player = board.turn;
-    let policy = root_search_policy(params);
-    let root_lines = enumerate_turn_candidates(board, root_player, params, policy, stats);
-
-    if root_lines.is_empty() {
-        return (Vec::new(), 0, "no_candidates");
-    }
-
-    if root_lines.len() == 1 {
-        return (root_lines[0].line.clone(), 1, "single_candidate");
-    }
-
-    let mut residual = Vec::new();
-
-    for (idx, ranked) in root_lines.iter().enumerate() {
-        let (after_root, _, root_winner) = apply_turn_line(board, &ranked.line, root_player);
-
-        let mut residual_objective = ranked.objective;
-
-        if root_winner != Some(root_player) {
-            let (reply_line, _) = choose_best_deterministic_reply(&after_root, params, stats);
-            if let Some(reply) = reply_line {
-                let (after_reply, _, reply_winner) = apply_turn_line(&after_root, &reply, after_root.turn);
-                let eval = evaluate_board_summary(&after_reply, params, stats);
-                residual_objective = if reply_winner == Some(root_player) {
-                    f64::INFINITY
-                } else if reply_winner.is_some() {
-                    f64::NEG_INFINITY
-                } else {
-                    objective_for_player(&eval, root_player, params)
-                };
-            } else {
-                let eval = evaluate_board_summary(&after_root, params, stats);
-                residual_objective = objective_for_player(&eval, root_player, params);
-            }
-        }
-
-        residual.push(ResidualRankedLine {
-            line: ranked.line.clone(),
-            objective: ranked.objective,
-            own_score: ranked.own_score,
-            immediate_win: ranked.immediate_win,
-            initial_rank: idx + 1,
-            residual_objective,
-        });
-    }
-
-    residual.sort_by(|a, b| {
-        b.residual_objective
-            .total_cmp(&a.residual_objective)
-            .then_with(|| b.objective.total_cmp(&a.objective))
-            .then_with(|| b.own_score.total_cmp(&a.own_score))
-            .then_with(|| b.immediate_win.cmp(&a.immediate_win))
-            .then_with(|| a.initial_rank.cmp(&b.initial_rank))
-    });
-
-    let best = residual
-        .first()
-        .map(|entry| entry.line.clone())
-        .unwrap_or_default();
-
-    (best, root_lines.len(), "deterministic")
 }
 
 fn choose_greedy_turn(board: &BoardState, params: &EngineParams, stats: &mut EngineStats) -> Vec<Coord> {
@@ -2737,8 +2792,8 @@ fn solve_forcing_proof(
     )
 }
 
-fn sort_root_actions_by_forcing_scores(actions: &mut [Vec<Coord>], line_scores: &[ForcingLineScore]) {
-    if actions.is_empty() || line_scores.is_empty() {
+fn sort_root_ranked_lines_by_forcing_scores(lines: &mut [RankedLine], line_scores: &[ForcingLineScore]) {
+    if lines.is_empty() || line_scores.is_empty() {
         return;
     }
 
@@ -2754,13 +2809,16 @@ fn sort_root_actions_by_forcing_scores(actions: &mut [Vec<Coord>], line_scores: 
         }
     }
 
-    actions.sort_by(|a, b| {
-        let a_key = canonical_line_key(a);
-        let b_key = canonical_line_key(b);
+    lines.sort_by(|a, b| {
+        let a_key = canonical_line_key(&a.line);
+        let b_key = canonical_line_key(&b.line);
         let a_score = score_by_key.get(&a_key).copied().unwrap_or(f64::NEG_INFINITY);
         let b_score = score_by_key.get(&b_key).copied().unwrap_or(f64::NEG_INFINITY);
         b_score
             .total_cmp(&a_score)
+            .then_with(|| b.immediate_win.cmp(&a.immediate_win))
+            .then_with(|| b.objective.total_cmp(&a.objective))
+            .then_with(|| b.own_score.total_cmp(&a.own_score))
             .then_with(|| a_key.cmp(&b_key))
     });
 }
@@ -2832,81 +2890,408 @@ fn rollout_leaf_value(
     }
 }
 
-fn select_uct_child(
-    nodes: &[MctsNode],
-    parent_idx: usize,
+fn static_leaf_value(
+    board: &BoardState,
     root_player: Player,
-    exploration_c: f64,
-) -> Option<usize> {
-    let parent = &nodes[parent_idx];
-    if parent.children.is_empty() {
+    params: &EngineParams,
+    stats: &mut EngineStats,
+) -> f64 {
+    let eval_result = evaluate_board_summary(board, params, stats);
+    let value = objective_for_player(&eval_result, root_player, params);
+    if value.is_finite() {
+        value.clamp(-1.0, 1.0)
+    } else if value.is_sign_positive() {
+        1.0
+    } else {
+        -1.0
+    }
+}
+
+fn non_quiescent_leaf_value(
+    board: &BoardState,
+    root_player: Player,
+    params: &EngineParams,
+    stats: &mut EngineStats,
+    start_depth_turns: u32,
+    max_depth_turns: &mut u32,
+) -> f64 {
+    if params.use_static_leaf_eval {
+        static_leaf_value(board, root_player, params, stats)
+    } else {
+        rollout_leaf_value(
+            board,
+            root_player,
+            params,
+            stats,
+            start_depth_turns,
+            max_depth_turns,
+        )
+    }
+}
+
+fn quiescence_leaf_value(
+    board: &BoardState,
+    root_player: Player,
+    params: &EngineParams,
+    stats: &mut EngineStats,
+    extension_remaining: u32,
+    start_depth_turns: u32,
+    max_depth_turns: &mut u32,
+    telemetry: &mut SearchTelemetry,
+) -> Option<f64> {
+    telemetry.quiescence_call_count = telemetry.quiescence_call_count.saturating_add(1);
+
+    if let Some(winner) = find_winner(&board.moves) {
+        return Some(terminal_value_for_root(Some(winner), root_player));
+    }
+
+    if extension_remaining == 0 || board.placements_left == 0 {
         return None;
     }
 
-    let parent_visits = parent.visits.max(1) as f64;
-    let maximize_root_objective = parent.player_to_move == root_player;
-    let c = exploration_c.max(0.0);
+    let current_player = board.turn;
+    let attacker = current_player.opponent();
+    let features = collect_features(&board.moves);
 
-    let mut best_child = None;
-    let mut best_score = f64::NEG_INFINITY;
+    if one_turn_groups(&features, attacker).is_empty() {
+        return None;
+    }
 
-    for &child_idx in &parent.children {
-        let child = &nodes[child_idx];
-        let score = if child.visits == 0 {
-            f64::INFINITY
+    let blockers_required = one_turn_blockers_required(&features, attacker);
+    let forcing_threshold = board.placements_left.max(1).min(2) as usize;
+    if blockers_required < forcing_threshold {
+        return None;
+    }
+
+    let blocking_lines = exact_blocking_responses(board, attacker);
+    if blocking_lines.is_empty() {
+        return Some(terminal_value_for_root(Some(attacker), root_player));
+    }
+
+    telemetry.quiescence_extension_count = telemetry.quiescence_extension_count.saturating_add(1);
+
+    let maximize = current_player == root_player;
+    let mut best_value = if maximize {
+        f64::NEG_INFINITY
+    } else {
+        f64::INFINITY
+    };
+
+    for line in blocking_lines {
+        let (after_turn, applied, winner) = apply_turn_line(board, &line, current_player);
+        if applied.is_empty() {
+            continue;
+        }
+
+        let next_depth = start_depth_turns.saturating_add(1);
+        *max_depth_turns = (*max_depth_turns).max(next_depth);
+
+        let child_value = if let Some(child_winner) = winner {
+            terminal_value_for_root(Some(child_winner), root_player)
+        } else if let Some(value) = quiescence_leaf_value(
+            &after_turn,
+            root_player,
+            params,
+            stats,
+            extension_remaining.saturating_sub(1),
+            next_depth,
+            max_depth_turns,
+            telemetry,
+        ) {
+            value
         } else {
-            let mean = child.total_value / child.visits as f64;
-            let oriented_mean = if maximize_root_objective { mean } else { -mean };
-            let exploration = c * ((parent_visits.ln() / child.visits as f64).sqrt());
-            oriented_mean + exploration
+            non_quiescent_leaf_value(
+                &after_turn,
+                root_player,
+                params,
+                stats,
+                next_depth,
+                max_depth_turns,
+            )
         };
 
-        if score > best_score {
-            best_score = score;
-            best_child = Some(child_idx);
+        if maximize {
+            best_value = best_value.max(child_value);
+        } else {
+            best_value = best_value.min(child_value);
         }
     }
 
-    best_child
+    if best_value.is_finite() {
+        Some(best_value.clamp(-1.0, 1.0))
+    } else {
+        None
+    }
+}
+
+fn leaf_value_for_mcts(
+    board: &BoardState,
+    root_player: Player,
+    params: &EngineParams,
+    stats: &mut EngineStats,
+    start_depth_turns: u32,
+    max_depth_turns: &mut u32,
+    telemetry: &mut SearchTelemetry,
+) -> f64 {
+    if let Some(winner) = find_winner(&board.moves) {
+        return terminal_value_for_root(Some(winner), root_player);
+    }
+
+    if params.quiescence_enabled {
+        if let Some(value) = quiescence_leaf_value(
+            board,
+            root_player,
+            params,
+            stats,
+            params.quiescence_max_extra_turns,
+            start_depth_turns,
+            max_depth_turns,
+            telemetry,
+        ) {
+            return value;
+        }
+    }
+
+    non_quiescent_leaf_value(
+        board,
+        root_player,
+        params,
+        stats,
+        start_depth_turns,
+        max_depth_turns,
+    )
+}
+
+fn ranked_actions_from_applied_lines(
+    board: &BoardState,
+    player: Player,
+    lines: Vec<Vec<Coord>>,
+    params: &EngineParams,
+    stats: &mut EngineStats,
+) -> Vec<RankedLine> {
+    let mut ranked = Vec::new();
+    let mut seen = HashSet::new();
+
+    for line in lines {
+        let key = canonical_line_key(&line);
+        if key.is_empty() || !seen.insert(key) {
+            continue;
+        }
+
+        let (after_turn, applied, winner) = apply_turn_line(board, &line, player);
+        if applied.is_empty() {
+            continue;
+        }
+
+        ranked.push(score_applied_turn(
+            &after_turn,
+            player,
+            applied,
+            winner,
+            params,
+            stats,
+        ));
+    }
+
+    sort_ranked_lines(&mut ranked);
+    ranked
+}
+
+fn enumerate_ranked_actions_for_node(
+    board: &BoardState,
+    player: Player,
+    params: &EngineParams,
+    stats: &mut EngineStats,
+    is_root: bool,
+) -> Vec<RankedLine> {
+    let policy = if is_root {
+        root_search_policy(params)
+    } else {
+        child_search_policy(params)
+    };
+
+    let mut ranked = enumerate_turn_candidates(board, player, params, policy, stats);
+    if ranked.len() <= 1 {
+        let broaden_target = if is_root {
+            params.turn_candidate_count.max(10).min(48)
+        } else {
+            params.child_turn_candidate_count.max(6).min(20)
+        };
+
+        let broadened = broaden_turn_actions(board, player, params, broaden_target, stats);
+        if broadened.len() > ranked.len() {
+            ranked = ranked_actions_from_applied_lines(board, player, broadened, params, stats);
+        }
+    }
+
+    ranked
+}
+
+fn progressive_widening_limit(node: &MctsNode, total_actions: usize, params: &EngineParams) -> usize {
+    if total_actions == 0 {
+        return 0;
+    }
+
+    let (base, alpha, multiplier) = if node.parent.is_none() {
+        (
+            params.root_widening_base,
+            params.root_widening_alpha,
+            params.root_widening_multiplier,
+        )
+    } else {
+        (
+            params.child_widening_base,
+            params.child_widening_alpha,
+            params.child_widening_multiplier,
+        )
+    };
+
+    let widened = base as f64 + multiplier * (node.visits as f64).powf(alpha);
+    widened
+        .floor()
+        .max(base as f64)
+        .min(total_actions as f64) as usize
 }
 
 fn ensure_node_actions(
     nodes: &mut [MctsNode],
     node_idx: usize,
     board: &BoardState,
+    root_player: Player,
     params: &EngineParams,
     stats: &mut EngineStats,
 ) {
-    if nodes[node_idx].unexpanded_actions.is_some() {
+    if nodes[node_idx].static_value.is_none() {
+        nodes[node_idx].static_value = Some(static_leaf_value(board, root_player, params, stats));
+    }
+
+    if nodes[node_idx].actions.is_some() {
         return;
     }
 
-    let policy = if nodes[node_idx].parent.is_none() {
-        root_search_policy(params)
-    } else {
-        child_search_policy(params)
-    };
     let player = nodes[node_idx].player_to_move;
-    let mut actions = enumerate_turn_candidates(board, player, params, policy, stats)
-        .into_iter()
-        .map(|entry| entry.line)
-        .collect::<Vec<_>>();
+    let is_root = nodes[node_idx].parent.is_none();
+    let ranked = enumerate_ranked_actions_for_node(board, player, params, stats, is_root);
+    nodes[node_idx].actions = Some(build_mcts_actions(ranked));
+}
 
-    if actions.len() <= 1 {
-        let broaden_target = if nodes[node_idx].parent.is_none() {
-            params.turn_candidate_count.max(8).min(40)
-        } else {
-            params.child_turn_candidate_count.max(6).min(20)
-        };
-        let broadened = broaden_turn_actions(board, player, params, broaden_target, stats);
-        if broadened.len() > actions.len() {
-            actions = broadened;
+fn update_widening_frontier(
+    nodes: &mut [MctsNode],
+    node_idx: usize,
+    params: &EngineParams,
+    telemetry: &mut SearchTelemetry,
+) -> usize {
+    let total_actions = nodes[node_idx]
+        .actions
+        .as_ref()
+        .map(|actions| actions.len())
+        .unwrap_or(0);
+
+    let allowed = progressive_widening_limit(&nodes[node_idx], total_actions, params);
+    if allowed > nodes[node_idx].widened_action_count {
+        telemetry.widening_unlock_count = telemetry
+            .widening_unlock_count
+            .saturating_add((allowed - nodes[node_idx].widened_action_count) as u32);
+        nodes[node_idx].widened_action_count = allowed;
+    }
+
+    allowed
+}
+
+fn mu_fpu_value(nodes: &[MctsNode], node_idx: usize, params: &EngineParams) -> f64 {
+    if !params.mu_fpu_enabled {
+        return 0.0;
+    }
+
+    let node = &nodes[node_idx];
+    let Some(actions) = &node.actions else {
+        return node.static_value.unwrap_or(0.0);
+    };
+
+    let mut total = 0.0;
+    let mut count = 0_u32;
+
+    for action in actions {
+        if let Some(child_idx) = action.child_idx {
+            let child = &nodes[child_idx];
+            if child.visits == 0 {
+                continue;
+            }
+            total += child.total_value / child.visits as f64;
+            count = count.saturating_add(1);
         }
     }
 
-    actions.reverse();
+    if count > 0 {
+        total / count as f64
+    } else {
+        node.static_value.unwrap_or(0.0)
+    }
+}
 
-    nodes[node_idx].unexpanded_actions = Some(actions);
+fn select_puct_action(
+    nodes: &[MctsNode],
+    node_idx: usize,
+    root_player: Player,
+    params: &EngineParams,
+    telemetry: &mut SearchTelemetry,
+) -> Option<usize> {
+    let node = &nodes[node_idx];
+    let actions = node.actions.as_ref()?;
+    let allowed = node.widened_action_count.min(actions.len());
+    if allowed == 0 {
+        return None;
+    }
+
+    let parent_visits = node.visits.max(1) as f64;
+    let maximize_root_objective = node.player_to_move == root_player;
+    let c = params.exploration_c.max(0.0);
+    let fpu_raw = mu_fpu_value(nodes, node_idx, params);
+    let fpu_oriented = if maximize_root_objective { fpu_raw } else { -fpu_raw };
+
+    let mut best_idx = None;
+    let mut best_score = f64::NEG_INFINITY;
+    let mut best_prior = f64::NEG_INFINITY;
+
+    for action_idx in 0..allowed {
+        let action = &actions[action_idx];
+        let (oriented_value, visits) = if let Some(child_idx) = action.child_idx {
+            let child = &nodes[child_idx];
+            let mean = if child.visits == 0 {
+                0.0
+            } else {
+                child.total_value / child.visits as f64
+            };
+            (
+                if maximize_root_objective { mean } else { -mean },
+                child.visits as f64,
+            )
+        } else {
+            (fpu_oriented, 0.0)
+        };
+
+        let exploration = c * action.prior * parent_visits.sqrt() / (1.0 + visits);
+        let score = oriented_value + exploration;
+
+        if score > best_score
+            || (score == best_score && action.prior > best_prior)
+            || (score == best_score && action.prior == best_prior && action.heuristic_value > 0.0)
+        {
+            best_idx = Some(action_idx);
+            best_score = score;
+            best_prior = action.prior;
+        }
+    }
+
+    if params.mu_fpu_enabled {
+        if let Some(action_idx) = best_idx {
+            if actions[action_idx].child_idx.is_none() {
+                telemetry.mu_fpu_selection_count = telemetry.mu_fpu_selection_count.saturating_add(1);
+            }
+        }
+    }
+
+    best_idx
 }
 
 fn select_expand_path(
@@ -2915,13 +3300,13 @@ fn select_expand_path(
     root_player: Player,
     params: &EngineParams,
     stats: &mut EngineStats,
+    context: &mut MctsSearchContext,
     depth_cap: u32,
     max_depth_turns: &mut u32,
-) -> (Vec<usize>, BoardState, bool) {
+) -> (Vec<usize>, BoardState) {
     let mut board = root_board.clone();
     let mut path = vec![0_usize];
     let mut node_idx = 0_usize;
-    let mut expanded = false;
 
     loop {
         let node_depth = nodes[node_idx].depth_turns;
@@ -2931,75 +3316,111 @@ fn select_expand_path(
             break;
         }
 
-        ensure_node_actions(nodes, node_idx, &board, params, stats);
-
-        let mut expanded_here = false;
-        loop {
-            let action_opt = {
-                let Some(actions) = nodes[node_idx].unexpanded_actions.as_mut() else {
-                    break;
-                };
-                actions.pop()
-            };
-
-            let Some(action) = action_opt else {
-                break;
-            };
-
-            let player = nodes[node_idx].player_to_move;
-            let (next_board, applied, winner) = apply_turn_line(&board, &action, player);
-            if applied.is_empty() {
-                continue;
-            }
-
-            let child_idx = nodes.len();
-            let child_depth = nodes[node_idx].depth_turns.saturating_add(1);
-            nodes.push(MctsNode {
-                parent: Some(node_idx),
-                action_from_parent: applied.clone(),
-                player_to_move: next_board.turn,
-                depth_turns: child_depth,
-                children: Vec::new(),
-                unexpanded_actions: None,
-                visits: 0,
-                total_value: 0.0,
-                terminal_winner: winner.or_else(|| find_winner(&next_board.moves)),
-            });
-            nodes[node_idx].children.push(child_idx);
-
-            board = next_board;
-            node_idx = child_idx;
-            path.push(child_idx);
-            *max_depth_turns = (*max_depth_turns).max(child_depth);
-            expanded = true;
-            expanded_here = true;
+        ensure_node_actions(nodes, node_idx, &board, root_player, params, stats);
+        let allowed = update_widening_frontier(nodes, node_idx, params, &mut context.telemetry);
+        if allowed == 0 {
             break;
         }
 
-        if expanded_here {
-            break;
-        }
-
-        let Some(child_idx) = select_uct_child(nodes, node_idx, root_player, params.exploration_c) else {
+        let Some(action_idx) = select_puct_action(nodes, node_idx, root_player, params, &mut context.telemetry) else {
             break;
         };
 
         let player = nodes[node_idx].player_to_move;
-        let action = nodes[child_idx].action_from_parent.clone();
+        let (action, existing_child_idx) = {
+            let actions = nodes[node_idx].actions.as_ref().expect("node actions initialized");
+            let selected = &actions[action_idx];
+            (selected.line.clone(), selected.child_idx)
+        };
+
         let (next_board, applied, winner) = apply_turn_line(&board, &action, player);
         if applied.is_empty() {
             break;
         }
-        if nodes[child_idx].terminal_winner.is_none() && winner.is_some() {
-            nodes[child_idx].terminal_winner = winner;
+
+        if let Some(child_idx) = existing_child_idx {
+            if nodes[child_idx].terminal_winner.is_none() && winner.is_some() {
+                nodes[child_idx].terminal_winner = winner;
+            }
+
+            board = next_board;
+            node_idx = child_idx;
+            path.push(child_idx);
+            continue;
+        }
+
+        let child_depth = nodes[node_idx].depth_turns.saturating_add(1);
+        let child_signature = board_state_signature(&next_board);
+        let mut child_node = MctsNode {
+            parent: Some(node_idx),
+            signature: child_signature.clone(),
+            action_from_parent: applied.clone(),
+            player_to_move: next_board.turn,
+            depth_turns: child_depth,
+            children: Vec::new(),
+            actions: None,
+            widened_action_count: 0,
+            visits: 0,
+            total_value: 0.0,
+            static_value: None,
+            terminal_winner: winner.or_else(|| find_winner(&next_board.moves)),
+        };
+
+        if params.transpositions_enabled {
+            if let Some(entry) = context.transpositions.get(&child_signature).copied() {
+                context.telemetry.transposition_hits = context.telemetry.transposition_hits.saturating_add(1);
+                context.telemetry.transposition_reuses = context.telemetry.transposition_reuses.saturating_add(1);
+                child_node.visits = entry.visits;
+                child_node.total_value = entry.total_value;
+            } else {
+                context.telemetry.transposition_misses = context.telemetry.transposition_misses.saturating_add(1);
+            }
+        }
+
+        let child_idx = nodes.len();
+        nodes.push(child_node);
+        nodes[node_idx].children.push(child_idx);
+        if let Some(actions) = nodes[node_idx].actions.as_mut() {
+            actions[action_idx].child_idx = Some(child_idx);
         }
 
         board = next_board;
-        node_idx = child_idx;
         path.push(child_idx);
+        *max_depth_turns = (*max_depth_turns).max(child_depth);
+        break;
     }
 
-    (path, board, expanded)
+    (path, board)
+}
+
+fn update_transposition_table(
+    nodes: &[MctsNode],
+    path: &[usize],
+    value: f64,
+    params: &EngineParams,
+    context: &mut MctsSearchContext,
+) {
+    if !params.transpositions_enabled {
+        return;
+    }
+
+    for &node_idx in path {
+        let signature = nodes[node_idx].signature.clone();
+        if let Some(entry) = context.transpositions.get_mut(&signature) {
+            entry.visits = entry.visits.saturating_add(1);
+            entry.total_value += value;
+            continue;
+        }
+
+        context.telemetry.transposition_stores = context.telemetry.transposition_stores.saturating_add(1);
+        context.transpositions.insert(
+            signature,
+            TranspositionEntry {
+                visits: 1,
+                total_value: value,
+            },
+        );
+    }
 }
 
 fn choose_mcts_turn(
@@ -3008,16 +3429,24 @@ fn choose_mcts_turn(
     max_time_ms: u32,
     max_nodes: u32,
     stats: &mut EngineStats,
-) -> (Vec<Coord>, usize, &'static str, u32, u32, ForcingTelemetry) {
+) -> (Vec<Coord>, usize, &'static str, u32, u32, ForcingTelemetry, SearchTelemetry) {
     if board.placements_left == 0 {
-        return (Vec::new(), 0, "terminal", 0, 0, ForcingTelemetry::default());
+        return (
+            Vec::new(),
+            0,
+            "terminal",
+            0,
+            0,
+            ForcingTelemetry::default(),
+            SearchTelemetry::default(),
+        );
     }
 
     let root_player = board.turn;
     let mut forcing_telemetry = ForcingTelemetry::default();
     let mut forcing_line_scores = Vec::new();
 
-    if should_attempt_forcing_solve(board, root_player) {
+    if params.forcing_solver_enabled && should_attempt_forcing_solve(board, root_player) {
         let (forcing_result, telemetry) =
             solve_forcing_proof(board, root_player, params, stats, max_time_ms, max_nodes);
         forcing_line_scores = forcing_result.root_line_scores;
@@ -3033,51 +3462,61 @@ fn choose_mcts_turn(
                         forcing_telemetry.max_depth_turns.max(1),
                         0,
                         forcing_telemetry,
+                        SearchTelemetry::default(),
                     );
                 }
             }
         }
     }
 
-    let root_policy = root_search_policy(params);
-    let mut root_actions = enumerate_turn_candidates(board, root_player, params, root_policy, stats)
-        .into_iter()
-        .map(|entry| entry.line)
-        .collect::<Vec<_>>();
-
-    if root_actions.len() <= 1 {
-        let broadened = broaden_turn_actions(
-            board,
-            root_player,
-            params,
-            params.turn_candidate_count.max(10).min(48),
-            stats,
-        );
-        if broadened.len() > root_actions.len() {
-            root_actions = broadened;
-        }
-    }
+    let mut root_ranked = enumerate_ranked_actions_for_node(board, root_player, params, stats, true);
 
     if !forcing_line_scores.is_empty() {
-        sort_root_actions_by_forcing_scores(&mut root_actions, &forcing_line_scores);
+        sort_root_ranked_lines_by_forcing_scores(&mut root_ranked, &forcing_line_scores);
     }
+
+    let root_actions = build_mcts_actions(root_ranked);
 
     if root_actions.is_empty() {
-        return (Vec::new(), 0, "no_candidates", 0, 0, forcing_telemetry);
+        return (
+            Vec::new(),
+            0,
+            "no_candidates",
+            0,
+            0,
+            forcing_telemetry,
+            SearchTelemetry::default(),
+        );
     }
 
-    let seed_move = root_actions.first().cloned().unwrap_or_default();
+    let seed_move = root_actions
+        .first()
+        .map(|action| action.line.clone())
+        .unwrap_or_default();
 
     if root_actions.len() == 1 {
-        return (root_actions[0].clone(), 1, "single_candidate", 1, 0, forcing_telemetry);
+        return (
+            root_actions[0].line.clone(),
+            1,
+            "single_candidate",
+            1,
+            0,
+            forcing_telemetry,
+            SearchTelemetry {
+                root_prior_top_share: root_actions[0].prior,
+                ..SearchTelemetry::default()
+            },
+        );
     }
 
     let root_candidates = root_actions.len();
-    root_actions.reverse();
-
     let remaining_time_ms = max_time_ms.saturating_sub(forcing_telemetry.elapsed_ms);
     let remaining_node_budget = max_nodes.saturating_sub(forcing_telemetry.nodes);
     if remaining_time_ms == 0 || remaining_node_budget == 0 {
+        let telemetry = SearchTelemetry {
+            root_prior_top_share: root_actions.first().map(|action| action.prior).unwrap_or(0.0),
+            ..SearchTelemetry::default()
+        };
         return (
             seed_move,
             root_candidates,
@@ -3085,25 +3524,35 @@ fn choose_mcts_turn(
             forcing_telemetry.max_depth_turns,
             0,
             forcing_telemetry,
+            telemetry,
         );
     }
 
+    let mut context = MctsSearchContext::default();
+    context.telemetry.root_prior_top_share = root_actions.first().map(|action| action.prior).unwrap_or(0.0);
     let mut nodes = vec![MctsNode {
         parent: None,
+        signature: board_state_signature(board),
         action_from_parent: Vec::new(),
         player_to_move: root_player,
         depth_turns: 0,
         children: Vec::new(),
-        unexpanded_actions: Some(root_actions),
+        actions: Some(root_actions),
+        widened_action_count: 0,
         visits: 0,
         total_value: 0.0,
+        static_value: None,
         terminal_winner: find_winner(&board.moves),
     }];
 
     let started_at_ms = now_ms();
     let budget_ms = (remaining_time_ms as f64).max(1.0);
     let node_budget = remaining_node_budget.max(1).min(2_000_000);
-    let depth_cap = (params.max_simulation_turns as u32).saturating_add(4).max(4).min(24);
+    let depth_cap = (params.max_simulation_turns as u32)
+        .saturating_add(params.quiescence_max_extra_turns)
+        .saturating_add(4)
+        .max(4)
+        .min(32);
 
     let mut playouts = 0_u32;
     let mut max_depth_turns = forcing_telemetry.max_depth_turns;
@@ -3119,12 +3568,13 @@ fn choose_mcts_turn(
             break;
         }
 
-        let (path, leaf_board, _expanded) = select_expand_path(
+        let (path, leaf_board) = select_expand_path(
             board,
             &mut nodes,
             root_player,
             params,
             stats,
+            &mut context,
             depth_cap,
             &mut max_depth_turns,
         );
@@ -3138,21 +3588,23 @@ fn choose_mcts_turn(
         let value = if let Some(winner) = nodes[leaf_idx].terminal_winner {
             terminal_value_for_root(Some(winner), root_player)
         } else {
-            rollout_leaf_value(
+            leaf_value_for_mcts(
                 &leaf_board,
                 root_player,
                 params,
                 stats,
                 nodes[leaf_idx].depth_turns,
                 &mut max_depth_turns,
+                &mut context.telemetry,
             )
         };
 
-        for node_on_path in path {
+        for &node_on_path in &path {
             let node = &mut nodes[node_on_path];
             node.visits = node.visits.saturating_add(1);
             node.total_value += value;
         }
+        update_transposition_table(&nodes, &path, value, params, &mut context);
 
         playouts = playouts.saturating_add(1);
     }
@@ -3171,6 +3623,7 @@ fn choose_mcts_turn(
 
     let root = &nodes[0];
     if root.children.is_empty() {
+        context.telemetry.transposition_table_size = context.transpositions.len() as u32;
         return (
             seed_move,
             root_candidates,
@@ -3178,6 +3631,7 @@ fn choose_mcts_turn(
             max_depth_turns,
             playouts,
             forcing_telemetry,
+            context.telemetry,
         );
     }
 
@@ -3207,6 +3661,17 @@ fn choose_mcts_turn(
         }
     }
 
+    let total_root_child_visits: u32 = root
+        .children
+        .iter()
+        .map(|child_idx| nodes[*child_idx].visits)
+        .sum();
+    if total_root_child_visits > 0 {
+        context.telemetry.root_best_visit_share =
+            nodes[best_child_idx].visits as f64 / total_root_child_visits as f64;
+    }
+    context.telemetry.transposition_table_size = context.transpositions.len() as u32;
+
     let best_line = nodes[best_child_idx].action_from_parent.clone();
     let best_depth = nodes[best_child_idx].depth_turns;
     (
@@ -3216,6 +3681,7 @@ fn choose_mcts_turn(
         max_depth_turns.max(best_depth),
         playouts,
         forcing_telemetry,
+        context.telemetry,
     )
 }
 
@@ -3271,6 +3737,7 @@ fn choose_turn_internal(request: ChooseTurnRequest) -> Result<ChooseTurnResponse
             forcing_cache_misses: 0,
             forcing_elapsed_ms: 0,
             forcing_root_candidates: 0,
+            telemetry: SearchTelemetry::default(),
         });
     }
 
@@ -3298,10 +3765,11 @@ fn choose_turn_internal(request: ChooseTurnRequest) -> Result<ChooseTurnResponse
             forcing_cache_misses: 0,
             forcing_elapsed_ms: 0,
             forcing_root_candidates: 0,
+            telemetry: SearchTelemetry::default(),
         });
     }
 
-    let (proposed_moves, root_candidates, stop_reason, mode, max_depth_turns, playouts, forcing) = if max_time_ms == 0 || max_nodes == 0 {
+    let (proposed_moves, root_candidates, stop_reason, mode, max_depth_turns, playouts, forcing, telemetry) = if max_time_ms == 0 || max_nodes == 0 {
         (
             choose_greedy_turn(&board, &params, &mut stats),
             0,
@@ -3310,12 +3778,13 @@ fn choose_turn_internal(request: ChooseTurnRequest) -> Result<ChooseTurnResponse
             0,
             0,
             ForcingTelemetry::default(),
+            SearchTelemetry::default(),
         )
     } else {
-        let (moves, root_candidates, reason, depth_turns, playout_count, forcing) =
+        let (moves, root_candidates, reason, depth_turns, playout_count, forcing, telemetry) =
             choose_mcts_turn(&board, &params, max_time_ms, max_nodes, &mut stats);
         if !moves.is_empty() {
-            (moves, root_candidates, reason, "mcts", depth_turns, playout_count, forcing)
+            (moves, root_candidates, reason, "mcts", depth_turns, playout_count, forcing, telemetry)
         } else {
             (
                 choose_greedy_turn(&board, &params, &mut stats),
@@ -3325,6 +3794,7 @@ fn choose_turn_internal(request: ChooseTurnRequest) -> Result<ChooseTurnResponse
                 depth_turns,
                 playout_count,
                 forcing,
+                telemetry,
             )
         }
     };
@@ -3353,6 +3823,7 @@ fn choose_turn_internal(request: ChooseTurnRequest) -> Result<ChooseTurnResponse
         forcing_cache_misses: forcing.cache_misses,
         forcing_elapsed_ms: forcing.elapsed_ms,
         forcing_root_candidates: forcing.root_candidates as u32,
+        telemetry,
     };
 
     Ok(response)
@@ -3421,5 +3892,117 @@ pub fn evaluate_position_json(input_json: &str) -> String {
         Ok(response) => serde_json::to_string(&response)
             .unwrap_or_else(|_| "{\"error\":\"response serialization failed\"}".to_owned()),
         Err(error) => to_error_json(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_params() -> EngineParams {
+        normalize_params(&BotTuningInput::default(), Some(&SearchOptionsInput::default()))
+    }
+
+    fn dummy_node(parent: Option<usize>, visits: u32) -> MctsNode {
+        MctsNode {
+            parent,
+            signature: "sig".to_owned(),
+            action_from_parent: Vec::new(),
+            player_to_move: Player::X,
+            depth_turns: 0,
+            children: Vec::new(),
+            actions: None,
+            widened_action_count: 0,
+            visits,
+            total_value: 0.0,
+            static_value: Some(0.0),
+            terminal_winner: None,
+        }
+    }
+
+    #[test]
+    fn build_mcts_actions_normalizes_priors() {
+        let actions = build_mcts_actions(vec![
+            RankedLine {
+                line: vec![(0, 0)],
+                objective: 0.85,
+                own_score: 0.8,
+                immediate_win: false,
+                opp_one_turn_wins: 0,
+            },
+            RankedLine {
+                line: vec![(1, 0)],
+                objective: 0.15,
+                own_score: 0.55,
+                immediate_win: false,
+                opp_one_turn_wins: 1,
+            },
+            RankedLine {
+                line: vec![(2, 0)],
+                objective: -0.2,
+                own_score: 0.4,
+                immediate_win: false,
+                opp_one_turn_wins: 2,
+            },
+        ]);
+
+        let prior_sum: f64 = actions.iter().map(|action| action.prior).sum();
+        assert!((prior_sum - 1.0).abs() < 1e-9);
+        assert!(actions[0].prior > actions[1].prior);
+        assert!(actions[1].prior > actions[2].prior);
+    }
+
+    #[test]
+    fn progressive_widening_limit_grows_with_visits() {
+        let params = base_params();
+        let root_initial = progressive_widening_limit(&dummy_node(None, 0), 20, &params);
+        let root_after_visits = progressive_widening_limit(&dummy_node(None, 9), 20, &params);
+        let child_initial = progressive_widening_limit(&dummy_node(Some(0), 0), 20, &params);
+
+        assert_eq!(root_initial, params.root_widening_base);
+        assert_eq!(child_initial, params.child_widening_base);
+        assert!(root_after_visits > root_initial);
+    }
+
+    #[test]
+    fn transposition_table_updates_accumulate_visits_and_value() {
+        let params = normalize_params(
+            &BotTuningInput::default(),
+            Some(&SearchOptionsInput {
+                transpositions_enabled: Some(true),
+                ..SearchOptionsInput::default()
+            }),
+        );
+
+        let board = BoardState {
+            moves: HashMap::new(),
+            move_history: Vec::new(),
+            turn: Player::X,
+            placements_left: 1,
+        };
+        let signature = board_state_signature(&board);
+        let nodes = vec![MctsNode {
+            parent: None,
+            signature: signature.clone(),
+            action_from_parent: Vec::new(),
+            player_to_move: Player::X,
+            depth_turns: 0,
+            children: Vec::new(),
+            actions: None,
+            widened_action_count: 0,
+            visits: 0,
+            total_value: 0.0,
+            static_value: Some(0.0),
+            terminal_winner: None,
+        }];
+        let mut context = MctsSearchContext::default();
+
+        update_transposition_table(&nodes, &[0], 0.75, &params, &mut context);
+        update_transposition_table(&nodes, &[0], -0.25, &params, &mut context);
+
+        let entry = context.transpositions.get(&signature).expect("transposition stored");
+        assert_eq!(context.telemetry.transposition_stores, 1);
+        assert_eq!(entry.visits, 2);
+        assert!((entry.total_value - 0.5).abs() < 1e-9);
     }
 }

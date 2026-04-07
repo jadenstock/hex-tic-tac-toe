@@ -1,12 +1,14 @@
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type CSSProperties } from 'react'
+import { startTransition, useCallback, useEffect, useMemo, useReducer, useRef, useState, type CSSProperties } from 'react'
 import './App.css'
 import {
   DEFAULT_BOT_SEARCH_OPTIONS,
   DEFAULT_BOT_TUNING,
   chooseBotTurnDetailedAsyncWithSession,
   createBotSearchSession,
+  evaluateBotPosition,
   getWasmBotRuntimeMessage,
   warmupWasmBot,
+  type BotPositionEvaluation,
   type BotSearchStats,
   type BotSearchOptions,
   type BotSearchSession,
@@ -94,6 +96,14 @@ type BotTelemetryFile = {
   app: string
   entryCount: number
   entries: BotTelemetryEntry[]
+}
+
+type EvalTraceMetric = 'objectiveForX' | 'objectiveForO' | 'scoreGap'
+
+type EvalTracePoint = BotPositionEvaluation & {
+  ply: number
+  label: string
+  move?: MoveRecord
 }
 
 type LiveGameState = {
@@ -218,8 +228,10 @@ const BOT_THINK_SECONDS_MAX = 10
 const BOT_NODE_BUDGET_PER_SECOND = 87_500
 const LIVE_WASM_SEARCH_OPTIONS: BotSearchOptions = {
   ...DEFAULT_BOT_SEARCH_OPTIONS,
-  turnCandidateCount: 24,
+  turnCandidateCount: 48,
   childTurnCandidateCount: 18,
+  quiescenceMaxExtraTurns: 4,
+  transpositionsEnabled: true,
   maxSimulationTurns: 4,
   simulationTurnCandidateCount: 8,
   simulationRadius: 6,
@@ -580,6 +592,55 @@ function createInitialSandboxState(): LiveGameState {
 
 function createSandboxState(moveHistory: MoveRecord[]): LiveGameState {
   return deriveLiveState(moveHistory)
+}
+
+function evalTraceMetricLabel(metric: EvalTraceMetric): string {
+  switch (metric) {
+    case 'objectiveForO':
+      return 'O objective'
+    case 'scoreGap':
+      return 'Pressure gap'
+    case 'objectiveForX':
+    default:
+      return 'X objective'
+  }
+}
+
+function evalTraceMetricValue(point: EvalTracePoint, metric: EvalTraceMetric): number {
+  switch (metric) {
+    case 'objectiveForO':
+      return point.objectiveForO
+    case 'scoreGap':
+      return point.xScore - point.oScore
+    case 'objectiveForX':
+    default:
+      return point.objectiveForX
+  }
+}
+
+function summarizeStopReason(stopReason: BotSearchStats['stopReason']): string | null {
+  switch (stopReason) {
+    case 'time':
+      return null
+    case 'nodes':
+      return 'node cap'
+    case 'budget_zero':
+      return 'zero budget'
+    case 'single_candidate':
+      return 'single candidate'
+    case 'early_win':
+      return 'forcing win'
+    case 'no_candidates':
+      return 'no candidates'
+    case 'fallback':
+      return 'fallback'
+    case 'terminal':
+      return 'terminal'
+    case 'deterministic':
+      return 'deterministic'
+    default:
+      return stopReason
+  }
 }
 
 function createInitialPlanningState(): PlanningState {
@@ -1116,15 +1177,15 @@ function App() {
   const [autoBotSide, setAutoBotSide] = useState<'X' | 'O' | 'both'>('both')
   const [botTuning, setBotTuning] = useState<BotTuning>(DEFAULT_BOT_TUNING)
   const [isBotThinking, setIsBotThinking] = useState(false)
-  const [liveBotNodes, setLiveBotNodes] = useState(0)
-  const [liveBotPlayouts, setLiveBotPlayouts] = useState(0)
-  const [liveBotBoardEvals, setLiveBotBoardEvals] = useState(0)
-  const [liveBotElapsedMs, setLiveBotElapsedMs] = useState(0)
   const [botThinkSeconds, setBotThinkSeconds] = useState(DEFAULT_BOT_THINK_SECONDS)
   const [lastBotStats, setLastBotStats] = useState<BotSearchStats | null>(null)
   const [botTelemetryEnabled, setBotTelemetryEnabled] = useState(false)
   const [botTelemetryEntries, setBotTelemetryEntries] = useState<BotTelemetryEntry[]>([])
   const [botBackendNotice, setBotBackendNotice] = useState<string | null>(null)
+  const [evalTraceMetric, setEvalTraceMetric] = useState<EvalTraceMetric>('objectiveForX')
+  const [evalTracePoints, setEvalTracePoints] = useState<EvalTracePoint[]>([])
+  const [evalTraceError, setEvalTraceError] = useState<string | null>(null)
+  const [isEvalTraceLoading, setIsEvalTraceLoading] = useState(false)
   const [showRulesModal, setShowRulesModal] = useState(false)
   const [dockOpen, setDockOpen] = useState(true)
   const [replayRecord, setReplayRecord] = useState<ReplayRecord | null>(null)
@@ -1269,12 +1330,61 @@ function App() {
   )
 
   const displayState = isReplayMode ? liveState : mode === 'sandbox' ? sandboxState : liveState
+  const analysisMoveHistory = replayRecord?.moveHistory ?? displayState.moveHistory
+  const activeEvalPly = replayRecord ? clampValue(replayStep, 0, analysisMoveHistory.length) : analysisMoveHistory.length
   const totalLiveMoves = liveState.moves.size
   const totalSandboxMoves = sandboxState.moves.size
   const autoBotForX = autoBotEnabled && (autoBotSide === 'X' || autoBotSide === 'both')
   const autoBotForO = autoBotEnabled && (autoBotSide === 'O' || autoBotSide === 'both')
   const showConnectedStatus = joinedRoom !== null && wsStatus === 'connected'
   const canUndo = isReplayMode ? false : mode === 'sandbox' ? sandboxState.moveHistory.length > 0 : liveState.moveHistory.length > 0
+  useEffect(() => {
+    let cancelled = false
+    setIsEvalTraceLoading(true)
+    setEvalTraceError(null)
+
+    const prefixes = Array.from({ length: analysisMoveHistory.length + 1 }, (_, ply) => analysisMoveHistory.slice(0, ply))
+
+    void Promise.all(
+      prefixes.map(async (moveHistory, ply) => {
+        const state = deriveLiveState(moveHistory)
+        const evaluation = await evaluateBotPosition(
+          {
+            moves: state.moves,
+            moveHistory: state.moveHistory,
+            turn: state.turn,
+            placementsLeft: state.placementsLeft,
+          },
+          botTuning,
+        )
+
+        return {
+          ply,
+          label: ply === 0 ? 'Start' : `Move ${ply}`,
+          move: ply === 0 ? undefined : analysisMoveHistory[ply - 1],
+          ...evaluation,
+        } satisfies EvalTracePoint
+      }),
+    )
+      .then((points) => {
+        if (cancelled) return
+        startTransition(() => {
+          setEvalTracePoints(points)
+          setEvalTraceError(null)
+          setIsEvalTraceLoading(false)
+        })
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return
+        setEvalTracePoints([])
+        setEvalTraceError(error instanceof Error ? error.message : 'Failed to build evaluation trace.')
+        setIsEvalTraceLoading(false)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [analysisMoveHistory, botTuning])
   const getHexAtScreen = useCallback(
     (screenX: number, screenY: number): HoverHex | null => {
       const world = screenToWorld(screenX, screenY)
@@ -1327,6 +1437,8 @@ function App() {
       '--accent-soft': theme.accentSoft,
       '--warn': theme.warn,
       '--page-background': theme.pageBackground,
+      '--x-color': theme.xColor,
+      '--o-color': theme.oColor,
       '--threat-x-text': theme.threatTextX,
       '--threat-o-text': theme.threatTextO,
     } as CSSProperties
@@ -1428,6 +1540,57 @@ function App() {
 
     return `${displayState.turn} to move (${displayState.placementsLeft} placement${displayState.placementsLeft === 1 ? '' : 's'} left)`
   }, [displayState.placementsLeft, displayState.turn, displayState.winner, mode, replayRecord, replayStep, totalSandboxMoves])
+  const evalTraceChart = useMemo(() => {
+    if (evalTracePoints.length === 0) {
+      return null
+    }
+
+    const values = evalTracePoints.map((point) => evalTraceMetricValue(point, evalTraceMetric))
+    const currentIndex = clampValue(activeEvalPly, 0, evalTracePoints.length - 1)
+    const currentPoint = evalTracePoints[currentIndex]
+    const currentValue = values[currentIndex] ?? 0
+    const largestSwing = values.reduce((maxDelta, value, index) => {
+      if (index === 0) return maxDelta
+      return Math.max(maxDelta, Math.abs(value - values[index - 1]))
+    }, 0)
+
+    const width = 720
+    const height = 220
+    const paddingLeft = 14
+    const paddingRight = 14
+    const paddingTop = 14
+    const paddingBottom = 30
+    const innerWidth = width - paddingLeft - paddingRight
+    const innerHeight = height - paddingTop - paddingBottom
+    const maxAbs = Math.max(0.05, ...values.map((value) => Math.abs(value)))
+    const xForIndex = (index: number) =>
+      values.length <= 1 ? paddingLeft + innerWidth / 2 : paddingLeft + (innerWidth * index) / (values.length - 1)
+    const yForValue = (value: number) => paddingTop + ((maxAbs - value) / (maxAbs * 2)) * innerHeight
+    const linePoints = values.map((value, index) => `${xForIndex(index)},${yForValue(value)}`).join(' ')
+    const zeroY = yForValue(0)
+    const currentX = xForIndex(currentIndex)
+    const currentY = yForValue(currentValue)
+
+    return {
+      currentPoint,
+      currentValue,
+      largestSwing,
+      linePoints,
+      zeroY,
+      currentX,
+      currentY,
+      width,
+      height,
+      pointMarkers:
+        values.length <= 60
+          ? values.map((value, index) => ({
+              x: xForIndex(index),
+              y: yForValue(value),
+              key: `${index}-${value.toFixed(4)}`,
+            }))
+          : [],
+    }
+  }, [activeEvalPly, evalTraceMetric, evalTracePoints])
 
   const syncFromWireBoard = useCallback((wireBoard: unknown, wireHistory?: unknown) => {
     const moves = boardObjectToMap(wireBoard)
@@ -1727,10 +1890,6 @@ function App() {
     }
 
     setIsBotThinking(true)
-    setLiveBotNodes(0)
-    setLiveBotPlayouts(0)
-    setLiveBotBoardEvals(0)
-    setLiveBotElapsedMs(0)
 
     try {
       await new Promise<void>((resolve) => window.setTimeout(resolve, 0))
@@ -1744,15 +1903,6 @@ function App() {
         botSearchSessionRef.current,
         botTuning,
         activeBotSearchOptions,
-        {
-          yieldEveryMs: 16,
-          onProgress: (progress) => {
-            setLiveBotNodes(progress.nodesExpanded)
-            setLiveBotPlayouts(progress.playouts)
-            setLiveBotBoardEvals(progress.boardEvaluations)
-            setLiveBotElapsedMs(progress.elapsedMs)
-          },
-        },
       )
 
       setLastBotStats(decision.stats)
@@ -2909,15 +3059,49 @@ function App() {
                                 {`Mode: MCTS | WASM budget: ${botThinkSeconds.toFixed(2)}s or ${activeBotSearchOptions.budget.maxNodes.toLocaleString()} nodes`}
                               </div>
                               <div className="compute-meta">
-                                {`Search profile: root target ${activeBotSearchOptions.turnCandidateCount} | child target ${activeBotSearchOptions.childTurnCandidateCount} | rollout cap ${activeBotSearchOptions.maxSimulationTurns} turns`}
+                                {`Profile: root ${activeBotSearchOptions.turnCandidateCount} | child ${activeBotSearchOptions.childTurnCandidateCount} | eval ${
+                                  activeBotSearchOptions.useStaticLeafEval
+                                    ? 'static'
+                                    : `rollout ${activeBotSearchOptions.maxSimulationTurns} turns`
+                                } | q-search ${
+                                  activeBotSearchOptions.quiescenceEnabled
+                                    ? `${activeBotSearchOptions.quiescenceMaxExtraTurns} turns`
+                                    : 'off'
+                                } | TT ${activeBotSearchOptions.transpositionsEnabled ? 'on' : 'off'} | forcing ${
+                                  activeBotSearchOptions.forcingSolverEnabled ? 'on' : 'off'
+                                }`}
                               </div>
                               {lastBotStats ? (
                                 <div className="compute-meta">
-                                  Last run: {lastBotStats.mode.toUpperCase()} | {(lastBotStats.elapsedMs / 1000).toFixed(3)}s | board evals{' '}
-                                  {lastBotStats.boardEvaluations.toLocaleString()} | nodes {lastBotStats.nodesExpanded.toLocaleString()} | playouts{' '}
-                                  {lastBotStats.playouts.toLocaleString()} | search depth {lastBotStats.maxDepthTurns} turns | candidate lines{' '}
-                                  {lastBotStats.rootCandidates} | stop {lastBotStats.stopReason}
+                                  Last run: {lastBotStats.mode.toUpperCase()} | {(lastBotStats.elapsedMs / 1000).toFixed(3)}s | playouts{' '}
+                                  {lastBotStats.playouts.toLocaleString()} | expanded {lastBotStats.nodesExpanded.toLocaleString()} | evals{' '}
+                                  {lastBotStats.boardEvaluations.toLocaleString()} | depth {lastBotStats.maxDepthTurns} | root candidates{' '}
+                                  {lastBotStats.rootCandidates}
+                                  {summarizeStopReason(lastBotStats.stopReason) ? ` | ${summarizeStopReason(lastBotStats.stopReason)}` : ''}
                                 </div>
+                              ) : null}
+                              {lastBotStats?.telemetry ? (
+                                <>
+                                  <div className="compute-meta">
+                                    Tree policy: top prior {(lastBotStats.telemetry.rootPriorTopShare * 100).toFixed(1)}% | best child{' '}
+                                    {(lastBotStats.telemetry.rootBestVisitShare * 100).toFixed(1)}% visits | widening +{' '}
+                                    {lastBotStats.telemetry.wideningUnlockCount.toLocaleString()} | mu-FPU{' '}
+                                    {lastBotStats.telemetry.muFpuSelectionCount.toLocaleString()} | q-search{' '}
+                                    {lastBotStats.telemetry.quiescenceExtensionCount.toLocaleString()} ext /{' '}
+                                    {lastBotStats.telemetry.quiescenceCallCount.toLocaleString()} checks
+                                  </div>
+                                  {activeBotSearchOptions.transpositionsEnabled ? (
+                                    <div className="compute-meta">
+                                      Transpositions: {lastBotStats.telemetry.transpositionHits.toLocaleString()} hits |{' '}
+                                      {lastBotStats.telemetry.transpositionMisses.toLocaleString()} misses |{' '}
+                                      {lastBotStats.telemetry.transpositionReuses.toLocaleString()} reuses |{' '}
+                                      {lastBotStats.telemetry.transpositionStores.toLocaleString()} stores |{' '}
+                                      {lastBotStats.telemetry.transpositionTableSize.toLocaleString()} entries
+                                    </div>
+                                  ) : (
+                                    <div className="compute-meta">Transpositions: disabled for this profile</div>
+                                  )}
+                                </>
                               ) : null}
                               {lastBotStats?.debug ? (
                                 <>
@@ -2962,15 +3146,12 @@ function App() {
                                   ) : null}
                                 </>
                               ) : null}
-                              {isBotThinking ? (
-                                <div className="compute-meta">
-                                  Thinking now: {(liveBotElapsedMs / 1000).toFixed(2)}s | board evals {liveBotBoardEvals.toLocaleString()} | nodes{' '}
-                                  {liveBotNodes.toLocaleString()} | playouts {liveBotPlayouts.toLocaleString()}
-                                </div>
-                              ) : null}
                             </div>
                             <details className="tuning-panel">
-                              <summary>Advanced tuning (WASM)</summary>
+                              <summary>Heuristic eval weights</summary>
+                              <div className="compute-meta">
+                                These weights drive the static board evaluator, MCTS priors, quiescence scoring, and the evaluation trace.
+                              </div>
                               <div className="tuning-grid">
                                 <label>
                                   <span className="tuning-label-text">
@@ -3095,6 +3276,80 @@ function App() {
                     </details>
                   </>
                 )}
+
+                <details className="dock-panel">
+                  <summary>Evaluation Trace</summary>
+                  <section className="controls">
+                    <div className="button-row">
+                      <label className="play-as">
+                        Metric
+                        <select value={evalTraceMetric} onChange={(event) => setEvalTraceMetric(event.target.value as EvalTraceMetric)}>
+                          <option value="objectiveForX">X objective</option>
+                          <option value="objectiveForO">O objective</option>
+                          <option value="scoreGap">Pressure gap</option>
+                        </select>
+                      </label>
+                      <div className="drag-readout">
+                        {replayRecord
+                          ? `Full replay trace | active step ${activeEvalPly} of ${analysisMoveHistory.length}`
+                          : mode === 'sandbox'
+                            ? `Sandbox trace | ${analysisMoveHistory.length} moves`
+                            : `Current game trace | ${analysisMoveHistory.length} moves`}
+                      </div>
+                    </div>
+                    <div className="compute-meta">
+                      Uses the current heuristic evaluator after every move prefix, including the start position.
+                    </div>
+                    {evalTraceError ? <div className="network-error">{evalTraceError}</div> : null}
+                    {isEvalTraceLoading ? <div className="compute-meta">Evaluating move trace…</div> : null}
+                    {!isEvalTraceLoading && !evalTraceError && evalTraceChart ? (
+                      <div className="eval-trace-card">
+                        <div className="compute-meta">
+                          {`Metric: ${evalTraceMetricLabel(evalTraceMetric)} | current ${evalTraceChart.currentValue.toFixed(3)} | largest swing ${evalTraceChart.largestSwing.toFixed(3)}`}
+                        </div>
+                        <div className="eval-trace-chart">
+                          <svg viewBox={`0 0 ${evalTraceChart.width} ${evalTraceChart.height}`} role="img" aria-label="Move-by-move evaluation trace">
+                            <line
+                              className="eval-trace-zero"
+                              x1={14}
+                              x2={evalTraceChart.width - 14}
+                              y1={evalTraceChart.zeroY}
+                              y2={evalTraceChart.zeroY}
+                            />
+                            <line
+                              className="eval-trace-active-line"
+                              x1={evalTraceChart.currentX}
+                              x2={evalTraceChart.currentX}
+                              y1={14}
+                              y2={evalTraceChart.height - 30}
+                            />
+                            <polyline
+                              className={`eval-trace-line ${
+                                evalTraceMetric === 'objectiveForO'
+                                  ? 'is-o'
+                                  : evalTraceMetric === 'scoreGap'
+                                    ? 'is-accent'
+                                    : 'is-x'
+                              }`}
+                              points={evalTraceChart.linePoints}
+                            />
+                            {evalTraceChart.pointMarkers.map((point) => (
+                              <circle key={point.key} className="eval-trace-point" cx={point.x} cy={point.y} r={2.75} />
+                            ))}
+                            <circle className="eval-trace-current-point" cx={evalTraceChart.currentX} cy={evalTraceChart.currentY} r={5} />
+                          </svg>
+                        </div>
+                        <div className="compute-meta">
+                          Active point: {evalTraceChart.currentPoint.label}
+                          {evalTraceChart.currentPoint.move
+                            ? ` | ${evalTraceChart.currentPoint.move.mark} @ ${evalTraceChart.currentPoint.move.q},${evalTraceChart.currentPoint.move.r}`
+                            : ''}
+                          {` | X obj ${evalTraceChart.currentPoint.objectiveForX.toFixed(3)} | O obj ${evalTraceChart.currentPoint.objectiveForO.toFixed(3)} | gap ${(evalTraceChart.currentPoint.xScore - evalTraceChart.currentPoint.oScore).toFixed(3)}`}
+                        </div>
+                      </div>
+                    ) : null}
+                  </section>
+                </details>
 
                 <details className="dock-panel">
                   <summary>Appearance</summary>
