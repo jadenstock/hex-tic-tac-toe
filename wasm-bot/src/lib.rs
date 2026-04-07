@@ -109,9 +109,18 @@ struct CandidatePolicy {
 #[derive(Clone, Debug)]
 struct EngineParams {
     threat_weights: [f64; 7],
+    threat_breadth_weights: [f64; 7],
     defense_weight: f64,
     tempo_discount_per_stone: f64,
     threat_severity_scale: f64,
+    one_turn_win_bonus: f64,
+    one_turn_fork_bonus: f64,
+    threat3_cluster_bonus: f64,
+    threat4_fork_bonus: f64,
+    threat5_fork_bonus: f64,
+    threat3_blocker_bonus: f64,
+    active_build_multiplier_one: f64,
+    active_build_multiplier_two: f64,
     candidate_radius: i32,
     top_k_first_moves: usize,
     turn_candidate_count: usize,
@@ -150,9 +159,18 @@ struct SearchOptionsInput {
 #[derive(Debug, Deserialize, Default)]
 struct BotTuningInput {
     threat_weights: Option<Vec<f64>>,
+    threat_breadth_weights: Option<Vec<f64>>,
     defense_weight: Option<f64>,
     tempo_discount_per_stone: Option<f64>,
     threat_severity_scale: Option<f64>,
+    one_turn_win_bonus: Option<f64>,
+    one_turn_fork_bonus: Option<f64>,
+    threat3_cluster_bonus: Option<f64>,
+    threat4_fork_bonus: Option<f64>,
+    threat5_fork_bonus: Option<f64>,
+    threat3_blocker_bonus: Option<f64>,
+    active_build_multiplier_one: Option<f64>,
+    active_build_multiplier_two: Option<f64>,
     candidate_radius: Option<i32>,
     top_k_first_moves: Option<usize>,
 }
@@ -168,6 +186,13 @@ struct ChooseTurnRequest {
     tuning: BotTuningInput,
     #[serde(default)]
     search_options: SearchOptionsInput,
+}
+
+#[derive(Debug, Deserialize)]
+struct EvaluatePositionRequest {
+    moves: Vec<MoveCell>,
+    #[serde(default)]
+    tuning: BotTuningInput,
 }
 
 #[derive(Debug, Serialize)]
@@ -195,6 +220,20 @@ struct ChooseTurnResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct EvaluatePositionResponse {
+    x_score: f64,
+    o_score: f64,
+    x_next_turn_finish_groups: usize,
+    o_next_turn_finish_groups: usize,
+    x_next_turn_blockers_required: usize,
+    o_next_turn_blockers_required: usize,
+    x_forced_next_turn: bool,
+    o_forced_next_turn: bool,
+    objective_for_x: f64,
+    objective_for_o: f64,
+}
+
+#[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
 }
@@ -208,6 +247,7 @@ struct ThreatWindow {
 
 #[derive(Clone, Debug)]
 struct ThreatLevelStats {
+    window_count: usize,
     blocker_burden: usize,
     resilience: f64,
     direction_count: usize,
@@ -369,10 +409,13 @@ fn turn_state_from_move_count(total_moves: usize) -> (Player, u8) {
     (turn, placements_left)
 }
 
-fn normalize_params(request: &ChooseTurnRequest) -> EngineParams {
+fn normalize_params(tuning: &BotTuningInput, search_options: Option<&SearchOptionsInput>) -> EngineParams {
+    let default_search_options = SearchOptionsInput::default();
+    let search_options = search_options.unwrap_or(&default_search_options);
     let mut threat_weights = [0.0_f64, 0.0, 6.0, 36.0, 860.0, 860.0, 20000.0];
+    let mut threat_breadth_weights = [0.0_f64, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
 
-    if let Some(weights) = &request.tuning.threat_weights {
+    if let Some(weights) = &tuning.threat_weights {
         for (idx, slot) in threat_weights.iter_mut().enumerate() {
             if let Some(value) = weights.get(idx) {
                 *slot = *value;
@@ -380,63 +423,62 @@ fn normalize_params(request: &ChooseTurnRequest) -> EngineParams {
         }
     }
 
-    let candidate_radius = request
-        .tuning
+    if let Some(weights) = &tuning.threat_breadth_weights {
+        for (idx, slot) in threat_breadth_weights.iter_mut().enumerate() {
+            if let Some(value) = weights.get(idx) {
+                *slot = *value;
+            }
+        }
+    }
+
+    let candidate_radius = tuning
         .candidate_radius
         .unwrap_or(4)
         .max(1)
         .min(8);
 
-    let top_k_first_moves = request
-        .tuning
+    let top_k_first_moves = tuning
         .top_k_first_moves
         .unwrap_or(12)
         .max(1)
         .min(48);
 
-    let turn_candidate_count = request
-        .search_options
+    let turn_candidate_count = search_options
         .turn_candidate_count
         .unwrap_or(8)
         .max(1)
         .min(64);
 
-    let child_turn_candidate_count = request
-        .search_options
+    let child_turn_candidate_count = search_options
         .child_turn_candidate_count
         .unwrap_or(8)
         .max(1)
         .min(64);
 
-    let exploration_c = request
-        .search_options
+    let exploration_c = search_options
         .exploration_c
         .unwrap_or(1.15)
         .max(0.0);
 
-    let max_simulation_turns = request
-        .search_options
+    let max_simulation_turns = search_options
         .max_simulation_turns
         .unwrap_or(3)
         .max(1)
         .min(12);
 
-    let simulation_turn_candidate_count = request
-        .search_options
+    let simulation_turn_candidate_count = search_options
         .simulation_turn_candidate_count
         .unwrap_or(4)
         .max(1)
         .min(24);
 
-    let simulation_radius = request
-        .search_options
+    let simulation_radius = search_options
         .simulation_radius
         .unwrap_or(3)
         .max(1)
         .min(8);
 
-    let simulation_top_k_first_moves = request
-        .search_options
+    let simulation_top_k_first_moves = search_options
         .simulation_top_k_first_moves
         .unwrap_or(2)
         .max(1)
@@ -444,9 +486,18 @@ fn normalize_params(request: &ChooseTurnRequest) -> EngineParams {
 
     EngineParams {
         threat_weights,
-        defense_weight: request.tuning.defense_weight.unwrap_or(1.1).max(0.0),
-        tempo_discount_per_stone: request.tuning.tempo_discount_per_stone.unwrap_or(0.08).max(0.0),
-        threat_severity_scale: request.tuning.threat_severity_scale.unwrap_or(3000.0).max(1.0),
+        threat_breadth_weights,
+        defense_weight: tuning.defense_weight.unwrap_or(1.1).max(0.0),
+        tempo_discount_per_stone: tuning.tempo_discount_per_stone.unwrap_or(0.08).max(0.0),
+        threat_severity_scale: tuning.threat_severity_scale.unwrap_or(3000.0).max(1.0),
+        one_turn_win_bonus: tuning.one_turn_win_bonus.unwrap_or(0.0).max(0.0),
+        one_turn_fork_bonus: tuning.one_turn_fork_bonus.unwrap_or(0.0).max(0.0),
+        threat3_cluster_bonus: tuning.threat3_cluster_bonus.unwrap_or(0.0).max(0.0),
+        threat4_fork_bonus: tuning.threat4_fork_bonus.unwrap_or(0.0).max(0.0),
+        threat5_fork_bonus: tuning.threat5_fork_bonus.unwrap_or(0.0).max(0.0),
+        threat3_blocker_bonus: tuning.threat3_blocker_bonus.unwrap_or(0.0).max(0.0),
+        active_build_multiplier_one: tuning.active_build_multiplier_one.unwrap_or(1.5).max(0.0),
+        active_build_multiplier_two: tuning.active_build_multiplier_two.unwrap_or(1.0).max(0.0),
         candidate_radius,
         top_k_first_moves,
         turn_candidate_count,
@@ -457,6 +508,26 @@ fn normalize_params(request: &ChooseTurnRequest) -> EngineParams {
         simulation_radius,
         simulation_top_k_first_moves,
     }
+}
+
+fn parse_moves(moves: &[MoveCell]) -> Result<(BoardMap, Vec<PlacedMove>), String> {
+    let mut moves_map: BoardMap = HashMap::new();
+    let mut move_history = Vec::new();
+
+    for cell in moves {
+        let mark = parse_player(&cell.mark)
+            .ok_or_else(|| format!("invalid mark '{}' at {},{}", cell.mark, cell.q, cell.r))?;
+        let coord = (cell.q, cell.r);
+        if !moves_map.contains_key(&coord) {
+            move_history.push(PlacedMove {
+                q: cell.q,
+                r: cell.r,
+            });
+        }
+        moves_map.insert(coord, mark);
+    }
+
+    Ok((moves_map, move_history))
 }
 
 fn count_direction(board: &BoardMap, q: i32, r: i32, dq: i32, dr: i32, player: Player) -> i32 {
@@ -1059,6 +1130,7 @@ fn pressure_for_threat_level(
     let level_windows: Vec<&ThreatWindow> = windows.iter().filter(|window| window.threat == threat).collect();
     if level_windows.is_empty() {
         return ThreatLevelStats {
+            window_count: 0,
             blocker_burden: 0,
             resilience: 0.0,
             direction_count: 0,
@@ -1088,11 +1160,97 @@ fn pressure_for_threat_level(
         * (0.5 + 0.5 * resilience);
 
     ThreatLevelStats {
+        window_count,
         blocker_burden,
         resilience,
         direction_count,
         pressure,
     }
+}
+
+fn extra_window_pairs(window_count: usize) -> f64 {
+    if window_count < 2 {
+        return 0.0;
+    }
+    (window_count * (window_count - 1)) as f64
+}
+
+fn response_budget_for_defender(board: &BoardState, attacker: Player) -> usize {
+    if board.turn == attacker.opponent() {
+        board.placements_left.max(1) as usize
+    } else {
+        2
+    }
+}
+
+fn tactical_bonus_for_player(
+    board: &BoardState,
+    features: &BoardFeatures,
+    profile: &ThreatProfile,
+    player: Player,
+    params: &EngineParams,
+) -> f64 {
+    let level3 = &profile.levels[3];
+    let level4 = &profile.levels[4];
+    let level5 = &profile.levels[5];
+
+    let breadth_bonus =
+        params.threat_breadth_weights[3] * extra_window_pairs(level3.window_count)
+        + params.threat_breadth_weights[4] * extra_window_pairs(level4.window_count)
+        + params.threat_breadth_weights[5] * extra_window_pairs(level5.window_count);
+
+    let threat3_cluster_signal = extra_window_pairs(level3.window_count)
+        + (level3.direction_count.saturating_sub(1) as f64) * level3.window_count as f64;
+    let threat3_cluster_bonus = params.threat3_cluster_bonus
+        * threat3_cluster_signal
+        * (0.5 + 0.5 * level3.resilience);
+
+    let threat3_blocker_bonus = params.threat3_blocker_bonus
+        * level3.window_count as f64
+        * level3.blocker_burden.saturating_sub(1) as f64;
+
+    let threat4_fork_bonus = params.threat4_fork_bonus
+        * level4.window_count as f64
+        * level4.blocker_burden.saturating_sub(1) as f64
+        * (0.5 + 0.5 * level4.resilience);
+
+    let threat5_fork_bonus = params.threat5_fork_bonus
+        * level5.window_count as f64
+        * level5.blocker_burden.saturating_sub(1) as f64
+        * (0.5 + 0.5 * level5.resilience);
+
+    let next_turn_finish_groups = one_turn_groups(features, player).len();
+    let next_turn_blockers_required = one_turn_blockers_required(features, player);
+    let finish_group_bonus = params.one_turn_win_bonus * next_turn_finish_groups as f64;
+    let overload = next_turn_blockers_required.saturating_sub(response_budget_for_defender(board, player));
+    let overload_bonus = params.one_turn_fork_bonus * overload as f64;
+
+    breadth_bonus
+        + threat3_cluster_bonus
+        + threat3_blocker_bonus
+        + threat4_fork_bonus
+        + threat5_fork_bonus
+        + finish_group_bonus
+        + overload_bonus
+}
+
+fn build_initiative_bonus_for_player(board: &BoardState, profile: &ThreatProfile, player: Player, params: &EngineParams) -> f64 {
+    if board.turn != player {
+        return 0.0;
+    }
+
+    let multiplier = if board.placements_left >= 2 {
+        params.active_build_multiplier_two
+    } else {
+        params.active_build_multiplier_one
+    };
+
+    if multiplier <= 1.0 {
+        return 0.0;
+    }
+
+    let build_pressure = profile.levels[2].pressure + profile.levels[3].pressure;
+    (multiplier - 1.0) * build_pressure
 }
 
 fn collect_threat_profile(board: &BoardMap, features: &BoardFeatures, player: Player, params: &EngineParams) -> ThreatProfile {
@@ -1132,13 +1290,15 @@ fn evaluate_board_summary(board: &BoardState, params: &EngineParams, stats: &mut
         x_stones,
         o_stones,
         params.tempo_discount_per_stone,
-    );
+    ) + tactical_bonus_for_player(board, &features, &x_profile, Player::X, params)
+        + build_initiative_bonus_for_player(board, &x_profile, Player::X, params);
     let o_raw = apply_tempo_discount(
         o_profile.total_pressure,
         o_stones,
         x_stones,
         params.tempo_discount_per_stone,
-    );
+    ) + tactical_bonus_for_player(board, &features, &o_profile, Player::O, params)
+        + build_initiative_bonus_for_player(board, &o_profile, Player::O, params);
 
     let x_score = x_raw / (x_raw + scale);
     let o_score = o_raw / (o_raw + scale);
@@ -3081,25 +3241,10 @@ fn sanitize_selected_moves(board: &BoardState, proposed: &[Coord]) -> Vec<Coord>
 
 fn choose_turn_internal(request: ChooseTurnRequest) -> Result<ChooseTurnResponse, String> {
     let turn = parse_player(&request.turn).ok_or_else(|| "turn must be X or O".to_owned())?;
-    let params = normalize_params(&request);
+    let params = normalize_params(&request.tuning, Some(&request.search_options));
     let max_time_ms = request.max_time_ms.unwrap_or(0);
     let max_nodes = request.max_nodes.unwrap_or(0);
-
-    let mut moves_map: BoardMap = HashMap::new();
-    let mut move_history = Vec::new();
-
-    for cell in request.moves {
-        let mark = parse_player(&cell.mark)
-            .ok_or_else(|| format!("invalid mark '{}' at {},{}", cell.mark, cell.q, cell.r))?;
-        let coord = (cell.q, cell.r);
-        if !moves_map.contains_key(&coord) {
-            move_history.push(PlacedMove {
-                q: cell.q,
-                r: cell.r,
-            });
-        }
-        moves_map.insert(coord, mark);
-    }
+    let (moves_map, move_history) = parse_moves(&request.moves)?;
 
     let mut board = BoardState {
         moves: moves_map,
@@ -3213,6 +3358,40 @@ fn choose_turn_internal(request: ChooseTurnRequest) -> Result<ChooseTurnResponse
     Ok(response)
 }
 
+fn evaluate_position_internal(request: EvaluatePositionRequest) -> Result<EvaluatePositionResponse, String> {
+    let params = normalize_params(&request.tuning, None);
+    let (moves_map, move_history) = parse_moves(&request.moves)?;
+    let (turn, placements_left) = turn_state_from_move_count(move_history.len());
+
+    let board = BoardState {
+        moves: moves_map,
+        move_history,
+        turn,
+        placements_left,
+    };
+
+    let mut stats = EngineStats::default();
+    let summary = evaluate_board_summary(&board, &params, &mut stats);
+    let features = collect_features(&board.moves);
+    let x_next_turn_finish_groups = features.x_one_turn_groups.len();
+    let o_next_turn_finish_groups = features.o_one_turn_groups.len();
+    let x_next_turn_blockers_required = one_turn_blockers_required(&features, Player::X);
+    let o_next_turn_blockers_required = one_turn_blockers_required(&features, Player::O);
+
+    Ok(EvaluatePositionResponse {
+        x_score: summary.x_score,
+        o_score: summary.o_score,
+        x_next_turn_finish_groups,
+        o_next_turn_finish_groups,
+        x_next_turn_blockers_required,
+        o_next_turn_blockers_required,
+        x_forced_next_turn: x_next_turn_blockers_required >= 3,
+        o_forced_next_turn: o_next_turn_blockers_required >= 3,
+        objective_for_x: objective_for_player(&summary, Player::X, &params),
+        objective_for_o: objective_for_player(&summary, Player::O, &params),
+    })
+}
+
 #[wasm_bindgen]
 pub fn choose_turn_json(input_json: &str) -> String {
     let parsed: ChooseTurnRequest = match serde_json::from_str(input_json) {
@@ -3223,6 +3402,22 @@ pub fn choose_turn_json(input_json: &str) -> String {
     };
 
     match choose_turn_internal(parsed) {
+        Ok(response) => serde_json::to_string(&response)
+            .unwrap_or_else(|_| "{\"error\":\"response serialization failed\"}".to_owned()),
+        Err(error) => to_error_json(error),
+    }
+}
+
+#[wasm_bindgen]
+pub fn evaluate_position_json(input_json: &str) -> String {
+    let parsed: EvaluatePositionRequest = match serde_json::from_str(input_json) {
+        Ok(value) => value,
+        Err(error) => {
+            return to_error_json(format!("invalid request JSON: {}", error));
+        }
+    };
+
+    match evaluate_position_internal(parsed) {
         Ok(response) => serde_json::to_string(&response)
             .unwrap_or_else(|_| "{\"error\":\"response serialization failed\"}".to_owned()),
         Err(error) => to_error_json(error),

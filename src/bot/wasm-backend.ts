@@ -41,9 +41,18 @@ type WasmTurnRequest = {
   max_nodes: number
   tuning: {
     threat_weights: number[]
+    threat_breadth_weights: number[]
     defense_weight: number
     tempo_discount_per_stone: number
     threat_severity_scale: number
+    one_turn_win_bonus: number
+    one_turn_fork_bonus: number
+    threat3_cluster_bonus: number
+    threat4_fork_bonus: number
+    threat5_fork_bonus: number
+    threat3_blocker_bonus: number
+    active_build_multiplier_one: number
+    active_build_multiplier_two: number
     candidate_radius: number
     top_k_first_moves: number
   }
@@ -168,9 +177,18 @@ function toWasmTurnRequest(state: LiveLikeState, options: BotSearchOptions, tuni
     max_nodes: Math.max(0, Math.floor(options.budget.maxNodes)),
     tuning: {
       threat_weights: [...tuning.threatWeights],
+      threat_breadth_weights: [...tuning.threatBreadthWeights],
       defense_weight: tuning.defenseWeight,
       tempo_discount_per_stone: tuning.tempoDiscountPerStone,
       threat_severity_scale: tuning.threatSeverityScale,
+      one_turn_win_bonus: tuning.oneTurnWinBonus,
+      one_turn_fork_bonus: tuning.oneTurnForkBonus,
+      threat3_cluster_bonus: tuning.threat3ClusterBonus,
+      threat4_fork_bonus: tuning.threat4ForkBonus,
+      threat5_fork_bonus: tuning.threat5ForkBonus,
+      threat3_blocker_bonus: tuning.threat3BlockerBonus,
+      active_build_multiplier_one: tuning.activeBuildMultiplierOne,
+      active_build_multiplier_two: tuning.activeBuildMultiplierTwo,
       candidate_radius: Math.max(1, Math.floor(tuning.candidateRadius)),
       top_k_first_moves: Math.max(1, Math.floor(tuning.topKFirstMoves)),
     },

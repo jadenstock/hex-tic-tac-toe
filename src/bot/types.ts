@@ -90,6 +90,8 @@ export type BotTuning = {
   triangleBonus: number
   rhombusBonus: number
   threat3BlockerBonus: number
+  activeBuildMultiplierOne: number
+  activeBuildMultiplierTwo: number
   candidateRadius: number
   topKFirstMoves: number
 }
@@ -211,17 +213,19 @@ export const DEFAULT_BOT_TUNING: BotTuning = {
   tempoDiscountPerStone: 0.08,
   threatSeverityScale: 3000,
   immediateDangerPenalty: 150000,
-  oneTurnWinBonus: 3500,
-  threatBreadthWeights: [0, 0, 0, 42, 14, 8, 0],
-  oneTurnForkBonus: 27300,
+  oneTurnWinBonus: 0,
+  threatBreadthWeights: [0, 0, 0, 0, 0, 0, 0],
+  oneTurnForkBonus: 0,
   oneTurnOverlapPenalty: 6975,
-  threat3ClusterBonus: 120,
+  threat3ClusterBonus: 0,
   threat3ClusterBreadthFloor: 0.2,
-  threat4ForkBonus: 17400,
-  threat5ForkBonus: 15000,
+  threat4ForkBonus: 0,
+  threat5ForkBonus: 0,
   triangleBonus: 0,
   rhombusBonus: 0,
   threat3BlockerBonus: 0,
+  activeBuildMultiplierOne: 1.5,
+  activeBuildMultiplierTwo: 1,
   candidateRadius: 4,
   topKFirstMoves: 12,
 }
