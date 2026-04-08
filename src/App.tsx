@@ -1125,7 +1125,7 @@ function clampValue(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value))
 }
 
-function createBotTelemetryDownload(filename: string, payload: BotTelemetryFile): void {
+function downloadJsonFile(filename: string, payload: unknown): void {
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
   const url = URL.createObjectURL(blob)
   const anchor = document.createElement('a')
@@ -2008,8 +2008,41 @@ function App() {
       entries: botTelemetryEntries,
     }
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
-    createBotTelemetryDownload(`hex-ttt-bot-telemetry-${timestamp}.json`, payload)
+    downloadJsonFile(`hex-ttt-bot-telemetry-${timestamp}.json`, payload)
   }, [botTelemetryEntries])
+
+  const exportGameState = useCallback(() => {
+    const timestamp = new Date().toISOString()
+    const filenameStem = replayGameId ?? currentGameId ?? joinedRoom ?? 'local'
+
+    downloadJsonFile(`hex-ttt-game-state-${filenameStem}-${timestamp.replace(/[:.]/g, '-')}.json`, {
+      version: 1,
+      exportedAt: timestamp,
+      app: 'hex-ttt',
+      source: isReplayMode ? 'replay' : mode === 'sandbox' ? 'sandbox' : joinedRoom ? 'live-room' : 'local-live',
+      roomId: joinedRoom,
+      currentGameId,
+      replayGameId,
+      trackedGameId,
+      trackedGameUrl,
+      turn: displayState.turn,
+      placementsLeft: displayState.placementsLeft,
+      winner: displayState.winner,
+      moveCount: displayState.moveHistory.length,
+      participants: currentParticipants,
+      moveHistory: displayState.moveHistory,
+    })
+  }, [
+    currentGameId,
+    currentParticipants,
+    displayState,
+    isReplayMode,
+    joinedRoom,
+    mode,
+    replayGameId,
+    trackedGameId,
+    trackedGameUrl,
+  ])
 
   const setAutoBotMode = useCallback((side: 'off' | 'X' | 'O' | 'both') => {
     const botOwnsX = side === 'X' || side === 'both'
@@ -2737,6 +2770,9 @@ function App() {
               Save Game Snapshot
             </button>
           ) : null}
+          <button className="toggle-hud" onClick={exportGameState} type="button">
+            Export state
+          </button>
           {trackedGameUrl ? (
             <button className="toggle-hud" onClick={() => void copyTrackedLink()} type="button">
               Copy link

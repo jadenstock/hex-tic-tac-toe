@@ -12,6 +12,7 @@ const FORCING_DEFENDER_BRANCH_CAP: usize = 15;
 const FORCING_PROVEN_WIN_SCORE: f64 = 2.0;
 const FORCING_PROVEN_LOSS_SCORE: f64 = -2.0;
 const FORCING_STATUS_SCORE_BOUNDARY: f64 = 1.5;
+const DEAD_STONE_PENALTY: f64 = 24.0;
 const DIRECTIONS: [(i32, i32); 3] = [(1, 0), (0, 1), (1, -1)];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -70,6 +71,8 @@ struct EvalSummary {
     o_score: f64,
     x_one_turn_wins: usize,
     o_one_turn_wins: usize,
+    x_forced_next_turn: bool,
+    o_forced_next_turn: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -102,6 +105,8 @@ struct MctsAction {
 struct CandidatePolicy {
     top_cell_count: usize,
     max_line_count: usize,
+    contextual_second_move_count: usize,
+    retain_all_lines: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -966,8 +971,12 @@ fn one_turn_blockers_required(features: &BoardFeatures, player: Player) -> usize
     minimum_blockers_required_from_pairs(&pairs)
 }
 
+fn has_one_turn_finish_threat(features: &BoardFeatures, player: Player) -> bool {
+    !one_turn_groups(features, player).is_empty()
+}
+
 fn has_immediate_threats(features: &BoardFeatures) -> bool {
-    !features.x_one_turn_groups.is_empty() || !features.o_one_turn_groups.is_empty()
+    has_one_turn_finish_threat(features, Player::X) || has_one_turn_finish_threat(features, Player::O)
 }
 
 fn enumerate_covering_move_sets(
@@ -1059,6 +1068,36 @@ fn threat_count_exponent(threat: usize) -> f64 {
 
 fn count_stones(board: &BoardMap, player: Player) -> usize {
     board.values().filter(|&&mark| mark == player).count()
+}
+
+fn live_stone_count(board: &BoardMap, features: &BoardFeatures, player: Player) -> usize {
+    let mut live = HashSet::new();
+
+    for window in &features.active_windows {
+        let (own, opp) = match player {
+            Player::X => (window.x_count, window.o_count),
+            Player::O => (window.o_count, window.x_count),
+        };
+        if own == 0 || opp > 0 {
+            continue;
+        }
+
+        for &coord in &window.cells {
+            if board.get(&coord).copied() == Some(player) {
+                live.insert(coord);
+            }
+        }
+    }
+
+    live.len()
+}
+
+fn count_dead_stones(board: &BoardMap, features: &BoardFeatures, player: Player) -> usize {
+    count_stones(board, player).saturating_sub(live_stone_count(board, features, player))
+}
+
+fn apply_dead_stone_penalty(score: f64, dead_stones: usize) -> f64 {
+    (score - DEAD_STONE_PENALTY * dead_stones as f64).max(0.0)
 }
 
 fn apply_tempo_discount(score: f64, own_stones: usize, opp_stones: usize, k: f64) -> f64 {
@@ -1294,6 +1333,24 @@ fn response_budget_for_defender(board: &BoardState, attacker: Player) -> usize {
     }
 }
 
+fn has_forced_next_turn_win(board: &BoardState, features: &BoardFeatures, player: Player) -> bool {
+    if board.turn == player {
+        return false;
+    }
+
+    if !has_one_turn_finish_threat(features, player) {
+        return false;
+    }
+
+    // Be conservative: if the side to move already has an immediate finish threat,
+    // don't collapse the position into a forced-next-turn win for the waiting player.
+    if has_one_turn_finish_threat(features, board.turn) {
+        return false;
+    }
+
+    one_turn_blockers_required(features, player) > response_budget_for_defender(board, player)
+}
+
 fn tactical_bonus_for_player(
     board: &BoardState,
     features: &BoardFeatures,
@@ -1388,28 +1445,38 @@ fn evaluate_board_summary(board: &BoardState, params: &EngineParams, stats: &mut
     let features = collect_features(&board.moves);
     let x_one_turn_wins = features.x_one_turn_groups.len();
     let o_one_turn_wins = features.o_one_turn_groups.len();
+    let x_forced_next_turn = has_forced_next_turn_win(board, &features, Player::X);
+    let o_forced_next_turn = has_forced_next_turn_win(board, &features, Player::O);
 
     let x_stones = count_stones(&board.moves, Player::X);
     let o_stones = count_stones(&board.moves, Player::O);
+    let x_dead_stones = count_dead_stones(&board.moves, &features, Player::X);
+    let o_dead_stones = count_dead_stones(&board.moves, &features, Player::O);
 
     let x_profile = collect_threat_profile(&board.moves, &features, Player::X, params);
     let o_profile = collect_threat_profile(&board.moves, &features, Player::O, params);
 
     let scale = params.threat_severity_scale.max(1.0);
-    let x_raw = apply_tempo_discount(
-        x_profile.total_pressure,
-        x_stones,
-        o_stones,
-        params.tempo_discount_per_stone,
-    ) + tactical_bonus_for_player(board, &features, &x_profile, Player::X, params)
-        + build_initiative_bonus_for_player(board, &x_profile, Player::X, params);
-    let o_raw = apply_tempo_discount(
-        o_profile.total_pressure,
-        o_stones,
-        x_stones,
-        params.tempo_discount_per_stone,
-    ) + tactical_bonus_for_player(board, &features, &o_profile, Player::O, params)
-        + build_initiative_bonus_for_player(board, &o_profile, Player::O, params);
+    let x_raw = apply_dead_stone_penalty(
+        apply_tempo_discount(
+            x_profile.total_pressure,
+            x_stones,
+            o_stones,
+            params.tempo_discount_per_stone,
+        ) + tactical_bonus_for_player(board, &features, &x_profile, Player::X, params)
+            + build_initiative_bonus_for_player(board, &x_profile, Player::X, params),
+        x_dead_stones,
+    );
+    let o_raw = apply_dead_stone_penalty(
+        apply_tempo_discount(
+            o_profile.total_pressure,
+            o_stones,
+            x_stones,
+            params.tempo_discount_per_stone,
+        ) + tactical_bonus_for_player(board, &features, &o_profile, Player::O, params)
+            + build_initiative_bonus_for_player(board, &o_profile, Player::O, params),
+        o_dead_stones,
+    );
 
     let x_score = x_raw / (x_raw + scale);
     let o_score = o_raw / (o_raw + scale);
@@ -1428,14 +1495,34 @@ fn evaluate_board_summary(board: &BoardState, params: &EngineParams, stats: &mut
         o_score,
         x_one_turn_wins,
         o_one_turn_wins,
+        x_forced_next_turn,
+        o_forced_next_turn,
     }
 }
 
 fn objective_for_player(result: &EvalSummary, player: Player, params: &EngineParams) -> f64 {
-    let (own, opp) = match player {
-        Player::X => (result.x_score, result.o_score),
-        Player::O => (result.o_score, result.x_score),
+    let (own, opp, own_forced, opp_forced) = match player {
+        Player::X => (
+            result.x_score,
+            result.o_score,
+            result.x_forced_next_turn,
+            result.o_forced_next_turn,
+        ),
+        Player::O => (
+            result.o_score,
+            result.x_score,
+            result.o_forced_next_turn,
+            result.x_forced_next_turn,
+        ),
     };
+
+    if own_forced && !opp_forced {
+        return 1.0;
+    }
+    if opp_forced && !own_forced {
+        return -1.0;
+    }
+
     own - params.defense_weight * opp
 }
 
@@ -1655,18 +1742,25 @@ fn collect_live_neighbor_candidates(board: &BoardState) -> Vec<Coord> {
     neighbors
 }
 
-fn collect_legal_candidates(board: &BoardState, player: Player, params: &EngineParams, target_count: usize) -> Vec<Coord> {
+fn collect_candidate_pool(
+    board: &BoardState,
+    player: Player,
+    params: &EngineParams,
+    target_count: usize,
+    force_take_own_immediate: bool,
+    force_block_opponent_immediate: bool,
+) -> Vec<Coord> {
     let features = collect_features(&board.moves);
 
     let own_finishes = collect_one_turn_finish_cells(&features, player);
-    if !own_finishes.is_empty() {
+    if force_take_own_immediate && !own_finishes.is_empty() {
         let mut out: Vec<Coord> = own_finishes.into_iter().collect();
         out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         return out;
     }
 
     let forced_blocks = collect_one_turn_finish_cells(&features, player.opponent());
-    if !forced_blocks.is_empty() {
+    if force_block_opponent_immediate && !forced_blocks.is_empty() {
         let mut out: Vec<Coord> = forced_blocks.into_iter().collect();
         out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         return out;
@@ -1705,6 +1799,12 @@ fn collect_legal_candidates(board: &BoardState, player: Player, params: &EngineP
         };
 
         let mut pool = live_neighbors;
+        if !force_take_own_immediate {
+            pool.extend(own_finishes.iter().copied());
+        }
+        if !force_block_opponent_immediate {
+            pool.extend(forced_blocks.iter().copied());
+        }
         pool.extend(selected.into_iter().take(cap).map(|(coord, _)| coord));
         return sorted_unique_coords(pool);
     }
@@ -1733,6 +1833,32 @@ fn collect_legal_candidates(board: &BoardState, player: Player, params: &EngineP
         .into_iter()
         .filter(|coord| !is_dead_candidate_hex(&board.moves, *coord))
         .collect()
+}
+
+fn collect_legal_candidates(board: &BoardState, player: Player, params: &EngineParams, target_count: usize) -> Vec<Coord> {
+    collect_candidate_pool(board, player, params, target_count, true, true)
+}
+
+fn collect_same_turn_followup_candidates(
+    board: &BoardState,
+    player: Player,
+    params: &EngineParams,
+    target_count: usize,
+) -> Vec<Coord> {
+    collect_candidate_pool(board, player, params, target_count, false, false)
+}
+
+fn collect_turn_start_candidates(
+    board: &BoardState,
+    player: Player,
+    params: &EngineParams,
+    target_count: usize,
+) -> Vec<Coord> {
+    if board.placements_left > 1 {
+        collect_same_turn_followup_candidates(board, player, params, target_count)
+    } else {
+        collect_legal_candidates(board, player, params, target_count)
+    }
 }
 
 fn rank_placements(
@@ -1914,7 +2040,7 @@ fn collect_winning_turn_lines(
         return Vec::new();
     }
 
-    let first_options = collect_legal_candidates(board, player, params, 0);
+    let first_options = collect_turn_start_candidates(board, player, params, 0);
     if first_options.is_empty() {
         return Vec::new();
     }
@@ -1941,7 +2067,7 @@ fn collect_winning_turn_lines(
             continue;
         }
 
-        let second_options = collect_legal_candidates(&after_first, player, params, 0);
+        let second_options = collect_same_turn_followup_candidates(&after_first, player, params, 0);
         for second in second_options {
             let key = canonical_line_key(&[first, second]);
             if !seen.insert(key) {
@@ -1989,13 +2115,18 @@ fn enumerate_turn_candidates(
     let baseline_opp_wins = opponent_one_turn_wins(&base_eval, player);
 
     let top_cell_count = policy.top_cell_count.max(1);
-    let first_pool = collect_legal_candidates(board, player, params, top_cell_count);
+    let first_pool = collect_turn_start_candidates(board, player, params, top_cell_count);
     let first_ranked = rank_placements(board, player, params, &first_pool, stats);
     if first_ranked.is_empty() {
         return Vec::new();
     }
 
-    let top_cell_placements: Vec<RankedPlacement> = first_ranked.into_iter().take(top_cell_count).collect();
+    let first_rank_limit = if board.placements_left > 1 && policy.contextual_second_move_count > 0 {
+        usize::MAX
+    } else {
+        top_cell_count
+    };
+    let top_cell_placements: Vec<RankedPlacement> = first_ranked.into_iter().take(first_rank_limit).collect();
 
     if board.placements_left <= 1 {
         let opponent_finishes = collect_one_turn_finish_cells(&collect_features(&board.moves), player.opponent());
@@ -2033,95 +2164,101 @@ fn enumerate_turn_candidates(
         return pruned;
     }
 
-    let baseline_opp_finish = collect_one_turn_finish_cells(&collect_features(&board.moves), player.opponent());
     let mut lines = Vec::new();
     let mut seen_pair_keys = HashSet::new();
+    if policy.contextual_second_move_count > 0 {
+        let first_cells = collect_turn_start_candidates(
+            board,
+            player,
+            params,
+            policy.contextual_second_move_count.max(top_cell_count),
+        );
 
-    if !baseline_opp_finish.is_empty() {
-        for first_entry in &top_cell_placements {
-            let first = first_entry.option;
+        for first in first_cells {
             let (after_first, first_winner) = match apply_move_copy(board, first, player) {
                 Some(value) => value,
                 None => continue,
             };
 
-            let second_pool = collect_legal_candidates(&after_first, player, params, top_cell_count);
-            let second_ranked = rank_placements(&after_first, player, params, &second_pool, stats)
-                .into_iter()
-                .take(top_cell_count)
-                .collect::<Vec<_>>();
-
-            if second_ranked.is_empty() {
-                lines.push(score_applied_turn(
-                    &after_first,
-                    player,
-                    vec![first],
-                    first_winner,
-                    params,
-                    stats,
-                ));
+            if first_winner == Some(player) {
+                let pair_key = canonical_line_key(&[first]);
+                if seen_pair_keys.insert(pair_key) {
+                    lines.push(score_applied_turn(
+                        &after_first,
+                        player,
+                        vec![first],
+                        first_winner,
+                        params,
+                        stats,
+                    ));
+                }
                 continue;
             }
 
-            for second_entry in second_ranked {
-                let second = second_entry.option;
+            let second_cells = collect_same_turn_followup_candidates(
+                &after_first,
+                player,
+                params,
+                policy.contextual_second_move_count.max(top_cell_count),
+            );
+
+            for second in second_cells {
                 let pair_key = canonical_line_key(&[first, second]);
                 if !seen_pair_keys.insert(pair_key) {
                     continue;
                 }
 
+                let (after_second, second_winner) = match apply_move_copy(&after_first, second, player) {
+                    Some(value) => value,
+                    None => continue,
+                };
+
+                let eval_result = evaluate_board_summary(&after_second, params, stats);
                 lines.push(RankedLine {
                     line: vec![first, second],
-                    objective: second_entry.objective,
-                    own_score: second_entry.own_score,
-                    immediate_win: second_entry.immediate_win,
-                    opp_one_turn_wins: second_entry.opp_one_turn_wins,
+                    objective: objective_for_player(&eval_result, player, params),
+                    own_score: score_for_player(&eval_result, player),
+                    immediate_win: second_winner == Some(player),
+                    opp_one_turn_wins: opponent_one_turn_wins(&eval_result, player),
                 });
             }
         }
+    } else {
+        let top_cells: Vec<Coord> = top_cell_placements.iter().map(|entry| entry.option).collect();
 
-        let mut pruned = prune_defensively_critical_lines(lines, baseline_opp_wins);
-        sort_ranked_lines(&mut pruned);
-        stats.nodes_expanded = stats
-            .nodes_expanded
-            .saturating_add(pruned.len() as u32);
-        return pruned;
-    }
+        for first_idx in 0..top_cells.len() {
+            for second_idx in (first_idx + 1)..top_cells.len() {
+                let first = top_cells[first_idx];
+                let second = top_cells[second_idx];
+                let pair_key = canonical_line_key(&[first, second]);
+                if !seen_pair_keys.insert(pair_key) {
+                    continue;
+                }
 
-    let top_cells: Vec<Coord> = top_cell_placements.iter().map(|entry| entry.option).collect();
+                let (after_first, _) = match apply_move_copy(board, first, player) {
+                    Some(value) => value,
+                    None => continue,
+                };
 
-    for first_idx in 0..top_cells.len() {
-        for second_idx in (first_idx + 1)..top_cells.len() {
-            let first = top_cells[first_idx];
-            let second = top_cells[second_idx];
-            let pair_key = canonical_line_key(&[first, second]);
-            if !seen_pair_keys.insert(pair_key) {
-                continue;
+                let (after_second, second_winner) = match apply_move_copy(&after_first, second, player) {
+                    Some(value) => value,
+                    None => continue,
+                };
+
+                let eval_result = evaluate_board_summary(&after_second, params, stats);
+                lines.push(RankedLine {
+                    line: vec![first, second],
+                    objective: objective_for_player(&eval_result, player, params),
+                    own_score: score_for_player(&eval_result, player),
+                    immediate_win: second_winner == Some(player),
+                    opp_one_turn_wins: opponent_one_turn_wins(&eval_result, player),
+                });
             }
-
-            let (after_first, _) = match apply_move_copy(board, first, player) {
-                Some(value) => value,
-                None => continue,
-            };
-
-            let (after_second, second_winner) = match apply_move_copy(&after_first, second, player) {
-                Some(value) => value,
-                None => continue,
-            };
-
-            let eval_result = evaluate_board_summary(&after_second, params, stats);
-            lines.push(RankedLine {
-                line: vec![first, second],
-                objective: objective_for_player(&eval_result, player, params),
-                own_score: score_for_player(&eval_result, player),
-                immediate_win: second_winner == Some(player),
-                opp_one_turn_wins: opponent_one_turn_wins(&eval_result, player),
-            });
         }
     }
 
     if lines.is_empty() {
-        if let Some(first) = top_cells.first().copied() {
+        if let Some(first) = top_cell_placements.first().map(|entry| entry.option) {
             let (after, _, winner) = apply_turn_line(board, &[first], player);
             return vec![score_applied_turn(&after, player, vec![first], winner, params, stats)];
         }
@@ -2133,7 +2270,11 @@ fn enumerate_turn_candidates(
 
     let mut picks = Vec::new();
     let mut unique = HashSet::new();
-    let max_line_count = policy.max_line_count.max(1);
+    let max_line_count = if policy.retain_all_lines {
+        usize::MAX
+    } else {
+        policy.max_line_count.max(1)
+    };
 
     for candidate in pruned {
         let key = canonical_line_key(&candidate.line);
@@ -2164,7 +2305,9 @@ fn root_search_policy(params: &EngineParams) -> CandidatePolicy {
 
     CandidatePolicy {
         top_cell_count: widened_top_cell_count(params.top_k_first_moves, top_cell_budget, 2),
-        max_line_count: line_limit.max((line_limit * 2).min(16)),
+        max_line_count: line_limit.max((line_limit * 4).min(192)),
+        contextual_second_move_count: line_limit.max(48).min(64),
+        retain_all_lines: true,
     }
 }
 
@@ -2172,6 +2315,8 @@ fn child_search_policy(params: &EngineParams) -> CandidatePolicy {
     CandidatePolicy {
         top_cell_count: widened_top_cell_count(params.top_k_first_moves, params.child_turn_candidate_count, 2),
         max_line_count: params.child_turn_candidate_count.min(20).max(6),
+        contextual_second_move_count: 0,
+        retain_all_lines: false,
     }
 }
 
@@ -2184,6 +2329,8 @@ fn choose_greedy_turn(board: &BoardState, params: &EngineParams, stats: &mut Eng
     let policy = CandidatePolicy {
         top_cell_count: widened_top_cell_count(params.top_k_first_moves, 24, 3),
         max_line_count: 24,
+        contextual_second_move_count: 48,
+        retain_all_lines: false,
     };
 
     let mut lines = enumerate_turn_candidates(board, player, params, policy, stats);
@@ -2217,8 +2364,7 @@ fn broaden_turn_actions(
         .max(params.simulation_top_k_first_moves)
         .max(6);
 
-    let legal_cells =
-        collect_legal_candidates(board, player, &broad_params, target.saturating_mul(3));
+    let legal_cells = collect_turn_start_candidates(board, player, &broad_params, target.saturating_mul(3));
     if legal_cells.is_empty() {
         return Vec::new();
     }
@@ -2304,6 +2450,8 @@ fn simulation_search_policy(params: &EngineParams) -> CandidatePolicy {
             1,
         ),
         max_line_count: params.simulation_turn_candidate_count.max(1).min(16),
+        contextual_second_move_count: 0,
+        retain_all_lines: false,
     }
 }
 
@@ -3856,8 +4004,8 @@ fn evaluate_position_internal(request: EvaluatePositionRequest) -> Result<Evalua
         o_next_turn_finish_groups,
         x_next_turn_blockers_required,
         o_next_turn_blockers_required,
-        x_forced_next_turn: x_next_turn_blockers_required >= 3,
-        o_forced_next_turn: o_next_turn_blockers_required >= 3,
+        x_forced_next_turn: summary.x_forced_next_turn,
+        o_forced_next_turn: summary.o_forced_next_turn,
         objective_for_x: objective_for_player(&summary, Player::X, &params),
         objective_for_o: objective_for_player(&summary, Player::O, &params),
     })
@@ -3917,6 +4065,83 @@ mod tests {
             total_value: 0.0,
             static_value: Some(0.0),
             terminal_winner: None,
+        }
+    }
+
+    fn archived_snapshot_1577_board() -> BoardState {
+        let moves = [
+            (1, -1, "X"),
+            (0, 0, "O"),
+            (1, 0, "O"),
+            (0, -1, "X"),
+            (2, -1, "X"),
+            (-1, 0, "O"),
+            (5, -1, "O"),
+            (-1, -1, "X"),
+            (-4, 0, "X"),
+            (-2, -1, "O"),
+            (4, -1, "O"),
+            (-5, 1, "X"),
+            (-4, 1, "X"),
+            (-2, 0, "O"),
+            (4, 0, "O"),
+            (2, 0, "X"),
+            (-5, 2, "X"),
+            (3, 1, "O"),
+            (4, 1, "O"),
+            (4, 2, "X"),
+            (4, -3, "X"),
+            (2, 1, "O"),
+            (-2, -2, "O"),
+            (5, 1, "X"),
+            (1, 1, "X"),
+            (3, -1, "O"),
+            (-3, 1, "O"),
+            (-2, -3, "X"),
+            (-2, 1, "X"),
+            (-4, 2, "O"),
+            (-5, 3, "O"),
+            (-7, 5, "X"),
+            (6, -1, "X"),
+            (6, -2, "O"),
+            (-6, 3, "O"),
+            (2, 2, "X"),
+            (7, -3, "X"),
+            (3, 0, "O"),
+            (-7, 3, "O"),
+            (3, 2, "X"),
+            (6, 0, "X"),
+        ]
+        .into_iter()
+        .map(|(q, r, mark)| MoveCell {
+            q,
+            r,
+            mark: mark.to_owned(),
+        })
+        .collect::<Vec<_>>();
+
+        let (moves_map, move_history) = parse_moves(&moves).expect("snapshot parses");
+        let (turn, placements_left) = turn_state_from_move_count(move_history.len());
+
+        BoardState {
+            moves: moves_map,
+            move_history,
+            turn,
+            placements_left,
+        }
+    }
+
+    fn line_forces_next_turn_win(board: &BoardState, line: &[Coord], player: Player, params: &EngineParams) -> bool {
+        let (after_line, _, winner) = apply_turn_line(board, line, player);
+        if winner == Some(player) {
+            return true;
+        }
+
+        let mut stats = EngineStats::default();
+        let summary = evaluate_board_summary(&after_line, params, &mut stats);
+        match player {
+            Player::X => summary.x_forced_next_turn,
+            Player::O => summary.o_forced_next_turn,
         }
     }
 
@@ -4004,5 +4229,109 @@ mod tests {
         assert_eq!(context.telemetry.transposition_stores, 1);
         assert_eq!(entry.visits, 2);
         assert!((entry.total_value - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn dead_stone_count_detects_fully_blocked_stone() {
+        let mut board: BoardMap = HashMap::new();
+        board.insert((0, 0), Player::X);
+
+        for coord in [(-3, 0), (3, 0), (0, -3), (0, 3), (-3, 3), (3, -3)] {
+            board.insert(coord, Player::O);
+        }
+
+        let features = collect_features(&board);
+
+        assert_eq!(count_dead_stones(&board, &features, Player::X), 1);
+        assert_eq!(count_dead_stones(&board, &features, Player::O), 0);
+    }
+
+    #[test]
+    fn archived_snapshot_known_forcing_pair_scores_as_terminal_for_o() {
+        let params = base_params();
+        let board = archived_snapshot_1577_board();
+        let (after_line, applied, winner) = apply_turn_line(&board, &[(1, 2), (-8, 3)], Player::O);
+
+        assert_eq!(board.turn, Player::O);
+        assert_eq!(board.placements_left, 2);
+        assert_eq!(applied, vec![(1, 2), (-8, 3)]);
+        assert_eq!(winner, None);
+
+        let mut stats = EngineStats::default();
+        let summary = evaluate_board_summary(&after_line, &params, &mut stats);
+
+        assert!(summary.o_forced_next_turn);
+        assert!(!summary.x_forced_next_turn);
+        assert_eq!(objective_for_player(&summary, Player::O, &params), 1.0);
+        assert_eq!(objective_for_player(&summary, Player::X, &params), -1.0);
+    }
+
+    #[test]
+    fn archived_snapshot_root_candidates_include_terminal_line_for_o() {
+        let params = base_params();
+        let board = archived_snapshot_1577_board();
+        let mut stats = EngineStats::default();
+        let lines = enumerate_turn_candidates(&board, Player::O, &params, root_search_policy(&params), &mut stats);
+        let preview = lines
+            .iter()
+            .take(12)
+            .map(|line| format!("{:?} objective {:.3}", line.line, line.objective))
+            .collect::<Vec<_>>();
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.immediate_win || line_forces_next_turn_win(&board, &line.line, Player::O, &params)),
+            "expected root candidates to include a terminal-equivalent O line; top lines: {:?}",
+            preview
+        );
+    }
+
+    #[test]
+    fn archived_snapshot_followup_pool_after_1_2_contains_terminal_line() {
+        let params = base_params();
+        let board = archived_snapshot_1577_board();
+        let policy = root_search_policy(&params);
+        let first_pool = collect_turn_start_candidates(&board, Player::O, &params, policy.top_cell_count);
+        let (after_first, winner) = apply_move_copy(&board, (1, 2), Player::O).expect("first move legal");
+        let second_pool =
+            collect_same_turn_followup_candidates(&after_first, Player::O, &params, policy.contextual_second_move_count);
+
+        assert_eq!(winner, None);
+        assert!(
+            first_pool.contains(&(1, 2)),
+            "expected first pool to include (1,2), got {:?}",
+            first_pool
+        );
+        assert!(
+            second_pool.iter().copied().any(|second| {
+                let line = vec![(1, 2), second];
+                line_forces_next_turn_win(&board, &line, Player::O, &params)
+            }),
+            "expected follow-up pool after (1,2) to include a terminal-equivalent line, got {:?}",
+            second_pool
+        );
+    }
+
+    #[test]
+    fn archived_snapshot_greedy_turn_selects_forcing_line_for_o() {
+        let params = base_params();
+        let board = archived_snapshot_1577_board();
+        let mut stats = EngineStats::default();
+        let chosen = choose_greedy_turn(&board, &params, &mut stats);
+        let mut preview_stats = EngineStats::default();
+        let preview = enumerate_turn_candidates(&board, Player::O, &params, root_search_policy(&params), &mut preview_stats)
+            .into_iter()
+            .take(12)
+            .map(|line| format!("{:?} objective {:.3}", line.line, line.objective))
+            .collect::<Vec<_>>();
+
+        assert_eq!(chosen.len(), 2);
+        assert!(
+            line_forces_next_turn_win(&board, &chosen, Player::O, &params),
+            "expected greedy choice to force a next-turn win, got {:?}; root preview: {:?}",
+            chosen,
+            preview
+        );
     }
 }
