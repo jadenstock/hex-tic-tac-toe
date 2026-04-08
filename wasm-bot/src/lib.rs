@@ -2040,13 +2040,63 @@ fn collect_winning_turn_lines(
         return Vec::new();
     }
 
+    let mut winners = Vec::new();
+    let mut seen = HashSet::new();
+    let start_features = collect_features(&board.moves);
+    let tactical_first_options = collect_one_turn_finish_cells(&start_features, player);
+
+    if !tactical_first_options.is_empty() {
+        let mut first_options: Vec<Coord> = tactical_first_options.into_iter().collect();
+        first_options.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+        for first in first_options {
+            let (after_first, first_winner) = match apply_move_copy(board, first, player) {
+                Some(value) => value,
+                None => continue,
+            };
+
+            if first_winner == Some(player) {
+                let line = vec![first];
+                let key = canonical_line_key(&line);
+                if seen.insert(key) {
+                    winners.push(line);
+                }
+                continue;
+            }
+
+            if after_first.placements_left == 0 {
+                continue;
+            }
+
+            let followup_features = collect_features(&after_first.moves);
+            let mut second_options: Vec<Coord> = collect_one_turn_finish_cells(&followup_features, player)
+                .into_iter()
+                .collect();
+            second_options.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+            for second in second_options {
+                let key = canonical_line_key(&[first, second]);
+                if !seen.insert(key) {
+                    continue;
+                }
+
+                if let Some((_, second_winner)) = apply_move_copy(&after_first, second, player) {
+                    if second_winner == Some(player) {
+                        winners.push(vec![first, second]);
+                    }
+                }
+            }
+        }
+
+        if !winners.is_empty() {
+            return winners;
+        }
+    }
+
     let first_options = collect_turn_start_candidates(board, player, params, 0);
     if first_options.is_empty() {
         return Vec::new();
     }
-
-    let mut winners = Vec::new();
-    let mut seen = HashSet::new();
 
     for first in first_options {
         let (after_first, first_winner) = match apply_move_copy(board, first, player) {
@@ -2083,6 +2133,21 @@ fn collect_winning_turn_lines(
     }
 
     winners
+}
+
+fn select_immediate_winning_turn(board: &BoardState, player: Player, params: &EngineParams) -> Option<Vec<Coord>> {
+    let mut winning_lines = collect_winning_turn_lines(board, player, params);
+    if winning_lines.is_empty() {
+        return None;
+    }
+
+    winning_lines.sort_by(|a, b| {
+        a.len()
+            .cmp(&b.len())
+            .then_with(|| canonical_line_key(a).cmp(&canonical_line_key(b)))
+    });
+
+    winning_lines.into_iter().next()
 }
 
 fn enumerate_turn_candidates(
@@ -2324,6 +2389,11 @@ fn choose_greedy_turn(board: &BoardState, params: &EngineParams, stats: &mut Eng
     let player = board.turn;
     if board.placements_left == 0 {
         return Vec::new();
+    }
+
+    if let Some(winning_line) = select_immediate_winning_turn(board, player, params) {
+        stats.nodes_expanded = stats.nodes_expanded.saturating_add(1);
+        return winning_line;
     }
 
     let policy = CandidatePolicy {
@@ -3591,6 +3661,18 @@ fn choose_mcts_turn(
     }
 
     let root_player = board.turn;
+    if let Some(winning_line) = select_immediate_winning_turn(board, root_player, params) {
+        return (
+            winning_line,
+            1,
+            "early_win",
+            1,
+            0,
+            ForcingTelemetry::default(),
+            SearchTelemetry::default(),
+        );
+    }
+
     let mut forcing_telemetry = ForcingTelemetry::default();
     let mut forcing_line_scores = Vec::new();
 
@@ -3917,6 +3999,30 @@ fn choose_turn_internal(request: ChooseTurnRequest) -> Result<ChooseTurnResponse
         });
     }
 
+    if let Some(winning_line) = select_immediate_winning_turn(&board, board.turn, &params) {
+        let selected = sanitize_selected_moves(&board, &winning_line);
+        return Ok(ChooseTurnResponse {
+            moves: selected
+                .into_iter()
+                .map(|(q, r)| MoveChoice { q, r })
+                .collect(),
+            mode: "beam",
+            stop_reason: "early_win",
+            nodes_expanded: 1,
+            playouts: 0,
+            board_evaluations: stats.board_evaluations,
+            root_candidates: 1,
+            max_depth_turns: 1,
+            forcing_status: "not_attempted",
+            forcing_nodes: 0,
+            forcing_cache_hits: 0,
+            forcing_cache_misses: 0,
+            forcing_elapsed_ms: 0,
+            forcing_root_candidates: 0,
+            telemetry: SearchTelemetry::default(),
+        });
+    }
+
     let (proposed_moves, root_candidates, stop_reason, mode, max_depth_turns, playouts, forcing, telemetry) = if max_time_ms == 0 || max_nodes == 0 {
         (
             choose_greedy_turn(&board, &params, &mut stats),
@@ -4145,6 +4251,23 @@ mod tests {
         }
     }
 
+    fn board_state_from_stones(stones: &[(i32, i32, Player)], turn: Player, placements_left: u8) -> BoardState {
+        let mut moves = HashMap::new();
+        let mut move_history = Vec::new();
+
+        for &(q, r, mark) in stones {
+            moves.insert((q, r), mark);
+            move_history.push(PlacedMove { q, r });
+        }
+
+        BoardState {
+            moves,
+            move_history,
+            turn,
+            placements_left,
+        }
+    }
+
     #[test]
     fn build_mcts_actions_normalizes_priors() {
         let actions = build_mcts_actions(vec![
@@ -4333,5 +4456,91 @@ mod tests {
             chosen,
             preview
         );
+    }
+
+    #[test]
+    fn immediate_two_stone_win_is_taken_over_defense() {
+        let params = base_params();
+        let board = board_state_from_stones(
+            &[
+                (0, 0, Player::O),
+                (1, 0, Player::O),
+                (2, 0, Player::O),
+                (3, 0, Player::O),
+                (0, 1, Player::X),
+                (1, 1, Player::X),
+                (2, 1, Player::X),
+                (3, 1, Player::X),
+            ],
+            Player::O,
+            2,
+        );
+
+        let wins = collect_winning_turn_lines(&board, Player::O, &params);
+        let mut stats = EngineStats::default();
+        let chosen = choose_greedy_turn(&board, &params, &mut stats);
+
+        assert!(
+            wins.iter().any(|line| {
+                let (_, _, winner) = apply_turn_line(&board, line, Player::O);
+                winner == Some(Player::O)
+            }),
+            "expected to enumerate an immediate O win, got {:?}",
+            wins
+        );
+        assert_eq!(chosen.len(), 2);
+        let (_, _, winner) = apply_turn_line(&board, &chosen, Player::O);
+        assert_eq!(
+            winner,
+            Some(Player::O),
+            "expected greedy choice to win immediately, got {:?}",
+            chosen
+        );
+    }
+
+    #[test]
+    fn choose_turn_internal_returns_early_win_for_immediate_two_stone_win() {
+        let response = choose_turn_internal(ChooseTurnRequest {
+            turn: "O".to_owned(),
+            placements_left: 2,
+            max_time_ms: Some(4000),
+            max_nodes: Some(500_000),
+            moves: vec![
+                MoveCell { q: 0, r: 0, mark: "O".to_owned() },
+                MoveCell { q: 1, r: 0, mark: "O".to_owned() },
+                MoveCell { q: 2, r: 0, mark: "O".to_owned() },
+                MoveCell { q: 3, r: 0, mark: "O".to_owned() },
+                MoveCell { q: 0, r: 1, mark: "X".to_owned() },
+                MoveCell { q: 1, r: 1, mark: "X".to_owned() },
+                MoveCell { q: 2, r: 1, mark: "X".to_owned() },
+                MoveCell { q: 3, r: 1, mark: "X".to_owned() },
+                MoveCell { q: 10, r: 10, mark: "X".to_owned() },
+            ],
+            tuning: BotTuningInput::default(),
+            search_options: SearchOptionsInput::default(),
+        })
+        .expect("choose turn succeeds");
+
+        assert_eq!(response.stop_reason, "early_win");
+        assert_eq!(response.moves.len(), 2);
+
+        let board = board_state_from_stones(
+            &[
+                (0, 0, Player::O),
+                (1, 0, Player::O),
+                (2, 0, Player::O),
+                (3, 0, Player::O),
+                (0, 1, Player::X),
+                (1, 1, Player::X),
+                (2, 1, Player::X),
+                (3, 1, Player::X),
+                (10, 10, Player::X),
+            ],
+            Player::O,
+            2,
+        );
+        let chosen_line = response.moves.iter().map(|mv| (mv.q, mv.r)).collect::<Vec<_>>();
+        let (_, _, winner) = apply_turn_line(&board, &chosen_line, Player::O);
+        assert_eq!(winner, Some(Player::O));
     }
 }
