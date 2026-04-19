@@ -44,16 +44,9 @@ type WasmTurnRequest = {
   max_nodes: number
   tuning: {
     threat_weights: number[]
-    threat_breadth_weights: number[]
     defense_weight: number
     tempo_discount_per_stone: number
     threat_severity_scale: number
-    one_turn_win_bonus: number
-    one_turn_fork_bonus: number
-    threat3_cluster_bonus: number
-    threat4_fork_bonus: number
-    threat5_fork_bonus: number
-    threat3_blocker_bonus: number
     active_build_multiplier_one: number
     active_build_multiplier_two: number
     candidate_radius: number
@@ -73,7 +66,6 @@ type WasmTurnRequest = {
     quiescence_enabled: boolean
     quiescence_max_extra_turns: number
     use_static_leaf_eval: boolean
-    transpositions_enabled: boolean
     forcing_solver_enabled: boolean
     max_simulation_turns: number
     simulation_turn_candidate_count: number
@@ -90,16 +82,9 @@ type WasmTurnRequest = {
 type WasmEvaluatePositionRequest = {
   tuning: {
     threat_weights: number[]
-    threat_breadth_weights: number[]
     defense_weight: number
     tempo_discount_per_stone: number
     threat_severity_scale: number
-    one_turn_win_bonus: number
-    one_turn_fork_bonus: number
-    threat3_cluster_bonus: number
-    threat4_fork_bonus: number
-    threat5_fork_bonus: number
-    threat3_blocker_bonus: number
     active_build_multiplier_one: number
     active_build_multiplier_two: number
     candidate_radius: number
@@ -128,11 +113,6 @@ type WasmTurnResponse = {
     mu_fpu_selection_count?: number
     quiescence_call_count?: number
     quiescence_extension_count?: number
-    transposition_hits?: number
-    transposition_misses?: number
-    transposition_stores?: number
-    transposition_reuses?: number
-    transposition_table_size?: number
   }
   error?: string
 }
@@ -244,16 +224,9 @@ function toWasmTurnRequest(state: LiveLikeState, options: BotSearchOptions, tuni
     max_nodes: Math.max(0, Math.floor(options.budget.maxNodes)),
     tuning: {
       threat_weights: [...tuning.threatWeights],
-      threat_breadth_weights: [...tuning.threatBreadthWeights],
       defense_weight: tuning.defenseWeight,
       tempo_discount_per_stone: tuning.tempoDiscountPerStone,
       threat_severity_scale: tuning.threatSeverityScale,
-      one_turn_win_bonus: tuning.oneTurnWinBonus,
-      one_turn_fork_bonus: tuning.oneTurnForkBonus,
-      threat3_cluster_bonus: tuning.threat3ClusterBonus,
-      threat4_fork_bonus: tuning.threat4ForkBonus,
-      threat5_fork_bonus: tuning.threat5ForkBonus,
-      threat3_blocker_bonus: tuning.threat3BlockerBonus,
       active_build_multiplier_one: tuning.activeBuildMultiplierOne,
       active_build_multiplier_two: tuning.activeBuildMultiplierTwo,
       candidate_radius: Math.max(1, Math.floor(tuning.candidateRadius)),
@@ -273,7 +246,6 @@ function toWasmTurnRequest(state: LiveLikeState, options: BotSearchOptions, tuni
       quiescence_enabled: options.quiescenceEnabled,
       quiescence_max_extra_turns: Math.max(0, Math.floor(options.quiescenceMaxExtraTurns)),
       use_static_leaf_eval: options.useStaticLeafEval,
-      transpositions_enabled: options.transpositionsEnabled,
       forcing_solver_enabled: options.forcingSolverEnabled,
       max_simulation_turns: Math.max(1, Math.floor(options.maxSimulationTurns)),
       simulation_turn_candidate_count: Math.max(1, Math.floor(options.simulationTurnCandidateCount)),
@@ -288,16 +260,9 @@ function toWasmEvaluateRequest(state: LiveLikeState, tuning: BotTuning): WasmEva
   return {
     tuning: {
       threat_weights: [...tuning.threatWeights],
-      threat_breadth_weights: [...tuning.threatBreadthWeights],
       defense_weight: tuning.defenseWeight,
       tempo_discount_per_stone: tuning.tempoDiscountPerStone,
       threat_severity_scale: tuning.threatSeverityScale,
-      one_turn_win_bonus: tuning.oneTurnWinBonus,
-      one_turn_fork_bonus: tuning.oneTurnForkBonus,
-      threat3_cluster_bonus: tuning.threat3ClusterBonus,
-      threat4_fork_bonus: tuning.threat4ForkBonus,
-      threat5_fork_bonus: tuning.threat5ForkBonus,
-      threat3_blocker_bonus: tuning.threat3BlockerBonus,
       active_build_multiplier_one: tuning.activeBuildMultiplierOne,
       active_build_multiplier_two: tuning.activeBuildMultiplierTwo,
       candidate_radius: Math.max(1, Math.floor(tuning.candidateRadius)),
@@ -377,21 +342,6 @@ function buildWasmDecision(
         : 0,
       quiescenceExtensionCount: Number.isFinite(Number(telemetryRaw.quiescence_extension_count))
         ? Math.max(0, Math.floor(Number(telemetryRaw.quiescence_extension_count)))
-        : 0,
-      transpositionHits: Number.isFinite(Number(telemetryRaw.transposition_hits))
-        ? Math.max(0, Math.floor(Number(telemetryRaw.transposition_hits)))
-        : 0,
-      transpositionMisses: Number.isFinite(Number(telemetryRaw.transposition_misses))
-        ? Math.max(0, Math.floor(Number(telemetryRaw.transposition_misses)))
-        : 0,
-      transpositionStores: Number.isFinite(Number(telemetryRaw.transposition_stores))
-        ? Math.max(0, Math.floor(Number(telemetryRaw.transposition_stores)))
-        : 0,
-      transpositionReuses: Number.isFinite(Number(telemetryRaw.transposition_reuses))
-        ? Math.max(0, Math.floor(Number(telemetryRaw.transposition_reuses)))
-        : 0,
-      transpositionTableSize: Number.isFinite(Number(telemetryRaw.transposition_table_size))
-        ? Math.max(0, Math.floor(Number(telemetryRaw.transposition_table_size)))
         : 0,
     }
   }

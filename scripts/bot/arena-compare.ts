@@ -86,7 +86,6 @@ const DEFAULT_SEARCH_OPTIONS: Pick<
   | 'quiescenceEnabled'
   | 'quiescenceMaxExtraTurns'
   | 'useStaticLeafEval'
-  | 'transpositionsEnabled'
   | 'forcingSolverEnabled'
   | 'maxSimulationTurns'
   | 'simulationTurnCandidateCount'
@@ -106,7 +105,6 @@ const DEFAULT_SEARCH_OPTIONS: Pick<
   quiescenceEnabled: true,
   quiescenceMaxExtraTurns: 2,
   useStaticLeafEval: true,
-  transpositionsEnabled: false,
   forcingSolverEnabled: true,
   maxSimulationTurns: 4,
   simulationTurnCandidateCount: 8,
@@ -124,7 +122,6 @@ const SEARCH_PROFILES = {
     turnCandidateCount: 48,
     childTurnCandidateCount: 18,
     quiescenceMaxExtraTurns: 4,
-    transpositionsEnabled: true,
     maxSimulationTurns: 4,
   },
   'previous-live': {
@@ -421,16 +418,9 @@ function chooseMoves(bot: BotModule, state: LiveState, options: BotSearchOptions
     max_nodes: options.budget.maxNodes,
     tuning: {
       threat_weights: [...DEFAULT_BOT_TUNING.threatWeights],
-      threat_breadth_weights: [...DEFAULT_BOT_TUNING.threatBreadthWeights],
       defense_weight: DEFAULT_BOT_TUNING.defenseWeight,
       tempo_discount_per_stone: DEFAULT_BOT_TUNING.tempoDiscountPerStone,
       threat_severity_scale: DEFAULT_BOT_TUNING.threatSeverityScale,
-      one_turn_win_bonus: DEFAULT_BOT_TUNING.oneTurnWinBonus,
-      one_turn_fork_bonus: DEFAULT_BOT_TUNING.oneTurnForkBonus,
-      threat3_cluster_bonus: DEFAULT_BOT_TUNING.threat3ClusterBonus,
-      threat4_fork_bonus: DEFAULT_BOT_TUNING.threat4ForkBonus,
-      threat5_fork_bonus: DEFAULT_BOT_TUNING.threat5ForkBonus,
-      threat3_blocker_bonus: DEFAULT_BOT_TUNING.threat3BlockerBonus,
       active_build_multiplier_one: DEFAULT_BOT_TUNING.activeBuildMultiplierOne,
       active_build_multiplier_two: DEFAULT_BOT_TUNING.activeBuildMultiplierTwo,
       candidate_radius: DEFAULT_BOT_TUNING.candidateRadius,
@@ -450,7 +440,6 @@ function chooseMoves(bot: BotModule, state: LiveState, options: BotSearchOptions
       quiescence_enabled: options.quiescenceEnabled,
       quiescence_max_extra_turns: options.quiescenceMaxExtraTurns,
       use_static_leaf_eval: options.useStaticLeafEval,
-      transpositions_enabled: options.transpositionsEnabled,
       forcing_solver_enabled: options.forcingSolverEnabled,
       max_simulation_turns: options.maxSimulationTurns,
       simulation_turn_candidate_count: options.simulationTurnCandidateCount,

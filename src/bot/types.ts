@@ -92,17 +92,10 @@ export type BotTuning = {
   tempoDiscountPerStone: number
   threatSeverityScale: number
   immediateDangerPenalty: number
-  oneTurnWinBonus: number
-  threatBreadthWeights: number[]
-  oneTurnForkBonus: number
   oneTurnOverlapPenalty: number
-  threat3ClusterBonus: number
   threat3ClusterBreadthFloor: number
-  threat4ForkBonus: number
-  threat5ForkBonus: number
   triangleBonus: number
   rhombusBonus: number
-  threat3BlockerBonus: number
   activeBuildMultiplierOne: number
   activeBuildMultiplierTwo: number
   candidateRadius: number
@@ -129,7 +122,6 @@ export type BotSearchOptions = {
   quiescenceEnabled: boolean
   quiescenceMaxExtraTurns: number
   useStaticLeafEval: boolean
-  transpositionsEnabled: boolean
   forcingSolverEnabled: boolean
   maxSimulationTurns: number
   simulationTurnCandidateCount: number
@@ -144,86 +136,9 @@ export type BotSearchTelemetry = {
   muFpuSelectionCount: number
   quiescenceCallCount: number
   quiescenceExtensionCount: number
-  transpositionHits: number
-  transpositionMisses: number
-  transpositionStores: number
-  transpositionReuses: number
-  transpositionTableSize: number
 }
 
 export type BotSearchMode = 'greedy' | 'mcts' | 'beam'
-
-export type BotRootRankingEntry = {
-  initialRank: number
-  residualRank: number
-  initialObjective: number
-  residualObjective: number
-  opponentReplyObjective: number
-}
-
-export type BotSearchTreeStats = {
-  nodeCount: number
-  leafCount: number
-  maxDepth: number
-  averageDepth: number
-  averageLeafDepth: number
-}
-
-export type BotSearchSessionStats = {
-  reusedCurrentRoot: boolean
-  reusedFromTree: boolean
-  previousTreeNodes: number
-  retainedTreeNodes: number
-  trimmedTreeNodes: number
-  keptAfterMove: boolean
-  currentTree: BotSearchTreeStats
-  evaluationCacheSize: number
-  candidateCacheSize: number
-  forcingCacheSize: number
-  evaluationCacheHits: number
-  evaluationCacheMisses: number
-  candidateCacheHits: number
-  candidateCacheMisses: number
-  forcingCacheHits: number
-  forcingCacheMisses: number
-}
-
-export type BotSearchDebugStats = {
-  rolloutCalls: number
-  tacticalExtensionCalls: number
-  staticLeafEvals: number
-  tacticalLeafEvals: number
-  terminalLeafHits: number
-  leafEvalOwnTurnCount: number
-  leafEvalOpponentTurnCount: number
-  rootSetupMs: number
-  rootImmediateWinScanMs: number
-  mctsLoopMs: number
-  selectionExpansionMs: number
-  rolloutEvalMs: number
-  backpropUndoMs: number
-  averagePlayoutMs: number
-  forcingAttempted: boolean
-  forcingSolvedWin: boolean
-  forcingStatus: 'not_attempted' | 'win' | 'loss' | 'unknown'
-  rootVisitedChildren: number
-  rootUnvisitedChildren: number
-  rootChildrenWithOpponentReplies: number
-  rootChildrenWithoutOpponentReplies: number
-  rootAvgOpponentRepliesExplored: number
-  rootMaxOpponentRepliesExplored: number
-  rootBestChildVisits: number
-  rootSecondChildVisits: number
-  rootBestChildValue: number
-  rootSecondChildValue: number
-  rootBestChildVisitShare: number
-  rootAnchorCount: number
-  rootFinalLineCount: number
-  selectedInitialRank: number
-  selectedResidualRank: number
-  bestResidualInitialRank: number
-  rootRankingPreview: BotRootRankingEntry[]
-}
 
 export type BotSearchStats = {
   mode: BotSearchMode
@@ -234,11 +149,7 @@ export type BotSearchStats = {
   maxDepthTurns: number
   rootCandidates: number
   stopReason: 'budget_zero' | 'time' | 'nodes' | 'terminal' | 'no_candidates' | 'fallback' | 'early_win' | 'single_candidate' | 'deterministic'
-  session?: BotSearchSessionStats
-  debug?: BotSearchDebugStats
   telemetry?: BotSearchTelemetry
-  predictedOpponentReply?: Axial[]
-  postMoveCount?: number
 }
 
 export type BotTurnDecision = {
@@ -253,17 +164,10 @@ export const DEFAULT_BOT_TUNING: BotTuning = {
   tempoDiscountPerStone: 0.08,
   threatSeverityScale: 3000,
   immediateDangerPenalty: 150000,
-  oneTurnWinBonus: 0,
-  threatBreadthWeights: [0, 0, 0, 0, 0, 0, 0],
-  oneTurnForkBonus: 0,
   oneTurnOverlapPenalty: 6975,
-  threat3ClusterBonus: 0,
   threat3ClusterBreadthFloor: 0.2,
-  threat4ForkBonus: 0,
-  threat5ForkBonus: 0,
   triangleBonus: 0,
   rhombusBonus: 0,
-  threat3BlockerBonus: 0,
   activeBuildMultiplierOne: 1.5,
   activeBuildMultiplierTwo: 1,
   candidateRadius: 4,
@@ -288,7 +192,6 @@ export const DEFAULT_BOT_SEARCH_OPTIONS: BotSearchOptions = {
   quiescenceEnabled: true,
   quiescenceMaxExtraTurns: 2,
   useStaticLeafEval: true,
-  transpositionsEnabled: false,
   forcingSolverEnabled: true,
   maxSimulationTurns: 3,
   simulationTurnCandidateCount: 4,

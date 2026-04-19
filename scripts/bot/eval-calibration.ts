@@ -60,16 +60,9 @@ type EvaluationResponse = {
 
 type WasmTuningRequest = {
   threat_weights: number[]
-  threat_breadth_weights: number[]
   defense_weight: number
   tempo_discount_per_stone: number
   threat_severity_scale: number
-  one_turn_win_bonus: number
-  one_turn_fork_bonus: number
-  threat3_cluster_bonus: number
-  threat4_fork_bonus: number
-  threat5_fork_bonus: number
-  threat3_blocker_bonus: number
   active_build_multiplier_one: number
   active_build_multiplier_two: number
   candidate_radius: number
@@ -78,16 +71,9 @@ type WasmTuningRequest = {
 
 type TuningOverrideInput = Partial<WasmTuningRequest> & {
   threatWeights?: number[]
-  threatBreadthWeights?: number[]
   defenseWeight?: number
   tempoDiscountPerStone?: number
   threatSeverityScale?: number
-  oneTurnWinBonus?: number
-  oneTurnForkBonus?: number
-  threat3ClusterBonus?: number
-  threat4ForkBonus?: number
-  threat5ForkBonus?: number
-  threat3BlockerBonus?: number
   activeBuildMultiplierOne?: number
   activeBuildMultiplierTwo?: number
   candidateRadius?: number
@@ -196,16 +182,9 @@ const DEFAULT_HEXO_TACTICS_DATASET = path.join(REPO_ROOT, '.external-repos/hexo-
 function defaultWasmTuning(): WasmTuningRequest {
   return {
     threat_weights: [...DEFAULT_BOT_TUNING.threatWeights],
-    threat_breadth_weights: [...DEFAULT_BOT_TUNING.threatBreadthWeights],
     defense_weight: DEFAULT_BOT_TUNING.defenseWeight,
     tempo_discount_per_stone: DEFAULT_BOT_TUNING.tempoDiscountPerStone,
     threat_severity_scale: DEFAULT_BOT_TUNING.threatSeverityScale,
-    one_turn_win_bonus: DEFAULT_BOT_TUNING.oneTurnWinBonus,
-    one_turn_fork_bonus: DEFAULT_BOT_TUNING.oneTurnForkBonus,
-    threat3_cluster_bonus: DEFAULT_BOT_TUNING.threat3ClusterBonus,
-    threat4_fork_bonus: DEFAULT_BOT_TUNING.threat4ForkBonus,
-    threat5_fork_bonus: DEFAULT_BOT_TUNING.threat5ForkBonus,
-    threat3_blocker_bonus: DEFAULT_BOT_TUNING.threat3BlockerBonus,
     active_build_multiplier_one: DEFAULT_BOT_TUNING.activeBuildMultiplierOne,
     active_build_multiplier_two: DEFAULT_BOT_TUNING.activeBuildMultiplierTwo,
     candidate_radius: DEFAULT_BOT_TUNING.candidateRadius,
@@ -245,26 +224,11 @@ function buildWasmTuning(overrides: TuningOverrideInput | null): WasmTuningReque
 
   return {
     threat_weights: asNumberArray(tuning.threat_weights ?? tuning.threatWeights, fallback.threat_weights),
-    threat_breadth_weights: asNumberArray(
-      tuning.threat_breadth_weights ?? tuning.threatBreadthWeights,
-      fallback.threat_breadth_weights,
-    ),
     defense_weight: asNumber(tuning.defense_weight ?? tuning.defenseWeight) ?? fallback.defense_weight,
     tempo_discount_per_stone:
       asNumber(tuning.tempo_discount_per_stone ?? tuning.tempoDiscountPerStone) ?? fallback.tempo_discount_per_stone,
     threat_severity_scale:
       asNumber(tuning.threat_severity_scale ?? tuning.threatSeverityScale) ?? fallback.threat_severity_scale,
-    one_turn_win_bonus: asNumber(tuning.one_turn_win_bonus ?? tuning.oneTurnWinBonus) ?? fallback.one_turn_win_bonus,
-    one_turn_fork_bonus:
-      asNumber(tuning.one_turn_fork_bonus ?? tuning.oneTurnForkBonus) ?? fallback.one_turn_fork_bonus,
-    threat3_cluster_bonus:
-      asNumber(tuning.threat3_cluster_bonus ?? tuning.threat3ClusterBonus) ?? fallback.threat3_cluster_bonus,
-    threat4_fork_bonus:
-      asNumber(tuning.threat4_fork_bonus ?? tuning.threat4ForkBonus) ?? fallback.threat4_fork_bonus,
-    threat5_fork_bonus:
-      asNumber(tuning.threat5_fork_bonus ?? tuning.threat5ForkBonus) ?? fallback.threat5_fork_bonus,
-    threat3_blocker_bonus:
-      asNumber(tuning.threat3_blocker_bonus ?? tuning.threat3BlockerBonus) ?? fallback.threat3_blocker_bonus,
     active_build_multiplier_one:
       asNumber(
         (tuning as TuningOverrideInput & { active_build_multiplier_one?: number }).active_build_multiplier_one ??

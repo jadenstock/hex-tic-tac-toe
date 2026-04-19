@@ -231,7 +231,6 @@ const LIVE_WASM_SEARCH_OPTIONS: BotSearchOptions = {
   turnCandidateCount: 48,
   childTurnCandidateCount: 18,
   quiescenceMaxExtraTurns: 4,
-  transpositionsEnabled: true,
   maxSimulationTurns: 4,
   simulationTurnCandidateCount: 8,
   simulationRadius: 6,
@@ -3103,7 +3102,7 @@ function App() {
                                   activeBotSearchOptions.quiescenceEnabled
                                     ? `${activeBotSearchOptions.quiescenceMaxExtraTurns} turns`
                                     : 'off'
-                                } | TT ${activeBotSearchOptions.transpositionsEnabled ? 'on' : 'off'} | forcing ${
+                                } | forcing ${
                                   activeBotSearchOptions.forcingSolverEnabled ? 'on' : 'off'
                                 }`}
                               </div>
@@ -3126,60 +3125,6 @@ function App() {
                                     {lastBotStats.telemetry.quiescenceExtensionCount.toLocaleString()} ext /{' '}
                                     {lastBotStats.telemetry.quiescenceCallCount.toLocaleString()} checks
                                   </div>
-                                  {activeBotSearchOptions.transpositionsEnabled ? (
-                                    <div className="compute-meta">
-                                      Transpositions: {lastBotStats.telemetry.transpositionHits.toLocaleString()} hits |{' '}
-                                      {lastBotStats.telemetry.transpositionMisses.toLocaleString()} misses |{' '}
-                                      {lastBotStats.telemetry.transpositionReuses.toLocaleString()} reuses |{' '}
-                                      {lastBotStats.telemetry.transpositionStores.toLocaleString()} stores |{' '}
-                                      {lastBotStats.telemetry.transpositionTableSize.toLocaleString()} entries
-                                    </div>
-                                  ) : (
-                                    <div className="compute-meta">Transpositions: disabled for this profile</div>
-                                  )}
-                                </>
-                              ) : null}
-                              {lastBotStats?.debug ? (
-                                <>
-                                  <div className="compute-meta">
-                                    Root coverage: visited {lastBotStats.debug.rootVisitedChildren} / {lastBotStats.debug.rootVisitedChildren + lastBotStats.debug.rootUnvisitedChildren} |
-                                    best visit share {(lastBotStats.debug.rootBestChildVisitShare * 100).toFixed(1)}% | avg opp replies explored{' '}
-                                    {lastBotStats.debug.rootAvgOpponentRepliesExplored.toFixed(2)} | max {lastBotStats.debug.rootMaxOpponentRepliesExplored}
-                                  </div>
-                                  <div className="compute-meta">
-                                    Timing: root setup {lastBotStats.debug.rootSetupMs.toFixed(1)}ms | root scan {lastBotStats.debug.rootImmediateWinScanMs.toFixed(1)}ms |
-                                    loop {lastBotStats.debug.mctsLoopMs.toFixed(1)}ms | select/expand {lastBotStats.debug.selectionExpansionMs.toFixed(1)}ms | rollout{' '}
-                                    {lastBotStats.debug.rolloutEvalMs.toFixed(1)}ms | undo/backprop {lastBotStats.debug.backpropUndoMs.toFixed(1)}ms | avg/playout{' '}
-                                    {lastBotStats.debug.averagePlayoutMs.toFixed(3)}ms
-                                  </div>
-                                  <div className="compute-meta">
-                                    Leaves: static {lastBotStats.debug.staticLeafEvals} | tactical {lastBotStats.debug.tacticalLeafEvals} | terminal{' '}
-                                    {lastBotStats.debug.terminalLeafHits} | own turn {lastBotStats.debug.leafEvalOwnTurnCount} | opp turn{' '}
-                                    {lastBotStats.debug.leafEvalOpponentTurnCount} | forcing {lastBotStats.debug.forcingStatus}
-                                  </div>
-                                </>
-                              ) : null}
-                              {lastBotStats?.session &&
-                              (lastBotStats.session.reusedFromTree ||
-                                lastBotStats.session.currentTree.nodeCount > 0 ||
-                                lastBotStats.session.keptAfterMove) ? (
-                                <>
-                                  <div className="compute-meta">
-                                    Forcing line: {lastBotStats.session.reusedFromTree ? 'reused' : 'fresh'}
-                                    {lastBotStats.session.reusedCurrentRoot ? ' (same root)' : ''} | prev tree{' '}
-                                    {lastBotStats.session.previousTreeNodes.toLocaleString()} | retained{' '}
-                                    {lastBotStats.session.retainedTreeNodes.toLocaleString()} | trimmed{' '}
-                                    {lastBotStats.session.trimmedTreeNodes.toLocaleString()} | kept after move{' '}
-                                    {lastBotStats.session.keptAfterMove ? 'yes' : 'no'}
-                                  </div>
-                                  {lastBotStats.session.currentTree.nodeCount > 0 ? (
-                                    <div className="compute-meta">
-                                    Current forcing tree: nodes {lastBotStats.session.currentTree.nodeCount.toLocaleString()} | leaves{' '}
-                                    {lastBotStats.session.currentTree.leafCount.toLocaleString()} | max depth{' '}
-                                    {lastBotStats.session.currentTree.maxDepth} | avg depth {lastBotStats.session.currentTree.averageDepth.toFixed(2)} | avg leaf{' '}
-                                    {lastBotStats.session.currentTree.averageLeafDepth.toFixed(2)}
-                                    </div>
-                                  ) : null}
                                 </>
                               ) : null}
                             </div>

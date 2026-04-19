@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 
 const WIN_LENGTH: i32 = 6;
@@ -36,12 +38,104 @@ type BoardMap = HashMap<Coord, Player>;
 
 type ThreatGroupMap = HashMap<String, usize>;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct BoardState {
     moves: BoardMap,
     move_history: Vec<PlacedMove>,
     turn: Player,
     placements_left: u8,
+    features_cache: RefCell<Option<Rc<BoardFeatures>>>,
+}
+
+impl Clone for BoardState {
+    fn clone(&self) -> Self {
+        Self {
+            moves: self.moves.clone(),
+            move_history: self.move_history.clone(),
+            turn: self.turn,
+            placements_left: self.placements_left,
+            features_cache: RefCell::new(self.features_cache.borrow().clone()),
+        }
+    }
+}
+
+impl BoardState {
+    fn new(moves: BoardMap, move_history: Vec<PlacedMove>, turn: Player, placements_left: u8) -> Self {
+        Self {
+            moves,
+            move_history,
+            turn,
+            placements_left,
+            features_cache: RefCell::new(None),
+        }
+    }
+
+    fn features(&self) -> Rc<BoardFeatures> {
+        if let Some(cached) = self.features_cache.borrow().as_ref() {
+            return Rc::clone(cached);
+        }
+        let fresh = Rc::new(collect_features(&self.moves));
+        *self.features_cache.borrow_mut() = Some(Rc::clone(&fresh));
+        fresh
+    }
+
+    fn invalidate_features(&mut self) {
+        self.features_cache.get_mut().take();
+    }
+
+    fn canonical_zobrist_key(&self) -> u64 {
+        let turn_tag = match self.turn {
+            Player::X => 0xD1342543DE82EF95u64,
+            Player::O => 0xB5026F5AA96619E9u64,
+        };
+        let placements_tag = splitmix64(0x243F6A8885A308D3u64 ^ self.placements_left as u64);
+        canonical_stone_hash(&self.moves) ^ turn_tag ^ placements_tag
+    }
+}
+
+fn rotate_axial_60(coord: Coord) -> Coord {
+    let (q, r) = coord;
+    (-r, q + r)
+}
+
+fn canonical_stone_hash(moves: &BoardMap) -> u64 {
+    let mut best: Option<u64> = None;
+    for rotation in 0..6u8 {
+        let mut acc = 0u64;
+        for (&coord, &mark) in moves.iter() {
+            let mut rotated = coord;
+            for _ in 0..rotation {
+                rotated = rotate_axial_60(rotated);
+            }
+            acc ^= zobrist_for_stone(rotated.0, rotated.1, mark);
+        }
+        best = Some(match best {
+            Some(prev) if prev <= acc => prev,
+            _ => acc,
+        });
+    }
+    best.unwrap_or(0)
+}
+
+fn splitmix64(seed: u64) -> u64 {
+    let mut x = seed.wrapping_add(0x9E3779B97F4A7C15u64);
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58476D1CE4E5B9u64);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94D049BB133111EBu64);
+    x ^= x >> 31;
+    x
+}
+
+fn zobrist_for_stone(q: i32, r: i32, mark: Player) -> u64 {
+    let mark_tag = match mark {
+        Player::X => 0x5DEECE66Du64,
+        Player::O => 0xDEADBEEFCAFEBABEu64,
+    };
+    let packed = ((q as i64 as u64).wrapping_mul(0x9E3779B97F4A7C15))
+        ^ ((r as i64 as u64).wrapping_mul(0xBF58476D1CE4E5B9))
+        ^ mark_tag;
+    splitmix64(packed)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -112,16 +206,9 @@ struct CandidatePolicy {
 #[derive(Clone, Debug)]
 struct EngineParams {
     threat_weights: [f64; 7],
-    threat_breadth_weights: [f64; 7],
     defense_weight: f64,
     tempo_discount_per_stone: f64,
     threat_severity_scale: f64,
-    one_turn_win_bonus: f64,
-    one_turn_fork_bonus: f64,
-    threat3_cluster_bonus: f64,
-    threat4_fork_bonus: f64,
-    threat5_fork_bonus: f64,
-    threat3_blocker_bonus: f64,
     active_build_multiplier_one: f64,
     active_build_multiplier_two: f64,
     candidate_radius: i32,
@@ -139,7 +226,6 @@ struct EngineParams {
     quiescence_enabled: bool,
     quiescence_max_extra_turns: u32,
     use_static_leaf_eval: bool,
-    transpositions_enabled: bool,
     forcing_solver_enabled: bool,
     max_simulation_turns: usize,
     simulation_turn_candidate_count: usize,
@@ -161,11 +247,6 @@ struct SearchTelemetry {
     mu_fpu_selection_count: u32,
     quiescence_call_count: u32,
     quiescence_extension_count: u32,
-    transposition_hits: u32,
-    transposition_misses: u32,
-    transposition_stores: u32,
-    transposition_reuses: u32,
-    transposition_table_size: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -190,7 +271,6 @@ struct SearchOptionsInput {
     quiescence_enabled: Option<bool>,
     quiescence_max_extra_turns: Option<u32>,
     use_static_leaf_eval: Option<bool>,
-    transpositions_enabled: Option<bool>,
     forcing_solver_enabled: Option<bool>,
     max_simulation_turns: Option<usize>,
     simulation_turn_candidate_count: Option<usize>,
@@ -201,16 +281,9 @@ struct SearchOptionsInput {
 #[derive(Debug, Deserialize, Default)]
 struct BotTuningInput {
     threat_weights: Option<Vec<f64>>,
-    threat_breadth_weights: Option<Vec<f64>>,
     defense_weight: Option<f64>,
     tempo_discount_per_stone: Option<f64>,
     threat_severity_scale: Option<f64>,
-    one_turn_win_bonus: Option<f64>,
-    one_turn_fork_bonus: Option<f64>,
-    threat3_cluster_bonus: Option<f64>,
-    threat4_fork_bonus: Option<f64>,
-    threat5_fork_bonus: Option<f64>,
-    threat3_blocker_bonus: Option<f64>,
     active_build_multiplier_one: Option<f64>,
     active_build_multiplier_two: Option<f64>,
     candidate_radius: Option<i32>,
@@ -284,29 +357,18 @@ struct ErrorResponse {
 #[derive(Clone, Debug)]
 struct ThreatWindow {
     threat: usize,
-    direction_index: usize,
     cut_set: Vec<Coord>,
 }
 
 #[derive(Clone, Debug)]
-struct ThreatLevelStats {
-    window_count: usize,
-    blocker_burden: usize,
-    resilience: f64,
-    direction_count: usize,
-    pressure: f64,
-}
-
-#[derive(Clone, Debug)]
 struct ThreatProfile {
-    levels: Vec<ThreatLevelStats>,
+    pressures: Vec<f64>,
     total_pressure: f64,
 }
 
 #[derive(Clone, Debug)]
 struct MctsNode {
     parent: Option<usize>,
-    signature: String,
     action_from_parent: Vec<Coord>,
     player_to_move: Player,
     depth_turns: u32,
@@ -319,15 +381,8 @@ struct MctsNode {
     terminal_winner: Option<Player>,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct TranspositionEntry {
-    visits: u32,
-    total_value: f64,
-}
-
 #[derive(Debug, Default)]
 struct MctsSearchContext {
-    transpositions: HashMap<String, TranspositionEntry>,
     telemetry: SearchTelemetry,
 }
 
@@ -355,10 +410,19 @@ impl ForcingStatus {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ForcingBound {
+    Exact,
+    Lower,
+    Upper,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ForcingCacheEntry {
     status: ForcingStatus,
     score: f64,
+    depth: u8,
+    bound: ForcingBound,
 }
 
 #[derive(Clone, Debug)]
@@ -381,10 +445,12 @@ struct ForcingSolveResult {
     root_line_scores: Vec<ForcingLineScore>,
 }
 
+type ForcingCacheKey = (u64, Player);
+
 #[derive(Clone, Debug)]
 struct ForcingSearchContext {
     budget: ForcingProofBudget,
-    cache: HashMap<String, ForcingCacheEntry>,
+    cache: HashMap<ForcingCacheKey, ForcingCacheEntry>,
     cache_hits: u32,
     cache_misses: u32,
     start_depth: u8,
@@ -471,18 +537,9 @@ fn normalize_params(tuning: &BotTuningInput, search_options: Option<&SearchOptio
     let default_search_options = SearchOptionsInput::default();
     let search_options = search_options.unwrap_or(&default_search_options);
     let mut threat_weights = [0.0_f64, 0.0, 6.0, 36.0, 860.0, 860.0, 20000.0];
-    let mut threat_breadth_weights = [0.0_f64, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
 
     if let Some(weights) = &tuning.threat_weights {
         for (idx, slot) in threat_weights.iter_mut().enumerate() {
-            if let Some(value) = weights.get(idx) {
-                *slot = *value;
-            }
-        }
-    }
-
-    if let Some(weights) = &tuning.threat_breadth_weights {
-        for (idx, slot) in threat_breadth_weights.iter_mut().enumerate() {
             if let Some(value) = weights.get(idx) {
                 *slot = *value;
             }
@@ -561,7 +618,6 @@ fn normalize_params(tuning: &BotTuningInput, search_options: Option<&SearchOptio
         .unwrap_or(2)
         .min(8);
     let use_static_leaf_eval = search_options.use_static_leaf_eval.unwrap_or(true);
-    let transpositions_enabled = search_options.transpositions_enabled.unwrap_or(false);
     let forcing_solver_enabled = search_options.forcing_solver_enabled.unwrap_or(true);
 
     let max_simulation_turns = search_options
@@ -590,16 +646,9 @@ fn normalize_params(tuning: &BotTuningInput, search_options: Option<&SearchOptio
 
     EngineParams {
         threat_weights,
-        threat_breadth_weights,
         defense_weight: tuning.defense_weight.unwrap_or(1.1).max(0.0),
         tempo_discount_per_stone: tuning.tempo_discount_per_stone.unwrap_or(0.08).max(0.0),
         threat_severity_scale: tuning.threat_severity_scale.unwrap_or(3000.0).max(1.0),
-        one_turn_win_bonus: tuning.one_turn_win_bonus.unwrap_or(0.0).max(0.0),
-        one_turn_fork_bonus: tuning.one_turn_fork_bonus.unwrap_or(0.0).max(0.0),
-        threat3_cluster_bonus: tuning.threat3_cluster_bonus.unwrap_or(0.0).max(0.0),
-        threat4_fork_bonus: tuning.threat4_fork_bonus.unwrap_or(0.0).max(0.0),
-        threat5_fork_bonus: tuning.threat5_fork_bonus.unwrap_or(0.0).max(0.0),
-        threat3_blocker_bonus: tuning.threat3_blocker_bonus.unwrap_or(0.0).max(0.0),
         active_build_multiplier_one: tuning.active_build_multiplier_one.unwrap_or(1.5).max(0.0),
         active_build_multiplier_two: tuning.active_build_multiplier_two.unwrap_or(1.0).max(0.0),
         candidate_radius,
@@ -617,7 +666,6 @@ fn normalize_params(tuning: &BotTuningInput, search_options: Option<&SearchOptio
         quiescence_enabled,
         quiescence_max_extra_turns,
         use_static_leaf_eval,
-        transpositions_enabled,
         forcing_solver_enabled,
         max_simulation_turns,
         simulation_turn_candidate_count,
@@ -687,6 +735,7 @@ fn apply_move_mut(board: &mut BoardState, coord: Coord, mark: Player) -> Result<
     }
 
     board.moves.insert(coord, mark);
+    board.invalidate_features();
     board.move_history.push(PlacedMove {
         q: coord.0,
         r: coord.1,
@@ -1034,7 +1083,7 @@ fn exact_blocking_responses(board: &BoardState, attacker: Player) -> Vec<Vec<Coo
         return Vec::new();
     }
 
-    let features = collect_features(&board.moves);
+    let features = board.features();
     let pairs = threat_group_pairs(&features, attacker);
     let raw_sets = enumerate_covering_move_sets(&pairs, board.placements_left as usize);
     if raw_sets.is_empty() {
@@ -1182,7 +1231,6 @@ fn collect_threat_windows(board: &BoardMap, features: &BoardFeatures, player: Pl
 
         windows.push(ThreatWindow {
             threat,
-            direction_index: window.direction_index,
             cut_set,
         });
     }
@@ -1190,59 +1238,7 @@ fn collect_threat_windows(board: &BoardMap, features: &BoardFeatures, player: Pl
     windows
 }
 
-fn greedy_blocker_burden(cut_sets: &[Vec<Coord>], max_blockers: usize) -> usize {
-    if cut_sets.is_empty() {
-        return 0;
-    }
-
-    let mut remaining: Vec<Vec<Coord>> = cut_sets.to_vec();
-    let mut blockers = 0_usize;
-
-    while !remaining.is_empty() && blockers < max_blockers {
-        let mut coverage: HashMap<Coord, usize> = HashMap::new();
-        for cells in &remaining {
-            for &cell in cells {
-                *coverage.entry(cell).or_insert(0) += 1;
-            }
-        }
-
-        let mut best_cell = None;
-        let mut best_coverage = 0_usize;
-        for (cell, count) in coverage {
-            if count > best_coverage {
-                best_cell = Some(cell);
-                best_coverage = count;
-            }
-        }
-
-        if best_coverage == 0 {
-            break;
-        }
-
-        let chosen = match best_cell {
-            Some(cell) => cell,
-            None => break,
-        };
-
-        blockers += 1;
-        remaining = remaining
-            .into_iter()
-            .filter(|cells| !cells.contains(&chosen))
-            .collect();
-    }
-
-    if remaining.is_empty() {
-        blockers
-    } else {
-        max_blockers + 1
-    }
-}
-
-fn residual_window_ratio_after_best_block(cut_sets: &[Vec<Coord>]) -> f64 {
-    if cut_sets.is_empty() {
-        return 0.0;
-    }
-
+fn best_covering_cell(cut_sets: &[Vec<Coord>]) -> Option<Coord> {
     let mut coverage: HashMap<Coord, usize> = HashMap::new();
     for cells in cut_sets {
         for &cell in cells {
@@ -1258,8 +1254,39 @@ fn residual_window_ratio_after_best_block(cut_sets: &[Vec<Coord>]) -> f64 {
             best_coverage = count;
         }
     }
+    best_cell
+}
 
-    let chosen = match best_cell {
+fn greedy_blocker_burden(cut_sets: &[Vec<Coord>], max_blockers: usize) -> usize {
+    if cut_sets.is_empty() {
+        return 0;
+    }
+
+    let mut remaining: Vec<Vec<Coord>> = cut_sets.to_vec();
+    let mut blockers = 0_usize;
+
+    while !remaining.is_empty() && blockers < max_blockers {
+        let chosen = match best_covering_cell(&remaining) {
+            Some(cell) => cell,
+            None => break,
+        };
+        blockers += 1;
+        remaining.retain(|cells| !cells.contains(&chosen));
+    }
+
+    if remaining.is_empty() {
+        blockers
+    } else {
+        max_blockers + 1
+    }
+}
+
+fn residual_window_ratio_after_best_block(cut_sets: &[Vec<Coord>]) -> f64 {
+    if cut_sets.is_empty() {
+        return 0.0;
+    }
+
+    let chosen = match best_covering_cell(cut_sets) {
         Some(cell) => cell,
         None => return 0.0,
     };
@@ -1276,16 +1303,10 @@ fn pressure_for_threat_level(
     windows: &[ThreatWindow],
     threat: usize,
     params: &EngineParams,
-) -> ThreatLevelStats {
+) -> f64 {
     let level_windows: Vec<&ThreatWindow> = windows.iter().filter(|window| window.threat == threat).collect();
     if level_windows.is_empty() {
-        return ThreatLevelStats {
-            window_count: 0,
-            blocker_burden: 0,
-            resilience: 0.0,
-            direction_count: 0,
-            pressure: 0.0,
-        };
+        return 0.0;
     }
 
     let cut_sets: Vec<Vec<Coord>> = level_windows
@@ -1296,33 +1317,10 @@ fn pressure_for_threat_level(
     let window_count = level_windows.len();
     let blocker_burden = greedy_blocker_burden(&cut_sets, 4);
     let resilience = residual_window_ratio_after_best_block(&cut_sets);
-    let direction_count = level_windows
-        .iter()
-        .map(|window| window.direction_index)
-        .collect::<HashSet<_>>()
-        .len();
 
     let weight = params.threat_weights.get(threat).copied().unwrap_or(0.0);
     let count_pressure = (window_count as f64).powf(threat_count_exponent(threat));
-    let pressure = weight
-        * count_pressure
-        * (blocker_burden.max(1) as f64)
-        * (0.5 + 0.5 * resilience);
-
-    ThreatLevelStats {
-        window_count,
-        blocker_burden,
-        resilience,
-        direction_count,
-        pressure,
-    }
-}
-
-fn extra_window_pairs(window_count: usize) -> f64 {
-    if window_count < 2 {
-        return 0.0;
-    }
-    (window_count * (window_count - 1)) as f64
+    weight * count_pressure * (blocker_burden.max(1) as f64) * (0.5 + 0.5 * resilience)
 }
 
 fn response_budget_for_defender(board: &BoardState, attacker: Player) -> usize {
@@ -1351,57 +1349,6 @@ fn has_forced_next_turn_win(board: &BoardState, features: &BoardFeatures, player
     one_turn_blockers_required(features, player) > response_budget_for_defender(board, player)
 }
 
-fn tactical_bonus_for_player(
-    board: &BoardState,
-    features: &BoardFeatures,
-    profile: &ThreatProfile,
-    player: Player,
-    params: &EngineParams,
-) -> f64 {
-    let level3 = &profile.levels[3];
-    let level4 = &profile.levels[4];
-    let level5 = &profile.levels[5];
-
-    let breadth_bonus =
-        params.threat_breadth_weights[3] * extra_window_pairs(level3.window_count)
-        + params.threat_breadth_weights[4] * extra_window_pairs(level4.window_count)
-        + params.threat_breadth_weights[5] * extra_window_pairs(level5.window_count);
-
-    let threat3_cluster_signal = extra_window_pairs(level3.window_count)
-        + (level3.direction_count.saturating_sub(1) as f64) * level3.window_count as f64;
-    let threat3_cluster_bonus = params.threat3_cluster_bonus
-        * threat3_cluster_signal
-        * (0.5 + 0.5 * level3.resilience);
-
-    let threat3_blocker_bonus = params.threat3_blocker_bonus
-        * level3.window_count as f64
-        * level3.blocker_burden.saturating_sub(1) as f64;
-
-    let threat4_fork_bonus = params.threat4_fork_bonus
-        * level4.window_count as f64
-        * level4.blocker_burden.saturating_sub(1) as f64
-        * (0.5 + 0.5 * level4.resilience);
-
-    let threat5_fork_bonus = params.threat5_fork_bonus
-        * level5.window_count as f64
-        * level5.blocker_burden.saturating_sub(1) as f64
-        * (0.5 + 0.5 * level5.resilience);
-
-    let next_turn_finish_groups = one_turn_groups(features, player).len();
-    let next_turn_blockers_required = one_turn_blockers_required(features, player);
-    let finish_group_bonus = params.one_turn_win_bonus * next_turn_finish_groups as f64;
-    let overload = next_turn_blockers_required.saturating_sub(response_budget_for_defender(board, player));
-    let overload_bonus = params.one_turn_fork_bonus * overload as f64;
-
-    breadth_bonus
-        + threat3_cluster_bonus
-        + threat3_blocker_bonus
-        + threat4_fork_bonus
-        + threat5_fork_bonus
-        + finish_group_bonus
-        + overload_bonus
-}
-
 fn build_initiative_bonus_for_player(board: &BoardState, profile: &ThreatProfile, player: Player, params: &EngineParams) -> f64 {
     if board.turn != player {
         return 0.0;
@@ -1417,24 +1364,19 @@ fn build_initiative_bonus_for_player(board: &BoardState, profile: &ThreatProfile
         return 0.0;
     }
 
-    let build_pressure = profile.levels[2].pressure + profile.levels[3].pressure;
+    let build_pressure = profile.pressures[2] + profile.pressures[3];
     (multiplier - 1.0) * build_pressure
 }
 
 fn collect_threat_profile(board: &BoardMap, features: &BoardFeatures, player: Player, params: &EngineParams) -> ThreatProfile {
     let windows = collect_threat_windows(board, features, player);
-    let mut levels = Vec::with_capacity(MAX_THREAT_INDEX + 1);
-    for threat in 0..=MAX_THREAT_INDEX {
-        levels.push(pressure_for_threat_level(&windows, threat, params));
-    }
-
-    let mut total_pressure = 0.0;
-    for threat in 2..=5 {
-        total_pressure += levels[threat].pressure;
-    }
+    let pressures: Vec<f64> = (0..=MAX_THREAT_INDEX)
+        .map(|threat| pressure_for_threat_level(&windows, threat, params))
+        .collect();
+    let total_pressure: f64 = (2..=5).map(|threat| pressures[threat]).sum();
 
     ThreatProfile {
-        levels,
+        pressures,
         total_pressure,
     }
 }
@@ -1442,7 +1384,7 @@ fn collect_threat_profile(board: &BoardMap, features: &BoardFeatures, player: Pl
 fn evaluate_board_summary(board: &BoardState, params: &EngineParams, stats: &mut EngineStats) -> EvalSummary {
     stats.board_evaluations = stats.board_evaluations.saturating_add(1);
 
-    let features = collect_features(&board.moves);
+    let features = board.features();
     let x_one_turn_wins = features.x_one_turn_groups.len();
     let o_one_turn_wins = features.o_one_turn_groups.len();
     let x_forced_next_turn = has_forced_next_turn_win(board, &features, Player::X);
@@ -1463,8 +1405,7 @@ fn evaluate_board_summary(board: &BoardState, params: &EngineParams, stats: &mut
             x_stones,
             o_stones,
             params.tempo_discount_per_stone,
-        ) + tactical_bonus_for_player(board, &features, &x_profile, Player::X, params)
-            + build_initiative_bonus_for_player(board, &x_profile, Player::X, params),
+        ) + build_initiative_bonus_for_player(board, &x_profile, Player::X, params),
         x_dead_stones,
     );
     let o_raw = apply_dead_stone_penalty(
@@ -1473,22 +1414,12 @@ fn evaluate_board_summary(board: &BoardState, params: &EngineParams, stats: &mut
             o_stones,
             x_stones,
             params.tempo_discount_per_stone,
-        ) + tactical_bonus_for_player(board, &features, &o_profile, Player::O, params)
-            + build_initiative_bonus_for_player(board, &o_profile, Player::O, params),
+        ) + build_initiative_bonus_for_player(board, &o_profile, Player::O, params),
         o_dead_stones,
     );
 
     let x_score = x_raw / (x_raw + scale);
     let o_score = o_raw / (o_raw + scale);
-
-    let _use_fields = (
-        x_profile.levels[3].direction_count,
-        o_profile.levels[3].direction_count,
-        x_profile.levels[3].blocker_burden,
-        o_profile.levels[3].blocker_burden,
-        x_profile.levels[3].resilience,
-        o_profile.levels[3].resilience,
-    );
 
     EvalSummary {
         x_score,
@@ -1747,20 +1678,19 @@ fn collect_candidate_pool(
     player: Player,
     params: &EngineParams,
     target_count: usize,
-    force_take_own_immediate: bool,
-    force_block_opponent_immediate: bool,
+    force_immediate_lines: bool,
 ) -> Vec<Coord> {
-    let features = collect_features(&board.moves);
+    let features = board.features();
 
     let own_finishes = collect_one_turn_finish_cells(&features, player);
-    if force_take_own_immediate && !own_finishes.is_empty() {
+    if force_immediate_lines && !own_finishes.is_empty() {
         let mut out: Vec<Coord> = own_finishes.into_iter().collect();
         out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         return out;
     }
 
     let forced_blocks = collect_one_turn_finish_cells(&features, player.opponent());
-    if force_block_opponent_immediate && !forced_blocks.is_empty() {
+    if force_immediate_lines && !forced_blocks.is_empty() {
         let mut out: Vec<Coord> = forced_blocks.into_iter().collect();
         out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         return out;
@@ -1799,10 +1729,8 @@ fn collect_candidate_pool(
         };
 
         let mut pool = live_neighbors;
-        if !force_take_own_immediate {
+        if !force_immediate_lines {
             pool.extend(own_finishes.iter().copied());
-        }
-        if !force_block_opponent_immediate {
             pool.extend(forced_blocks.iter().copied());
         }
         pool.extend(selected.into_iter().take(cap).map(|(coord, _)| coord));
@@ -1836,7 +1764,7 @@ fn collect_candidate_pool(
 }
 
 fn collect_legal_candidates(board: &BoardState, player: Player, params: &EngineParams, target_count: usize) -> Vec<Coord> {
-    collect_candidate_pool(board, player, params, target_count, true, true)
+    collect_candidate_pool(board, player, params, target_count, true)
 }
 
 fn collect_same_turn_followup_candidates(
@@ -1845,7 +1773,7 @@ fn collect_same_turn_followup_candidates(
     params: &EngineParams,
     target_count: usize,
 ) -> Vec<Coord> {
-    collect_candidate_pool(board, player, params, target_count, false, false)
+    collect_candidate_pool(board, player, params, target_count, false)
 }
 
 fn collect_turn_start_candidates(
@@ -2042,7 +1970,7 @@ fn collect_winning_turn_lines(
 
     let mut winners = Vec::new();
     let mut seen = HashSet::new();
-    let start_features = collect_features(&board.moves);
+    let start_features = board.features();
     let tactical_first_options = collect_one_turn_finish_cells(&start_features, player);
 
     if !tactical_first_options.is_empty() {
@@ -2068,7 +1996,7 @@ fn collect_winning_turn_lines(
                 continue;
             }
 
-            let followup_features = collect_features(&after_first.moves);
+            let followup_features = after_first.features();
             let mut second_options: Vec<Coord> = collect_one_turn_finish_cells(&followup_features, player)
                 .into_iter()
                 .collect();
@@ -2194,7 +2122,7 @@ fn enumerate_turn_candidates(
     let top_cell_placements: Vec<RankedPlacement> = first_ranked.into_iter().take(first_rank_limit).collect();
 
     if board.placements_left <= 1 {
-        let opponent_finishes = collect_one_turn_finish_cells(&collect_features(&board.moves), player.opponent());
+        let opponent_finishes = collect_one_turn_finish_cells(&board.features(), player.opponent());
         let filtered: Vec<RankedPlacement> = if !opponent_finishes.is_empty() {
             let subset: Vec<RankedPlacement> = top_cell_placements
                 .iter()
@@ -2364,24 +2292,40 @@ fn root_candidate_line_limit(params: &EngineParams) -> usize {
     requested.max(4).min(48)
 }
 
-fn root_search_policy(params: &EngineParams) -> CandidatePolicy {
-    let line_limit = root_candidate_line_limit(params);
-    let top_cell_budget = ((line_limit + 2).max(6)).min((line_limit + 2).max(10));
-
-    CandidatePolicy {
-        top_cell_count: widened_top_cell_count(params.top_k_first_moves, top_cell_budget, 2),
-        max_line_count: line_limit.max((line_limit * 4).min(192)),
-        contextual_second_move_count: line_limit.max(48).min(64),
-        retain_all_lines: true,
-    }
+enum PolicyKind {
+    Root,
+    Child,
+    Simulation,
 }
 
-fn child_search_policy(params: &EngineParams) -> CandidatePolicy {
-    CandidatePolicy {
-        top_cell_count: widened_top_cell_count(params.top_k_first_moves, params.child_turn_candidate_count, 2),
-        max_line_count: params.child_turn_candidate_count.min(20).max(6),
-        contextual_second_move_count: 0,
-        retain_all_lines: false,
+fn search_policy(kind: PolicyKind, params: &EngineParams) -> CandidatePolicy {
+    match kind {
+        PolicyKind::Root => {
+            let line_limit = root_candidate_line_limit(params);
+            let top_cell_budget = (line_limit + 2).max(6);
+            CandidatePolicy {
+                top_cell_count: widened_top_cell_count(params.top_k_first_moves, top_cell_budget, 2),
+                max_line_count: line_limit.max((line_limit * 4).min(192)),
+                contextual_second_move_count: line_limit.max(48).min(64),
+                retain_all_lines: true,
+            }
+        }
+        PolicyKind::Child => CandidatePolicy {
+            top_cell_count: widened_top_cell_count(params.top_k_first_moves, params.child_turn_candidate_count, 2),
+            max_line_count: params.child_turn_candidate_count.min(20).max(6),
+            contextual_second_move_count: 0,
+            retain_all_lines: false,
+        },
+        PolicyKind::Simulation => CandidatePolicy {
+            top_cell_count: widened_top_cell_count(
+                params.simulation_top_k_first_moves.max(1),
+                params.simulation_turn_candidate_count.max(1),
+                1,
+            ),
+            max_line_count: params.simulation_turn_candidate_count.max(1).min(16),
+            contextual_second_move_count: 0,
+            retain_all_lines: false,
+        },
     }
 }
 
@@ -2512,56 +2456,6 @@ fn broaden_turn_actions(
         .collect()
 }
 
-fn simulation_search_policy(params: &EngineParams) -> CandidatePolicy {
-    CandidatePolicy {
-        top_cell_count: widened_top_cell_count(
-            params.simulation_top_k_first_moves.max(1),
-            params.simulation_turn_candidate_count.max(1),
-            1,
-        ),
-        max_line_count: params.simulation_turn_candidate_count.max(1).min(16),
-        contextual_second_move_count: 0,
-        retain_all_lines: false,
-    }
-}
-
-fn player_mark(player: Player) -> char {
-    match player {
-        Player::X => 'X',
-        Player::O => 'O',
-    }
-}
-
-fn board_state_signature(board: &BoardState) -> String {
-    let mut stones: Vec<(i32, i32, Player)> = board
-        .moves
-        .iter()
-        .map(|(&(q, r), &mark)| (q, r, mark))
-        .collect();
-    stones.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-
-    let mut out = String::new();
-    out.push('t');
-    out.push(':');
-    out.push(player_mark(board.turn));
-    out.push('|');
-    out.push('p');
-    out.push(':');
-    out.push_str(&board.placements_left.to_string());
-    out.push('|');
-
-    for (q, r, mark) in stones {
-        out.push_str(&q.to_string());
-        out.push(',');
-        out.push_str(&r.to_string());
-        out.push(',');
-        out.push(player_mark(mark));
-        out.push(';');
-    }
-
-    out
-}
-
 fn build_forcing_proof_budget(max_time_ms: u32, max_nodes: u32, start_ms: f64) -> ForcingProofBudget {
     let max_time = max_time_ms.max(1);
     let max_node_count = max_nodes.max(1);
@@ -2615,7 +2509,7 @@ fn forcing_heuristic_score(
 }
 
 fn should_attempt_forcing_solve(board: &BoardState, attacker: Player) -> bool {
-    let features = collect_features(&board.moves);
+    let features = board.features();
     if !has_immediate_threats(&features) {
         return false;
     }
@@ -2636,7 +2530,7 @@ fn forcing_candidate_lines(
         return Vec::new();
     }
 
-    let mut policy = child_search_policy(params);
+    let mut policy = search_policy(PolicyKind::Child, params);
     policy.top_cell_count = widened_top_cell_count(
         params.top_k_first_moves,
         params.child_turn_candidate_count.max(10).min(24),
@@ -2679,7 +2573,7 @@ fn forcing_candidate_lines(
         let keep = if winner == Some(attacker) {
             true
         } else {
-            let features = collect_features(&after_turn.moves);
+            let features = after_turn.features();
             let blockers_required = one_turn_blockers_required(&features, attacker);
             let forcing_threshold = after_turn.placements_left.max(1).min(2) as usize;
             blockers_required >= forcing_threshold
@@ -2740,28 +2634,35 @@ fn forcing_solve_node(
     let depth_used = context.start_depth.saturating_sub(depth_remaining) as u32;
     context.max_depth_turns = context.max_depth_turns.max(depth_used);
 
-    let cache_key = if is_root {
+    let cache_key: Option<ForcingCacheKey> = if is_root {
         None
     } else {
-        Some(format!(
-            "{}|a:{}|d:{}",
-            board_state_signature(board),
-            player_mark(attacker),
-            depth_remaining
-        ))
+        Some((board.canonical_zobrist_key(), attacker))
     };
 
-    if let Some(key) = &cache_key {
-        if let Some(cached) = context.cache.get(key) {
-            context.cache_hits = context.cache_hits.saturating_add(1);
-            return ForcingNodeResult {
-                status: cached.status,
-                score: cached.score,
-                best_action: None,
-            };
+    if let Some(key) = cache_key {
+        if let Some(cached) = context.cache.get(&key).copied() {
+            if cached.depth >= depth_remaining {
+                let usable = match cached.bound {
+                    ForcingBound::Exact => true,
+                    ForcingBound::Lower => cached.score >= beta,
+                    ForcingBound::Upper => cached.score <= alpha,
+                };
+                if usable {
+                    context.cache_hits = context.cache_hits.saturating_add(1);
+                    return ForcingNodeResult {
+                        status: cached.status,
+                        score: cached.score,
+                        best_action: None,
+                    };
+                }
+            }
         }
         context.cache_misses = context.cache_misses.saturating_add(1);
     }
+
+    let alpha_at_entry = alpha;
+    let beta_at_entry = beta;
 
     if context.budget.nodes_visited >= context.budget.max_nodes || now_ms() >= context.budget.deadline_ms {
         return forcing_unknown_result(board, attacker, params, stats);
@@ -2786,7 +2687,7 @@ fn forcing_solve_node(
         };
     }
 
-    let features = collect_features(&board.moves);
+    let features = board.features();
     let blockers_required = one_turn_blockers_required(&features, attacker);
     let forcing_threshold = board.placements_left.max(1).min(2) as usize;
 
@@ -2943,13 +2844,25 @@ fn forcing_solve_node(
     };
 
     if let Some(key) = cache_key {
-        context.cache.insert(
-            key,
-            ForcingCacheEntry {
-                status: result.status,
-                score: result.score,
-            },
-        );
+        let bound = if result.score <= alpha_at_entry {
+            ForcingBound::Upper
+        } else if result.score >= beta_at_entry {
+            ForcingBound::Lower
+        } else {
+            ForcingBound::Exact
+        };
+        let entry = ForcingCacheEntry {
+            status: result.status,
+            score: result.score,
+            depth: depth_remaining,
+            bound,
+        };
+        match context.cache.get(&key).copied() {
+            Some(prev) if prev.depth > entry.depth => {}
+            _ => {
+                context.cache.insert(key, entry);
+            }
+        }
     }
 
     result
@@ -3049,6 +2962,26 @@ fn terminal_value_for_root(winner: Option<Player>, root_player: Player) -> f64 {
     }
 }
 
+fn clamp_objective(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(-1.0, 1.0)
+    } else if value.is_sign_positive() {
+        1.0
+    } else {
+        -1.0
+    }
+}
+
+fn static_leaf_value(
+    board: &BoardState,
+    root_player: Player,
+    params: &EngineParams,
+    stats: &mut EngineStats,
+) -> f64 {
+    let eval_result = evaluate_board_summary(board, params, stats);
+    clamp_objective(objective_for_player(&eval_result, root_player, params))
+}
+
 fn rollout_leaf_value(
     board: &BoardState,
     root_player: Player,
@@ -3073,7 +3006,7 @@ fn rollout_leaf_value(
         }
 
         let player = simulation_board.turn;
-        let policy = simulation_search_policy(&simulation_params);
+        let policy = search_policy(PolicyKind::Simulation, &simulation_params);
         let mut lines = enumerate_turn_candidates(
             &simulation_board,
             player,
@@ -3097,32 +3030,7 @@ fn rollout_leaf_value(
         }
     }
 
-    let eval_result = evaluate_board_summary(&simulation_board, params, stats);
-    let value = objective_for_player(&eval_result, root_player, params);
-    if value.is_finite() {
-        value.clamp(-1.0, 1.0)
-    } else if value.is_sign_positive() {
-        1.0
-    } else {
-        -1.0
-    }
-}
-
-fn static_leaf_value(
-    board: &BoardState,
-    root_player: Player,
-    params: &EngineParams,
-    stats: &mut EngineStats,
-) -> f64 {
-    let eval_result = evaluate_board_summary(board, params, stats);
-    let value = objective_for_player(&eval_result, root_player, params);
-    if value.is_finite() {
-        value.clamp(-1.0, 1.0)
-    } else if value.is_sign_positive() {
-        1.0
-    } else {
-        -1.0
-    }
+    static_leaf_value(&simulation_board, root_player, params, stats)
 }
 
 fn non_quiescent_leaf_value(
@@ -3169,7 +3077,7 @@ fn quiescence_leaf_value(
 
     let current_player = board.turn;
     let attacker = current_player.opponent();
-    let features = collect_features(&board.moves);
+    let features = board.features();
 
     if one_turn_groups(&features, attacker).is_empty() {
         return None;
@@ -3323,9 +3231,9 @@ fn enumerate_ranked_actions_for_node(
     is_root: bool,
 ) -> Vec<RankedLine> {
     let policy = if is_root {
-        root_search_policy(params)
+        search_policy(PolicyKind::Root, params)
     } else {
-        child_search_policy(params)
+        search_policy(PolicyKind::Child, params)
     };
 
     let mut ranked = enumerate_turn_candidates(board, player, params, policy, stats);
@@ -3568,10 +3476,8 @@ fn select_expand_path(
         }
 
         let child_depth = nodes[node_idx].depth_turns.saturating_add(1);
-        let child_signature = board_state_signature(&next_board);
-        let mut child_node = MctsNode {
+        let child_node = MctsNode {
             parent: Some(node_idx),
-            signature: child_signature.clone(),
             action_from_parent: applied.clone(),
             player_to_move: next_board.turn,
             depth_turns: child_depth,
@@ -3583,17 +3489,6 @@ fn select_expand_path(
             static_value: None,
             terminal_winner: winner.or_else(|| find_winner(&next_board.moves)),
         };
-
-        if params.transpositions_enabled {
-            if let Some(entry) = context.transpositions.get(&child_signature).copied() {
-                context.telemetry.transposition_hits = context.telemetry.transposition_hits.saturating_add(1);
-                context.telemetry.transposition_reuses = context.telemetry.transposition_reuses.saturating_add(1);
-                child_node.visits = entry.visits;
-                child_node.total_value = entry.total_value;
-            } else {
-                context.telemetry.transposition_misses = context.telemetry.transposition_misses.saturating_add(1);
-            }
-        }
 
         let child_idx = nodes.len();
         nodes.push(child_node);
@@ -3609,36 +3504,6 @@ fn select_expand_path(
     }
 
     (path, board)
-}
-
-fn update_transposition_table(
-    nodes: &[MctsNode],
-    path: &[usize],
-    value: f64,
-    params: &EngineParams,
-    context: &mut MctsSearchContext,
-) {
-    if !params.transpositions_enabled {
-        return;
-    }
-
-    for &node_idx in path {
-        let signature = nodes[node_idx].signature.clone();
-        if let Some(entry) = context.transpositions.get_mut(&signature) {
-            entry.visits = entry.visits.saturating_add(1);
-            entry.total_value += value;
-            continue;
-        }
-
-        context.telemetry.transposition_stores = context.telemetry.transposition_stores.saturating_add(1);
-        context.transpositions.insert(
-            signature,
-            TranspositionEntry {
-                visits: 1,
-                total_value: value,
-            },
-        );
-    }
 }
 
 fn choose_mcts_turn(
@@ -3762,7 +3627,6 @@ fn choose_mcts_turn(
     context.telemetry.root_prior_top_share = root_actions.first().map(|action| action.prior).unwrap_or(0.0);
     let mut nodes = vec![MctsNode {
         parent: None,
-        signature: board_state_signature(board),
         action_from_parent: Vec::new(),
         player_to_move: root_player,
         depth_turns: 0,
@@ -3834,7 +3698,6 @@ fn choose_mcts_turn(
             node.visits = node.visits.saturating_add(1);
             node.total_value += value;
         }
-        update_transposition_table(&nodes, &path, value, params, &mut context);
 
         playouts = playouts.saturating_add(1);
     }
@@ -3853,7 +3716,6 @@ fn choose_mcts_turn(
 
     let root = &nodes[0];
     if root.children.is_empty() {
-        context.telemetry.transposition_table_size = context.transpositions.len() as u32;
         return (
             seed_move,
             root_candidates,
@@ -3900,7 +3762,6 @@ fn choose_mcts_turn(
         context.telemetry.root_best_visit_share =
             nodes[best_child_idx].visits as f64 / total_root_child_visits as f64;
     }
-    context.telemetry.transposition_table_size = context.transpositions.len() as u32;
 
     let best_line = nodes[best_child_idx].action_from_parent.clone();
     let best_depth = nodes[best_child_idx].depth_turns;
@@ -3942,12 +3803,12 @@ fn choose_turn_internal(request: ChooseTurnRequest) -> Result<ChooseTurnResponse
     let max_nodes = request.max_nodes.unwrap_or(0);
     let (moves_map, move_history) = parse_moves(&request.moves)?;
 
-    let mut board = BoardState {
-        moves: moves_map,
+    let mut board = BoardState::new(
+        moves_map,
         move_history,
         turn,
-        placements_left: request.placements_left.max(1).min(2),
-    };
+        request.placements_left.max(1).min(2),
+    );
 
     let mut stats = EngineStats::default();
 
@@ -4088,16 +3949,11 @@ fn evaluate_position_internal(request: EvaluatePositionRequest) -> Result<Evalua
     let (moves_map, move_history) = parse_moves(&request.moves)?;
     let (turn, placements_left) = turn_state_from_move_count(move_history.len());
 
-    let board = BoardState {
-        moves: moves_map,
-        move_history,
-        turn,
-        placements_left,
-    };
+    let board = BoardState::new(moves_map, move_history, turn, placements_left);
 
     let mut stats = EngineStats::default();
     let summary = evaluate_board_summary(&board, &params, &mut stats);
-    let features = collect_features(&board.moves);
+    let features = board.features();
     let x_next_turn_finish_groups = features.x_one_turn_groups.len();
     let o_next_turn_finish_groups = features.o_one_turn_groups.len();
     let x_next_turn_blockers_required = one_turn_blockers_required(&features, Player::X);
@@ -4160,7 +4016,6 @@ mod tests {
     fn dummy_node(parent: Option<usize>, visits: u32) -> MctsNode {
         MctsNode {
             parent,
-            signature: "sig".to_owned(),
             action_from_parent: Vec::new(),
             player_to_move: Player::X,
             depth_turns: 0,
@@ -4229,12 +4084,7 @@ mod tests {
         let (moves_map, move_history) = parse_moves(&moves).expect("snapshot parses");
         let (turn, placements_left) = turn_state_from_move_count(move_history.len());
 
-        BoardState {
-            moves: moves_map,
-            move_history,
-            turn,
-            placements_left,
-        }
+        BoardState::new(moves_map, move_history, turn, placements_left)
     }
 
     fn line_forces_next_turn_win(board: &BoardState, line: &[Coord], player: Player, params: &EngineParams) -> bool {
@@ -4260,12 +4110,7 @@ mod tests {
             move_history.push(PlacedMove { q, r });
         }
 
-        BoardState {
-            moves,
-            move_history,
-            turn,
-            placements_left,
-        }
+        BoardState::new(moves, move_history, turn, placements_left)
     }
 
     #[test]
@@ -4301,6 +4146,84 @@ mod tests {
     }
 
     #[test]
+    fn forcing_heuristic_score_stays_below_status_boundary_for_non_terminal_board() {
+        let params = base_params();
+        let mut stats = EngineStats::default();
+        let board = board_state_from_stones(
+            &[((0, 0), Player::X), ((1, 0), Player::O), ((2, 0), Player::X)]
+                .iter()
+                .map(|&((q, r), mark)| (q, r, mark))
+                .collect::<Vec<_>>(),
+            Player::O,
+            1,
+        );
+        let score_for_x = forcing_heuristic_score(&board, Player::X, &params, &mut stats);
+        let score_for_o = forcing_heuristic_score(&board, Player::O, &params, &mut stats);
+        assert!(score_for_x.abs() < FORCING_STATUS_SCORE_BOUNDARY, "heuristic must not cross proof boundary: got {}", score_for_x);
+        assert!(score_for_o.abs() < FORCING_STATUS_SCORE_BOUNDARY, "heuristic must not cross proof boundary: got {}", score_for_o);
+        assert_eq!(forcing_status_from_score(score_for_x), ForcingStatus::Unknown);
+        assert_eq!(forcing_status_from_score(score_for_o), ForcingStatus::Unknown);
+    }
+
+    #[test]
+    fn canonical_zobrist_key_matches_across_six_rotations() {
+        let original = board_state_from_stones(
+            &[((1, 0), Player::X), ((2, -1), Player::O), ((0, 1), Player::X)]
+                .iter()
+                .map(|&((q, r), mark)| (q, r, mark))
+                .collect::<Vec<_>>(),
+            Player::O,
+            1,
+        );
+        let baseline = original.canonical_zobrist_key();
+        let mut current = original.moves.clone();
+        for _ in 0..5 {
+            let rotated: BoardMap = current
+                .iter()
+                .map(|(&coord, &mark)| (rotate_axial_60(coord), mark))
+                .collect();
+            let rotated_board = BoardState::new(rotated.clone(), Vec::new(), original.turn, original.placements_left);
+            assert_eq!(rotated_board.canonical_zobrist_key(), baseline);
+            current = rotated;
+        }
+    }
+
+    #[test]
+    fn board_state_features_cache_returns_same_rc_and_invalidates_on_move() {
+        let mut board = BoardState::new(HashMap::new(), Vec::new(), Player::X, 1);
+        let a = board.features();
+        let b = board.features();
+        assert!(Rc::ptr_eq(&a, &b), "cache should hand back the same Rc");
+
+        apply_move_mut(&mut board, (0, 0), Player::X).expect("move succeeds");
+
+        let c = board.features();
+        assert!(!Rc::ptr_eq(&a, &c), "cache should be rebuilt after a move");
+        assert!(c.active_windows.len() > 0 || board.moves.len() == 1);
+    }
+
+    #[test]
+    fn board_state_clone_shares_cache_until_clone_mutated() {
+        let board = BoardState::new(HashMap::new(), Vec::new(), Player::X, 1);
+        let original_features = board.features();
+        let mut cloned = board.clone();
+        let cloned_features = cloned.features();
+        assert!(
+            Rc::ptr_eq(&original_features, &cloned_features),
+            "clone should inherit the populated cache"
+        );
+
+        apply_move_mut(&mut cloned, (0, 0), Player::X).expect("move succeeds");
+        let cloned_after = cloned.features();
+        assert!(!Rc::ptr_eq(&original_features, &cloned_after));
+        let original_again = board.features();
+        assert!(
+            Rc::ptr_eq(&original_features, &original_again),
+            "original cache survives when the clone mutates"
+        );
+    }
+
+    #[test]
     fn progressive_widening_limit_grows_with_visits() {
         let params = base_params();
         let root_initial = progressive_widening_limit(&dummy_node(None, 0), 20, &params);
@@ -4310,48 +4233,6 @@ mod tests {
         assert_eq!(root_initial, params.root_widening_base);
         assert_eq!(child_initial, params.child_widening_base);
         assert!(root_after_visits > root_initial);
-    }
-
-    #[test]
-    fn transposition_table_updates_accumulate_visits_and_value() {
-        let params = normalize_params(
-            &BotTuningInput::default(),
-            Some(&SearchOptionsInput {
-                transpositions_enabled: Some(true),
-                ..SearchOptionsInput::default()
-            }),
-        );
-
-        let board = BoardState {
-            moves: HashMap::new(),
-            move_history: Vec::new(),
-            turn: Player::X,
-            placements_left: 1,
-        };
-        let signature = board_state_signature(&board);
-        let nodes = vec![MctsNode {
-            parent: None,
-            signature: signature.clone(),
-            action_from_parent: Vec::new(),
-            player_to_move: Player::X,
-            depth_turns: 0,
-            children: Vec::new(),
-            actions: None,
-            widened_action_count: 0,
-            visits: 0,
-            total_value: 0.0,
-            static_value: Some(0.0),
-            terminal_winner: None,
-        }];
-        let mut context = MctsSearchContext::default();
-
-        update_transposition_table(&nodes, &[0], 0.75, &params, &mut context);
-        update_transposition_table(&nodes, &[0], -0.25, &params, &mut context);
-
-        let entry = context.transpositions.get(&signature).expect("transposition stored");
-        assert_eq!(context.telemetry.transposition_stores, 1);
-        assert_eq!(entry.visits, 2);
-        assert!((entry.total_value - 0.5).abs() < 1e-9);
     }
 
     #[test]
@@ -4394,7 +4275,7 @@ mod tests {
         let params = base_params();
         let board = archived_snapshot_1577_board();
         let mut stats = EngineStats::default();
-        let lines = enumerate_turn_candidates(&board, Player::O, &params, root_search_policy(&params), &mut stats);
+        let lines = enumerate_turn_candidates(&board, Player::O, &params, search_policy(PolicyKind::Root, &params), &mut stats);
         let preview = lines
             .iter()
             .take(12)
@@ -4414,7 +4295,7 @@ mod tests {
     fn archived_snapshot_followup_pool_after_1_2_contains_terminal_line() {
         let params = base_params();
         let board = archived_snapshot_1577_board();
-        let policy = root_search_policy(&params);
+        let policy = search_policy(PolicyKind::Root, &params);
         let first_pool = collect_turn_start_candidates(&board, Player::O, &params, policy.top_cell_count);
         let (after_first, winner) = apply_move_copy(&board, (1, 2), Player::O).expect("first move legal");
         let second_pool =
@@ -4443,7 +4324,7 @@ mod tests {
         let mut stats = EngineStats::default();
         let chosen = choose_greedy_turn(&board, &params, &mut stats);
         let mut preview_stats = EngineStats::default();
-        let preview = enumerate_turn_candidates(&board, Player::O, &params, root_search_policy(&params), &mut preview_stats)
+        let preview = enumerate_turn_candidates(&board, Player::O, &params, search_policy(PolicyKind::Root, &params), &mut preview_stats)
             .into_iter()
             .take(12)
             .map(|line| format!("{:?} objective {:.3}", line.line, line.objective))
